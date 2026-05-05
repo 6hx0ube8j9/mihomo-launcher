@@ -24,7 +24,7 @@ var iconFs embed.FS
 const (
 	API_URL    = "http://127.0.0.1:9090"
 	PROXY_ADDR = "127.0.0.1:7890"
-	APP_MUTEX  = "Global\\MihomoUltimateManager_V13"
+	APP_MUTEX  = "Global\\MihomoUltimateManager_V14"
 	REG_RUN    = `Software\Microsoft\Windows\CurrentVersion\Run`
 )
 
@@ -36,7 +36,7 @@ var (
 	baseDir        = filepath.Dir(exePath)
 )
 
-// --- 进程树绑定 (Job Object) 解决主程序死后内核残留问题 ---
+// --- 进程联动核心：Job Object ---
 func initJobObject() {
 	h, _ := windows.CreateJobObject(nil, nil)
 	if h != 0 {
@@ -50,6 +50,7 @@ func initJobObject() {
 	}
 }
 
+// --- 权限与静默调用 ---
 func isAdmin() bool {
 	var token windows.Token
 	err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token)
@@ -79,6 +80,7 @@ func runCmdSilent(path string, args ...string) {
 	}
 }
 
+// --- 服务检测逻辑 ---
 func isServiceInstalled() bool {
 	m, _ := windows.OpenSCManager(nil, nil, windows.SC_MANAGER_CONNECT)
 	if m == 0 { return false }
@@ -120,35 +122,42 @@ func monitorKernel() {
 }
 
 func onReady() {
+	// 初始化图标
 	systray.SetIcon(getIcon("default.ico"))
 
+	// 1. 顶部菜单
 	mWeb := systray.AddMenuItem("控制面板", "")
 	mDir := systray.AddMenuItem("打开程序目录", "")
 	systray.AddSeparator()
 
+	// 2. 模式切换
 	mProxy := systray.AddMenuItemCheckbox("系统代理", "", false)
 	mTun := systray.AddMenuItemCheckbox("TUN 模式", "", false)
 	systray.AddSeparator()
 
+	// 3. 服务管理菜单 (带状态置灰)
 	mSvcRoot := systray.AddMenuItem("服务管理", "")
 	mSvcBat := mSvcRoot.AddSubMenuItem("管理服务 (BAT)", "")
 	mSvcInst := mSvcRoot.AddSubMenuItem("安装服务", "")
 	mSvcUninst := mSvcRoot.AddSubMenuItem("卸载服务", "")
 	
+	// 4. 自启与隐藏
 	mAuto := systray.AddMenuItemCheckbox("开机自动启动", "", false)
-	mHide := systray.AddMenuItem("隐藏托盘图标", "点击后图标将消失，重启后恢复")
+	mHide := systray.AddMenuItem("隐藏托盘图标", "")
 	systray.AddSeparator()
 
+	// 5. 退出
 	mRestart := systray.AddMenuItem("重启内核", "")
-	mExit := systray.AddMenuItem("完全退出", "")
+	mExit := systray.AddMenuItem("彻底退出", "")
 
-	// 状态更新协程
+	// 循环更新 UI 状态
 	go func() {
 		for {
 			if isExiting { return }
 			
-			// 1. 服务动态置灰逻辑
-			if isServiceInstalled() {
+			// A. 服务按钮状态同步
+			installed := isServiceInstalled()
+			if installed {
 				mSvcInst.Disable()
 				mSvcUninst.Enable()
 			} else {
@@ -156,12 +165,14 @@ func onReady() {
 				mSvcUninst.Disable()
 			}
 
-			// 2. 同步状态和图标
+			// B. 代理与 TUN 状态图标同步
 			syncUI(mProxy, mTun, mAuto)
+			
 			time.Sleep(2 * time.Second)
 		}
 	}()
 
+	// 交互事件处理
 	for {
 		select {
 		case <-mWeb.ClickedCh:
@@ -181,8 +192,7 @@ func onReady() {
 		case <-mAuto.ClickedCh:
 			toggleAutoStart(!mAuto.Checked())
 		case <-mHide.ClickedCh:
-			// 直接退出托盘运行循环，但保留后台进程
-			systray.Quit() 
+			systray.Quit() // 销毁托盘，但不设置 isExiting，进程保持后台运行
 		case <-mRestart.ClickedCh:
 			runCmdSilent("taskkill", "/F", "/IM", "mihomo.exe", "/T")
 		case <-mExit.ClickedCh:
@@ -193,21 +203,19 @@ func onReady() {
 }
 
 func syncUI(mP, mT, mA *systray.MenuItem) {
-	// 系统代理检查
+	// 系统代理
 	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.QUERY_VALUE)
-	isProxyOn := false
+	proxyOn := false
 	if err == nil {
 		v, _, _ := k.GetIntegerValue("ProxyEnable")
 		if v == 1 { 
 			mP.Check()
-			isProxyOn = true
-		} else { 
-			mP.Uncheck() 
-		}
+			proxyOn = true
+		} else { mP.Uncheck() }
 		k.Close()
 	}
 
-	// 开机自启检查
+	// 自启状态
 	k2, err := registry.OpenKey(registry.CURRENT_USER, REG_RUN, registry.QUERY_VALUE)
 	if err == nil {
 		_, _, e := k2.GetStringValue("MihomoLauncher")
@@ -215,7 +223,7 @@ func syncUI(mP, mT, mA *systray.MenuItem) {
 		k2.Close()
 	}
 
-	// 内核状态检查与图标切换
+	// 内核状态与图标切换 (default, tun, proxy)
 	resp, err := httpClient.Get(API_URL + "/configs")
 	if err == nil {
 		var d struct { Tun struct { Enable bool } `json:"tun"` }
@@ -225,8 +233,8 @@ func syncUI(mP, mT, mA *systray.MenuItem) {
 		if d.Tun.Enable {
 			mT.Check()
 			systray.SetIcon(getIcon("tun.ico"))
-		} else if isProxyOn {
-			systray.SetIcon(getIcon("proxy.ico")) // 修正后的 proxy.ico
+		} else if proxyOn {
+			systray.SetIcon(getIcon("proxy.ico"))
 		} else {
 			mT.Uncheck()
 			systray.SetIcon(getIcon("default.ico"))
@@ -263,7 +271,6 @@ func getIcon(n string) []byte {
 }
 
 func onExit() {
-	// 如果不是点击的“彻底退出”，只是隐藏，则不执行 os.Exit
 	if isExiting {
 		if hJob != 0 { windows.CloseHandle(hJob) }
 		os.Exit(0)
