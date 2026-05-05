@@ -24,19 +24,19 @@ var iconFs embed.FS
 const (
 	API_URL    = "http://127.0.0.1:9090"
 	PROXY_ADDR = "127.0.0.1:7890"
-	APP_MUTEX  = "Global\\MihomoUltimateManager_V15"
+	APP_MUTEX  = "Global\\MihomoUltimateManager_V13"
 	REG_RUN    = `Software\Microsoft\Windows\CurrentVersion\Run`
 )
 
 var (
-	isReallyExiting bool // 只有点击“彻底退出”才会设为真
-	hJob            windows.Handle
-	httpClient      = &http.Client{Timeout: 2 * time.Second}
-	exePath, _      = os.Executable()
-	baseDir         = filepath.Dir(exePath)
+	isExiting      bool
+	hJob           windows.Handle
+	httpClient     = &http.Client{Timeout: 2 * time.Second}
+	exePath, _     = os.Executable()
+	baseDir        = filepath.Dir(exePath)
 )
 
-// --- 进程树绑定：确保主程序崩溃时内核也退出，但正常隐藏时不影响 ---
+// --- 进程树绑定 (Job Object) 解决主程序死后内核残留问题 ---
 func initJobObject() {
 	h, _ := windows.CreateJobObject(nil, nil)
 	if h != 0 {
@@ -50,7 +50,6 @@ func initJobObject() {
 	}
 }
 
-// --- 权限与调用 ---
 func isAdmin() bool {
 	var token windows.Token
 	err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token)
@@ -66,11 +65,9 @@ func runAsAdmin() {
 	windows.ShellExecute(0, verb, exePtr, nil, cwdPtr, windows.SW_HIDE)
 }
 
-// 修复后的命令执行：强制指定子目录并使用绝对路径
-func runCmdSilent(fullPath string) {
-	dir := filepath.Dir(fullPath)
-	cmd := exec.Command("cmd.exe", "/C", filepath.Base(fullPath))
-	cmd.Dir = dir // 关键：切换到脚本所在目录
+func runCmdSilent(path string, args ...string) {
+	cmd := exec.Command(path, args...)
+	cmd.Dir = baseDir
 	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 	if hJob != 0 {
 		_ = cmd.Start()
@@ -113,11 +110,10 @@ func main() {
 func monitorKernel() {
 	target := filepath.Join(baseDir, "mihomo.exe")
 	for {
-		if isReallyExiting { return }
+		if isExiting { return }
 		_, err := httpClient.Get(API_URL)
 		if err != nil {
-			// 内核不在运行，启动它
-			runCmdSilent(target)
+			runCmdSilent(target, "-d", baseDir)
 		}
 		time.Sleep(5 * time.Second)
 	}
@@ -140,24 +136,27 @@ func onReady() {
 	mSvcUninst := mSvcRoot.AddSubMenuItem("卸载服务", "")
 	
 	mAuto := systray.AddMenuItemCheckbox("开机自动启动", "", false)
-	mHide := systray.AddMenuItem("隐藏托盘图标", "点击后图标消失，进程常驻后台")
+	mHide := systray.AddMenuItem("隐藏托盘图标", "点击后图标将消失，重启后恢复")
 	systray.AddSeparator()
 
 	mRestart := systray.AddMenuItem("重启内核", "")
-	mExit := systray.AddMenuItem("彻底退出", "")
+	mExit := systray.AddMenuItem("完全退出", "")
 
-	// 自动同步状态
+	// 状态更新协程
 	go func() {
 		for {
-			if isReallyExiting { return }
-			installed := isServiceInstalled()
-			if installed {
+			if isExiting { return }
+			
+			// 1. 服务动态置灰逻辑
+			if isServiceInstalled() {
 				mSvcInst.Disable()
 				mSvcUninst.Enable()
 			} else {
 				mSvcInst.Enable()
 				mSvcUninst.Disable()
 			}
+
+			// 2. 同步状态和图标
 			syncUI(mProxy, mTun, mAuto)
 			time.Sleep(2 * time.Second)
 		}
@@ -182,30 +181,33 @@ func onReady() {
 		case <-mAuto.ClickedCh:
 			toggleAutoStart(!mAuto.Checked())
 		case <-mHide.ClickedCh:
-			// 仅退出托盘 UI 循环，不杀死进程
-			systray.Quit()
+			// 直接退出托盘运行循环，但保留后台进程
+			systray.Quit() 
 		case <-mRestart.ClickedCh:
-			// 杀死内核进程，monitorKernel 会自动拉起
-			exec.Command("taskkill", "/F", "/IM", "mihomo.exe", "/T").Run()
+			runCmdSilent("taskkill", "/F", "/IM", "mihomo.exe", "/T")
 		case <-mExit.ClickedCh:
-			isReallyExiting = true
+			isExiting = true
 			systray.Quit()
 		}
 	}
 }
 
 func syncUI(mP, mT, mA *systray.MenuItem) {
+	// 系统代理检查
 	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.QUERY_VALUE)
-	proxyOn := false
+	isProxyOn := false
 	if err == nil {
 		v, _, _ := k.GetIntegerValue("ProxyEnable")
 		if v == 1 { 
 			mP.Check()
-			proxyOn = true
-		} else { mP.Uncheck() }
+			isProxyOn = true
+		} else { 
+			mP.Uncheck() 
+		}
 		k.Close()
 	}
 
+	// 开机自启检查
 	k2, err := registry.OpenKey(registry.CURRENT_USER, REG_RUN, registry.QUERY_VALUE)
 	if err == nil {
 		_, _, e := k2.GetStringValue("MihomoLauncher")
@@ -213,16 +215,18 @@ func syncUI(mP, mT, mA *systray.MenuItem) {
 		k2.Close()
 	}
 
+	// 内核状态检查与图标切换
 	resp, err := httpClient.Get(API_URL + "/configs")
 	if err == nil {
 		var d struct { Tun struct { Enable bool } `json:"tun"` }
 		json.NewDecoder(resp.Body).Decode(&d)
 		resp.Body.Close()
+
 		if d.Tun.Enable {
 			mT.Check()
 			systray.SetIcon(getIcon("tun.ico"))
-		} else if proxyOn {
-			systray.SetIcon(getIcon("proxy.ico"))
+		} else if isProxyOn {
+			systray.SetIcon(getIcon("proxy.ico")) // 修正后的 proxy.ico
 		} else {
 			mT.Uncheck()
 			systray.SetIcon(getIcon("default.ico"))
@@ -259,8 +263,8 @@ func getIcon(n string) []byte {
 }
 
 func onExit() {
-	// 关键逻辑：如果标志位为假，说明是“隐藏”操作，不执行 os.Exit(0)
-	if isReallyExiting {
+	// 如果不是点击的“彻底退出”，只是隐藏，则不执行 os.Exit
+	if isExiting {
 		if hJob != 0 { windows.CloseHandle(hJob) }
 		os.Exit(0)
 	}
