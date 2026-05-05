@@ -1,22 +1,44 @@
-name: build
-on: [push, pull_request]
-env:
-  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+name: Build Mihomo Launcher
+
+on:
+  push:
+    branches: [ "main", "master" ]
+  pull_request:
+    branches: [ "main", "master" ]
+  workflow_dispatch: # 支持手动触发编译
+
 jobs:
   build:
     runs-on: windows-latest
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
           go-version: '1.22'
-      - name: Prep
+          check-latest: true
+
+      - name: Prepare Dependencies
+        shell: pwsh
         run: |
-          if (!(Test-Path "go.mod")) { go mod init mihomo-launcher }
+          # 如果没有 go.mod 则初始化
+          if (!(Test-Path "go.mod")) {
+            go mod init mihomo-launcher
+          }
+          # 自动下载依赖并生成稳定的 go.sum
           go mod tidy
-      - name: Build
-        run: go build -ldflags="-H windowsgui -s -w" -o mihomo-launcher.exe main.go
-      - uses: actions/upload-artifact@v4
+
+      - name: Build Executable
+        shell: pwsh
+        run: |
+          go build -ldflags="-H=windowsgui -s -w" -o mihomo-launcher.exe main.go
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: mihomo-launcher
+          name: mihomo-launcher-windows
           path: mihomo-launcher.exe
+          retention-days: 14
