@@ -27,8 +27,8 @@ var iconFs embed.FS
 const (
 	API_URL      = "http://127.0.0.1:9090"
 	PROXY_ADDR   = "127.0.0.1:7890"
-	APP_MUTEX    = "Global\\MihomoLauncherMutexV4"
-	TUN_ADAPTER  = "Mihomo" 
+	APP_MUTEX    = "Global\\MihomoLauncherMutexV6"
+	TUN_ADAPTER  = "Mihomo"
 )
 
 var (
@@ -39,38 +39,17 @@ var (
 	iniPath     string
 	hJob        windows.Handle
 	isExiting   bool
-	httpClient  = &http.Client{Timeout: 1500 * time.Millisecond}
+	httpClient  = &http.Client{Timeout: 1 * time.Second}
 )
 
 type Config struct {
-	AutoStart   bool
-	ServiceMode bool
 	TunEnabled  bool
 	TrayHidden  bool
 	SystemProxy bool
 	Mode        string
 }
 
-// --- 系统工具 (无黑窗版) ---
-
-func isAdmin() bool {
-	var t windows.Token
-	err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &t)
-	if err != nil { return false }
-	defer t.Close()
-	return t.IsElevated()
-}
-
-func runAsAdmin() {
-	verb, _ := syscall.UTF16PtrFromString("runas")
-	exe, _ := os.Executable()
-	exePtr, _ := syscall.UTF16PtrFromString(exe)
-	cwd, _ := os.Getwd()
-	cwdPtr, _ := syscall.UTF16PtrFromString(cwd)
-	_ = windows.ShellExecute(0, verb, exePtr, nil, cwdPtr, windows.SW_SHOWNORMAL)
-}
-
-// --- 守护逻辑 ---
+// --- 核心工具 ---
 
 func initJobObject() {
 	h, _ := windows.CreateJobObject(nil, nil)
@@ -78,10 +57,8 @@ func initJobObject() {
 		var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 		info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
 		windows.NewLazySystemDLL("kernel32.dll").NewProc("SetInformationJobObject").Call(
-			uintptr(h),
-			uintptr(windows.JobObjectExtendedLimitInformation),
-			uintptr(unsafe.Pointer(&info)),
-			uintptr(uint32(unsafe.Sizeof(info))),
+			uintptr(h), uintptr(windows.JobObjectExtendedLimitInformation),
+			uintptr(unsafe.Pointer(&info)), uintptr(uint32(unsafe.Sizeof(info))),
 		)
 		hJob = h
 	}
@@ -90,101 +67,128 @@ func initJobObject() {
 func monitorCore() {
 	for {
 		if isExiting { return }
-		confMu.RLock()
-		sMode := conf.ServiceMode
-		confMu.RUnlock()
-
-		if !sMode {
-			runCoreDirectly()
+		// 检查内核是否运行
+		_, err := http.Get(API_URL)
+		if err != nil {
+			// 内核未运行则启动
+			runCore()
 		}
-		time.Sleep(3 * time.Second)
+		time.Sleep(5 * time.Second)
 	}
 }
 
-func runCoreDirectly() {
+func runCore() {
 	_ = exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe").Run()
 	time.Sleep(500 * time.Millisecond)
-
-	if _, err := os.Stat(coreExe); os.IsNotExist(err) { return }
-
-	cmd := exec.Command(coreExe, "-d", baseDir)
-	cmd.Dir = baseDir
-	cmd.SysProcAttr = &windows.SysProcAttr{
-		CreationFlags: windows.CREATE_NO_WINDOW | windows.CREATE_BREAKAWAY_FROM_JOB,
-	}
-
-	if err := cmd.Start(); err == nil {
-		if hJob != 0 {
+	if _, err := os.Stat(coreExe); err == nil {
+		cmd := exec.Command(coreExe, "-d", baseDir)
+		cmd.Dir = baseDir
+		cmd.SysProcAttr = &windows.SysProcAttr{
+			CreationFlags: windows.CREATE_NO_WINDOW | windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+		}
+		if err := cmd.Start(); err == nil && hJob != 0 {
 			hp, _ := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
 			_ = windows.AssignProcessToJobObject(hJob, hp)
 			windows.CloseHandle(hp)
 		}
-		_ = cmd.Wait()
 	}
 }
 
-// --- 同步逻辑 ---
+// --- 托盘逻辑 ---
 
-func syncLoop(mProxy, mTun, mRule, mGlobal, mDirect *systray.MenuItem) {
-	for {
-		if isExiting { return }
-		loadIni() 
+func onReady() {
+	systray.SetIcon(getIcon("default.ico"))
 
-		isProxyOn := false
-		k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.QUERY_VALUE)
-		if err == nil {
-			v, _, _ := k.GetIntegerValue("ProxyEnable")
-			isProxyOn = v == 1
-			k.Close()
-		}
+	mWeb := systray.AddMenuItem("打开控制面板", "")
+	systray.AddSeparator()
+	mProxy := systray.AddMenuItemCheckbox("系统代理", "", false)
+	mTun := systray.AddMenuItemCheckbox("虚拟网卡 (TUN)", "", false)
+	systray.AddSeparator()
+	mRule := systray.AddMenuItemCheckbox("规则模式", "", false)
+	mGlobal := systray.AddMenuItemCheckbox("全局模式", "", false)
+	mDirect := systray.AddMenuItemCheckbox("直连模式", "", false)
+	systray.AddSeparator()
+	mRes := systray.AddMenuItem("重启内核", "")
+	mSvc := systray.AddMenuItem("管理服务", "")
+	mHide := systray.AddMenuItem("隐藏图标 (后台运行)", "")
+	mExit := systray.AddMenuItem("完全退出程序", "")
 
-		isTunUp := false
-		ifaces, _ := net.Interfaces()
-		for _, i := range ifaces {
-			if strings.Contains(i.Name, TUN_ADAPTER) && i.Flags&net.FlagUp != 0 {
-				isTunUp = true
-				break
-			}
-		}
-
-		resp, err := httpClient.Get(API_URL + "/configs")
-		if err == nil {
-			var data struct {
-				Mode string `json:"mode"`
-				Tun  struct { Enable bool `json:"enable"` } `json:"tun"`
-			}
-			if json.NewDecoder(resp.Body).Decode(&data) == nil {
-				confMu.Lock()
-				conf.Mode = strings.ToLower(data.Mode)
-				conf.TunEnabled = data.Tun.Enable
-				confMu.Unlock()
-			}
-			resp.Body.Close()
+	// 单一循环状态同步
+	go func() {
+		for {
+			if isExiting { return }
 			
-			// 根据状态设置图标 (修复名称)
-			if isTunUp {
-				systray.SetIcon(getIcon("tun.ico"))
-			} else if isProxyOn {
-				systray.SetIcon(getIcon("proxy.ico"))
-			} else {
-				systray.SetIcon(getIcon("default.ico"))
-			}
-		} else {
-			systray.SetIcon(getIcon("stop.ico"))
-		}
+			// 1. 读取外部指令（是否显形）
+			loadIni()
+			confMu.RLock()
+			isHidden := conf.TrayHidden
+			confMu.RUnlock()
 
-		if mProxy != nil {
-			updateUI(mProxy, mTun, mRule, mGlobal, mDirect, isProxyOn, isTunUp)
+			if isHidden {
+				systray.SetIcon([]byte{}) // 设为空，图标消失
+			} else {
+				// 正常状态刷新
+				refreshUI(mProxy, mTun, mRule, mGlobal, mDirect)
+			}
+			time.Sleep(2 * time.Second)
 		}
-		time.Sleep(2 * time.Second)
+	}()
+
+	for {
+		select {
+		case <-mProxy.ClickedCh: toggleProxy()
+		case <-mTun.ClickedCh: toggleTun()
+		case <-mRule.ClickedCh: setMode("rule")
+		case <-mGlobal.ClickedCh: setMode("global")
+		case <-mDirect.ClickedCh: setMode("direct")
+		case <-mWeb.ClickedCh: exec.Command("rundll32", "url.dll,FileProtocolHandler", API_URL+"/ui").Start()
+		case <-mRes.ClickedCh: go runCore()
+		case <-mSvc.ClickedCh:
+			bat := filepath.Join(baseDir, "mihomo-service", "mihomo-service.bat")
+			c := exec.Command("cmd", "/c", bat)
+			c.SysProcAttr = &windows.SysProcAttr{HideWindow: true}
+			_ = c.Start()
+		case <-mHide.ClickedCh:
+			confMu.Lock()
+			conf.TrayHidden = true
+			confMu.Unlock()
+			saveIni()
+		case <-mExit.ClickedCh:
+			cleanExit()
+		}
 	}
 }
 
-func updateUI(mProxy, mTun, mRule, mGlobal, mDirect *systray.MenuItem, proxy, tun bool) {
-	if proxy { mProxy.Check() } else { mProxy.Uncheck() }
-	if tun { mTun.Check() } else { mTun.Uncheck() }
+func refreshUI(mProxy, mTun, mRule, mGlobal, mDirect *systray.MenuItem) {
+	// 代理检测
+	isP := false
+	k, _ := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.QUERY_VALUE)
+	if v, _, _ := k.GetIntegerValue("ProxyEnable"); v == 1 { isP = true }
+	k.Close()
+
+	// API 检测
+	resp, err := httpClient.Get(API_URL + "/configs")
+	if err == nil {
+		var d struct {
+			Mode string `json:"mode"`
+			Tun  struct{ Enable bool } `json:"tun"`
+		}
+		json.NewDecoder(resp.Body).Decode(&d)
+		resp.Body.Close()
+		
+		confMu.Lock()
+		conf.Mode = strings.ToLower(d.Mode)
+		conf.TunEnabled = d.Tun.Enable
+		confMu.Unlock()
+
+		if d.Tun.Enable { systray.SetIcon(getIcon("tun.ico")) } else if isP { systray.SetIcon(getIcon("proxy.ico")) } else { systray.SetIcon(getIcon("default.ico")) }
+	} else {
+		systray.SetIcon(getIcon("stop.ico"))
+	}
 
 	confMu.RLock()
+	if isP { mProxy.Check() } else { mProxy.Uncheck() }
+	if conf.TunEnabled { mTun.Check() } else { mTun.Uncheck() }
 	mRule.Uncheck(); mGlobal.Uncheck(); mDirect.Uncheck()
 	switch conf.Mode {
 	case "rule": mRule.Check()
@@ -194,74 +198,15 @@ func updateUI(mProxy, mTun, mRule, mGlobal, mDirect *systray.MenuItem, proxy, tu
 	confMu.RUnlock()
 }
 
-// --- 托盘准备 (修复菜单重复) ---
+// --- 其他功能 ---
 
-func onReady() {
-	// 关键：清空旧菜单防止重复显示
-	// 注意：部分 systray 版本可能不支持 ResetMenu，如果编译报错，请删除此行并使用 Quit/Run 逻辑
-	// 这里通过逻辑确保每次 Run 都是新鲜的
-
-	systray.SetIcon(getIcon("default.ico"))
-	
-	mWeb := systray.AddMenuItem("打开控制面板", "")
-	systray.AddSeparator()
-	mProxy := systray.AddMenuItemCheckbox("系统代理", "", conf.SystemProxy)
-	mTun := systray.AddMenuItemCheckbox("虚拟网卡 (TUN)", "", conf.TunEnabled)
-	systray.AddSeparator()
-	mRule := systray.AddMenuItemCheckbox("规则模式", "", conf.Mode == "rule")
-	mGlobal := systray.AddMenuItemCheckbox("全局模式", "", conf.Mode == "global")
-	mDirect := systray.AddMenuItemCheckbox("直连模式", "", conf.Mode == "direct")
-	systray.AddSeparator()
-	mRes := systray.AddMenuItem("重启内核", "")
-	mSvc := systray.AddMenuItem("管理服务", "")
-	mHide := systray.AddMenuItem("隐藏图标 (后台运行)", "")
-	mExit := systray.AddMenuItem("退出程序", "")
-
-	go syncLoop(mProxy, mTun, mRule, mGlobal, mDirect)
-
-	for {
-		select {
-		case <-mProxy.ClickedCh:
-			confMu.Lock()
-			conf.SystemProxy = !conf.SystemProxy
-			setProxyReg(conf.SystemProxy)
-			confMu.Unlock()
-			saveIni()
-		case <-mTun.ClickedCh:
-			confMu.Lock()
-			conf.TunEnabled = !conf.TunEnabled
-			sendPatch(fmt.Sprintf(`{"tun": {"enable": %v}}`, conf.TunEnabled))
-			confMu.Unlock()
-			saveIni()
-		case <-mRule.ClickedCh: setMode("rule")
-		case <-mGlobal.ClickedCh: setMode("global")
-		case <-mDirect.ClickedCh: setMode("direct")
-		case <-mWeb.ClickedCh: exec.Command("rundll32", "url.dll,FileProtocolHandler", API_URL+"/ui").Start()
-		case <-mRes.ClickedCh: go runCoreDirectly()
-		case <-mSvc.ClickedCh:
-			serviceBat := filepath.Join(baseDir, "mihomo-service", "mihomo-service.bat")
-			c := exec.Command("cmd", "/c", serviceBat) // 不再使用 start 避免弹框
-			c.Dir = filepath.Dir(serviceBat)
-			c.SysProcAttr = &windows.SysProcAttr{HideWindow: true}
-			_ = c.Start()
-		case <-mHide.ClickedCh:
-			confMu.Lock()
-			conf.TrayHidden = true
-			confMu.Unlock()
-			saveIni()
-			systray.Quit()
-			return
-		case <-mExit.ClickedCh:
-			cleanExit()
-		}
-	}
-}
-
-// --- 基础工具 ---
-
-func setProxyReg(e bool) {
+func toggleProxy() {
+	confMu.Lock()
+	conf.SystemProxy = !conf.SystemProxy
+	state := conf.SystemProxy
+	confMu.Unlock()
 	k, _, _ := registry.CreateKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.ALL_ACCESS)
-	if e {
+	if state {
 		k.SetDWordValue("ProxyEnable", 1)
 		k.SetStringValue("ProxyServer", PROXY_ADDR)
 	} else {
@@ -271,17 +216,19 @@ func setProxyReg(e bool) {
 	windows.NewLazySystemDLL("user32.dll").NewProc("UpdatePerUserSystemParameters").Call(0, 0, 0, 0)
 }
 
-func sendPatch(j string) {
-	req, _ := http.NewRequest("PATCH", API_URL+"/configs", bytes.NewBuffer([]byte(j)))
-	if resp, err := httpClient.Do(req); err == nil { resp.Body.Close() }
+func toggleTun() {
+	confMu.Lock()
+	val := !conf.TunEnabled
+	confMu.Unlock()
+	body := fmt.Sprintf(`{"tun": {"enable": %v}}`, val)
+	req, _ := http.NewRequest("PATCH", API_URL+"/configs", strings.NewReader(body))
+	if r, err := httpClient.Do(req); err == nil { r.Body.Close() }
 }
 
 func setMode(m string) {
-	confMu.Lock()
-	conf.Mode = m
-	sendPatch(fmt.Sprintf(`{"mode": "%s"}`, m))
-	confMu.Unlock()
-	saveIni()
+	body := fmt.Sprintf(`{"mode": "%s"}`, m)
+	req, _ := http.NewRequest("PATCH", API_URL+"/configs", strings.NewReader(body))
+	if r, err := httpClient.Do(req); err == nil { r.Body.Close() }
 }
 
 func loadIni() {
@@ -292,10 +239,6 @@ func loadIni() {
 	conf.TrayHidden = strings.Contains(s, "tray_hidden=true")
 	conf.TunEnabled = strings.Contains(s, "tun_enabled=true")
 	conf.SystemProxy = strings.Contains(s, "system_proxy=true")
-	conf.ServiceMode = strings.Contains(s, "service_mode=true")
-	if strings.Contains(s, "mode=rule") { conf.Mode = "rule" }
-	if strings.Contains(s, "mode=global") { conf.Mode = "global" }
-	if strings.Contains(s, "mode=direct") { conf.Mode = "direct" }
 	confMu.Unlock()
 }
 
@@ -303,58 +246,41 @@ func saveIni() {
 	confMu.RLock()
 	defer confMu.RUnlock()
 	f, _ := os.Create(iniPath)
-	defer f.Close()
-	fmt.Fprintf(f, "tray_hidden=%v\ntun_enabled=%v\nsystem_proxy=%v\nmode=%s\nservice_mode=%v\n",
-		conf.TrayHidden, conf.TunEnabled, conf.SystemProxy, conf.Mode, conf.ServiceMode)
+	fmt.Fprintf(f, "tray_hidden=%v\ntun_enabled=%v\nsystem_proxy=%v\n", conf.TrayHidden, conf.TunEnabled, conf.SystemProxy)
+	f.Close()
+}
+
+func getIcon(n string) []byte {
+	b, _ := iconFs.ReadFile("icons/" + n)
+	return b
 }
 
 func cleanExit() {
 	isExiting = true
-	setProxyReg(false)
-	if hJob != 0 { windows.CloseHandle(hJob) }
+	k, _, _ := registry.CreateKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.ALL_ACCESS)
+	k.SetDWordValue("ProxyEnable", 0)
+	k.Close()
 	os.Exit(0)
 }
 
-func getIcon(n string) []byte {
-	data, _ := iconFs.ReadFile("icons/" + n)
-	return data
-}
-
-// --- 入口 ---
-
 func main() {
-	if !isAdmin() { runAsAdmin(); return }
-
 	p, _ := os.Executable()
 	baseDir = filepath.Dir(p)
 	coreExe = filepath.Join(baseDir, "mihomo.exe")
 	iniPath = filepath.Join(baseDir, "mihomo-launcher.ini")
 
-	// 1. 互斥锁逻辑
 	mName := windows.StringToUTF16Ptr(APP_MUTEX)
 	hM, err := windows.CreateMutex(nil, false, mName)
 	if err != nil || windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
+		// 救活逻辑：写文件让老进程显形
 		loadIni()
 		conf.TrayHidden = false
 		saveIni()
-		if hM != 0 { windows.CloseHandle(hM) }
-		os.Exit(0)
+		return 
 	}
 
-	loadIni()
 	initJobObject()
+	loadIni()
 	go monitorCore()
-
-	// 2. 托盘运行逻辑修复
-	for {
-		if isExiting { break }
-		loadIni()
-		if !conf.TrayHidden {
-			// 每次启动 systray 前确保全局状态正常
-			systray.Run(onReady, nil)
-		}
-		// 当 systray.Quit() 被调用后，会回到这里
-		// 循环等待直到 TrayHidden 被再次置为 false (通过双击启动)
-		time.Sleep(2 * time.Second)
-	}
+	systray.Run(onReady, nil)
 }
