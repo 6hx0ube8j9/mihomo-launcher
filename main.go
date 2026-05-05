@@ -6,7 +6,6 @@ import (
 	"embed"
 	"encoding/json"
 	"fmt"
-	"io"
 	"net"
 	"net/http"
 	"os"
@@ -58,7 +57,7 @@ var (
 	httpClient      = &http.Client{Timeout: 2 * time.Second}
 )
 
-// --- 权限与工具 ---
+// --- 基础工具 ---
 
 func isAdmin() bool {
 	var t windows.Token
@@ -92,17 +91,17 @@ func initJobObject() {
 	}
 }
 
-// --- 原版 BAT 逻辑集成 (服务管理) ---
+// --- 原版 BAT 逻辑集成 ---
 
 func manageService(action string) {
-	svcDir := filepath.Dir(svcExe)
 	switch action {
 	case "install":
-		// 模拟 BAT 中的安装逻辑：sc create + sc config
+		// 模拟原版 BAT: 先清理后安装
 		_ = exec.Command("sc", "stop", SERVICE_NAME).Run()
 		_ = exec.Command("sc", "delete", SERVICE_NAME).Run()
 		time.Sleep(500 * time.Millisecond)
 		
+		// 创建服务并配置自动启动
 		cmd := exec.Command("sc", "create", SERVICE_NAME, "binPath=", svcExe, "start=", "auto", "DisplayName=", "Mihomo Service")
 		cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 		_ = cmd.Run()
@@ -111,17 +110,12 @@ func manageService(action string) {
 		_ = exec.Command("sc", "start", SERVICE_NAME).Run()
 		
 	case "uninstall":
-		// 模拟 BAT 中的卸载逻辑
+		// 模拟原版 BAT: 停止并删除
 		_ = exec.Command("sc", "stop", SERVICE_NAME).Run()
 		_ = exec.Command("sc", "delete", SERVICE_NAME).Run()
-		
-	case "restart":
-		_ = exec.Command("sc", "stop", SERVICE_NAME).Run()
-		time.Sleep(500 * time.Millisecond)
-		_ = exec.Command("sc", "start", SERVICE_NAME).Run()
 	}
 	
-	// 检查服务是否真的在运行
+	// 更新本地配置中的服务状态
 	query := exec.Command("sc", "query", SERVICE_NAME)
 	query.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 	out, _ := query.Output()
@@ -132,7 +126,7 @@ func manageService(action string) {
 	saveIni()
 }
 
-// --- 核心守护 ---
+// --- 核心调度逻辑 ---
 
 func engineKeeper() {
 	defer wg.Done()
@@ -189,7 +183,7 @@ func syncStateFromCore() {
 	}
 }
 
-// --- UI 与菜单 ---
+// --- UI 逻辑 ---
 
 func onReady() {
 	confMu.RLock()
@@ -207,18 +201,20 @@ func onReady() {
 	mDirect := systray.AddMenuItemCheckbox("直连模式", "", conf.Mode == "direct")
 	systray.AddSeparator()
 	
+	// 高级管理子菜单
 	mSet := systray.AddMenuItem("高级管理", "")
 	mAuto := mSet.AddSubMenuItemCheckbox("开机启动", "", conf.AutoStart)
 	mSvcInst := mSet.AddSubMenuItem("安装/修复服务模式", "")
 	mSvcUninst := mSet.AddSubMenuItem("停止/卸载服务模式", "")
 	mRes := mSet.AddSubMenuItem("重启内核进程", "")
-	mExit := mSet.AddSubMenuItem("完全退出", "") // "完全退出" 并入高级管理
+	mExit := mSet.AddSubMenuItem("完全退出", "") // 完全退出并入此处
 	
 	systray.AddSeparator()
-	mDir := systray.AddMenuItem("打开程序目录", "") // 位置调整
+	mDir := systray.AddMenuItem("打开程序目录", "") // 隐藏图标上方
 	mHide := systray.AddMenuItem("隐藏托盘图标", "")
 	confMu.RUnlock()
 
+	// 状态更新协程
 	go func() {
 		for range time.Tick(2 * time.Second) {
 			confMu.RLock()
