@@ -9,7 +9,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"syscall"
 	"time"
 	"unsafe"
@@ -25,19 +24,19 @@ var iconFs embed.FS
 const (
 	API_URL    = "http://127.0.0.1:9090"
 	PROXY_ADDR = "127.0.0.1:7890"
-	APP_MUTEX  = "Global\\MihomoUltimateManager_V16"
+	APP_MUTEX  = "Global\\MihomoUltimateManager_V15"
 	REG_RUN    = `Software\Microsoft\Windows\CurrentVersion\Run`
 )
 
 var (
-	isReallyExiting bool 
+	isReallyExiting bool // 只有点击“彻底退出”才会设为真
 	hJob            windows.Handle
 	httpClient      = &http.Client{Timeout: 2 * time.Second}
 	exePath, _      = os.Executable()
 	baseDir         = filepath.Dir(exePath)
 )
 
-// --- 修复点 1: 强制进程绑定 (主程序死，内核死) ---
+// --- 进程树绑定：确保主程序崩溃时内核也退出，但正常隐藏时不影响 ---
 func initJobObject() {
 	h, _ := windows.CreateJobObject(nil, nil)
 	if h != 0 {
@@ -51,36 +50,7 @@ func initJobObject() {
 	}
 }
 
-// --- 修复点 2: 解决 BAT 无反应，使用 ShellExecute 保证脚本执行 ---
-func runBat(path string) {
-	verbPtr, _ := syscall.UTF16PtrFromString("runas") // 以管理员运行脚本
-	pathPtr, _ := syscall.UTF16PtrFromString(path)
-	dirPtr, _ := syscall.UTF16PtrFromString(filepath.Dir(path))
-	windows.ShellExecute(0, verbPtr, pathPtr, nil, dirPtr, windows.SW_SHOWNORMAL)
-}
-
-// 启动内核专用（保持静默）
-func runKernelSilent(path string) {
-	// 检查是否已经有 mihomo.exe 在跑，防止无限开启
-	check := exec.Command("tasklist")
-	out, _ := check.Output()
-	if strings.Contains(string(out), "mihomo.exe") {
-		return 
-	}
-
-	cmd := exec.Command(path, "-d", baseDir)
-	cmd.Dir = baseDir
-	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-	if hJob != 0 {
-		_ = cmd.Start()
-		hp, _ := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
-		_ = windows.AssignProcessToJobObject(hJob, hp)
-		windows.CloseHandle(hp)
-	} else {
-		_ = cmd.Start()
-	}
-}
-
+// --- 权限与调用 ---
 func isAdmin() bool {
 	var token windows.Token
 	err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token)
@@ -94,6 +64,22 @@ func runAsAdmin() {
 	exePtr, _ := syscall.UTF16PtrFromString(exePath)
 	cwdPtr, _ := syscall.UTF16PtrFromString(baseDir)
 	windows.ShellExecute(0, verb, exePtr, nil, cwdPtr, windows.SW_HIDE)
+}
+
+// 修复后的命令执行：强制指定子目录并使用绝对路径
+func runCmdSilent(fullPath string) {
+	dir := filepath.Dir(fullPath)
+	cmd := exec.Command("cmd.exe", "/C", filepath.Base(fullPath))
+	cmd.Dir = dir // 关键：切换到脚本所在目录
+	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+	if hJob != 0 {
+		_ = cmd.Start()
+		hp, _ := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
+		_ = windows.AssignProcessToJobObject(hJob, hp)
+		windows.CloseHandle(hp)
+	} else {
+		_ = cmd.Start()
+	}
 }
 
 func isServiceInstalled() bool {
@@ -128,12 +114,12 @@ func monitorKernel() {
 	target := filepath.Join(baseDir, "mihomo.exe")
 	for {
 		if isReallyExiting { return }
-		// 通过 API 检测内核是否真的活着
 		_, err := httpClient.Get(API_URL)
 		if err != nil {
-			runKernelSilent(target)
+			// 内核不在运行，启动它
+			runCmdSilent(target)
 		}
-		time.Sleep(10 * time.Second) // 增加间隔，防止瞬时拉起多个
+		time.Sleep(5 * time.Second)
 	}
 }
 
@@ -154,16 +140,16 @@ func onReady() {
 	mSvcUninst := mSvcRoot.AddSubMenuItem("卸载服务", "")
 	
 	mAuto := systray.AddMenuItemCheckbox("开机自动启动", "", false)
-	mHide := systray.AddMenuItem("隐藏托盘图标", "")
+	mHide := systray.AddMenuItem("隐藏托盘图标", "点击后图标消失，进程常驻后台")
 	systray.AddSeparator()
 
 	mRestart := systray.AddMenuItem("重启内核", "")
 	mExit := systray.AddMenuItem("彻底退出", "")
 
+	// 自动同步状态
 	go func() {
 		for {
 			if isReallyExiting { return }
-			// 动态置灰逻辑
 			installed := isServiceInstalled()
 			if installed {
 				mSvcInst.Disable()
@@ -188,18 +174,18 @@ func onReady() {
 		case <-mTun.ClickedCh:
 			setCfg(fmt.Sprintf(`{"tun":{"enable":%v}}`, !mTun.Checked()))
 		case <-mSvcBat.ClickedCh:
-			// 使用 ShellExecute 运行 BAT
-			runBat(filepath.Join(baseDir, "mihomo-service", "mihomo-service.bat"))
+			runCmdSilent(filepath.Join(baseDir, "mihomo-service", "mihomo-service.bat"))
 		case <-mSvcInst.ClickedCh:
-			runBat(filepath.Join(baseDir, "mihomo-service", "install.bat"))
+			runCmdSilent(filepath.Join(baseDir, "mihomo-service", "install.bat"))
 		case <-mSvcUninst.ClickedCh:
-			runBat(filepath.Join(baseDir, "mihomo-service", "uninstall.bat"))
+			runCmdSilent(filepath.Join(baseDir, "mihomo-service", "uninstall.bat"))
 		case <-mAuto.ClickedCh:
 			toggleAutoStart(!mAuto.Checked())
 		case <-mHide.ClickedCh:
-			// 退出 UI 线程，进入纯后台模式
+			// 仅退出托盘 UI 循环，不杀死进程
 			systray.Quit()
 		case <-mRestart.ClickedCh:
+			// 杀死内核进程，monitorKernel 会自动拉起
 			exec.Command("taskkill", "/F", "/IM", "mihomo.exe", "/T").Run()
 		case <-mExit.ClickedCh:
 			isReallyExiting = true
@@ -273,7 +259,7 @@ func getIcon(n string) []byte {
 }
 
 func onExit() {
-	// 修复点 3: 只有明确彻底退出时才结束进程
+	// 关键逻辑：如果标志位为假，说明是“隐藏”操作，不执行 os.Exit(0)
 	if isReallyExiting {
 		if hJob != 0 { windows.CloseHandle(hJob) }
 		os.Exit(0)
