@@ -1,22 +1,41 @@
-name: Build Launcher
-on: [push, workflow_dispatch]
+name: Build Mihomo Launcher
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
 jobs:
   build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v3
-      - uses: actions/setup-go@v4
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      - name: Setup Go
+        uses: actions/setup-go@v5
         with:
-          go-version: '1.20'
-      - name: Build
+          go-version: '1.21'
+
+      - name: Install Dependencies
         run: |
-          go mod init mihomo-launcher || echo "skip"
-          go mod tidy
+          go mod init mihomo-launcher || echo "exists"
+          go get github.com/getlantern/systray
+          go get golang.org/x/sys/windows
           go install github.com/akavel/rsrc@latest
+
+      - name: Generate Resource File
+        run: |
+          # 确保 icons 文件夹下有 default.ico
           rsrc -ico icons/default.ico -o resource.syso
+
+      - name: Build Launcher
+        run: |
+          # 编译不带黑窗口的 GUI 程序
           go build -ldflags="-H windowsgui -s -w" -o mihomo-launcher.exe main.go
-      - name: Upload
-        uses: actions/upload-artifact@v3
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v4
         with:
-          name: launcher-only
+          name: mihomo-launcher-dist
           path: mihomo-launcher.exe
