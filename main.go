@@ -28,7 +28,7 @@ const (
 	API_URL      = "http://127.0.0.1:9090"
 	PROXY_ADDR   = "127.0.0.1:7890"
 	APP_MUTEX    = "Global\\MihomoLauncherMutex"
-	TUN_ADAPTER  = "Mihomo" // 物理网卡关键字
+	TUN_ADAPTER  = "Mihomo" 
 )
 
 var (
@@ -69,7 +69,7 @@ func runAsAdmin() {
 	_ = windows.ShellExecute(0, verb, exePtr, nil, cwdPtr, windows.SW_SHOWNORMAL)
 }
 
-// --- 核心守护逻辑 (骨架1精华) ---
+// --- 核心守护逻辑 ---
 
 func initJobObject() {
 	h, _ := windows.CreateJobObject(nil, nil)
@@ -89,7 +89,6 @@ func initJobObject() {
 func monitorCore() {
 	for {
 		if isExiting { return }
-		
 		confMu.RLock()
 		sMode := conf.ServiceMode
 		confMu.RUnlock()
@@ -97,12 +96,11 @@ func monitorCore() {
 		if !sMode {
 			runCoreAndExclude()
 		}
-		time.Sleep(2 * time.Second) // 守护频率，防止闪退死循环
+		time.Sleep(2 * time.Second)
 	}
 }
 
 func runCoreAndExclude() {
-	// 强制清理残余
 	_ = exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe").Run()
 	time.Sleep(500 * time.Millisecond)
 
@@ -110,7 +108,6 @@ func runCoreAndExclude() {
 
 	cmd := exec.Command(coreExe, "-d", baseDir)
 	cmd.Dir = baseDir
-	// 关键：不显示窗口，允许脱离当前 Job 后重新分配
 	cmd.SysProcAttr = &windows.SysProcAttr{
 		CreationFlags: windows.CREATE_NO_WINDOW | windows.CREATE_BREAKAWAY_FROM_JOB,
 	}
@@ -121,11 +118,8 @@ func runCoreAndExclude() {
 			_ = windows.AssignProcessToJobObject(hJob, hp)
 			windows.CloseHandle(hp)
 		}
-		
-		// 启动后根据 INI 状态补齐 TUN 配置 (骨架1补丁)
 		go patchTunOnStart()
-
-		_ = cmd.Wait() // 阻塞点：内核死，此处才会继续执行重启循环
+		_ = cmd.Wait()
 	}
 }
 
@@ -135,7 +129,7 @@ func patchTunOnStart() {
 	needTun := conf.TunEnabled
 	confMu.RUnlock()
 	if needTun {
-		for i := 0; i < 10; i++ { // 尝试 10 次直到 API 就绪
+		for i := 0; i < 10; i++ {
 			body := `{"tun": {"enable": true}}`
 			req, _ := http.NewRequest("PATCH", API_URL+"/configs", strings.NewReader(body))
 			if resp, err := httpClient.Do(req); err == nil {
@@ -147,14 +141,13 @@ func patchTunOnStart() {
 	}
 }
 
-// --- 状态同步与 UI (骨架2精华) ---
+// --- 状态同步与 UI ---
 
 func syncStateLoop(mProxy, mTun, mRule, mGlobal, mDirect *systray.MenuItem) {
 	for {
 		if isExiting { return }
-		loadIni() // 实时加载，支持双击救活时的配置变更
+		loadIni() 
 
-		// 1. 系统代理检测
 		isProxyOn := false
 		k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.QUERY_VALUE)
 		if err == nil {
@@ -163,7 +156,6 @@ func syncStateLoop(mProxy, mTun, mRule, mGlobal, mDirect *systray.MenuItem) {
 			k.Close()
 		}
 
-		// 2. 物理网卡检测 (TUN 状态最准判据)
 		isTunUp := false
 		ifaces, _ := net.Interfaces()
 		for _, i := range ifaces {
@@ -173,7 +165,6 @@ func syncStateLoop(mProxy, mTun, mRule, mGlobal, mDirect *systray.MenuItem) {
 			}
 		}
 
-		// 3. API 状态拉取
 		resp, err := httpClient.Get(API_URL + "/configs")
 		if err == nil {
 			var data struct {
@@ -189,10 +180,9 @@ func syncStateLoop(mProxy, mTun, mRule, mGlobal, mDirect *systray.MenuItem) {
 			resp.Body.Close()
 			systray.SetIcon(getIcon("default.ico"))
 		} else {
-			systray.SetIcon(getIcon("stop.ico")) // 内核不通变色
+			systray.SetIcon(getIcon("stop.ico"))
 		}
 
-		// 更新 UI 勾选
 		updateUI(mProxy, mTun, mRule, mGlobal, mDirect, isProxyOn, isTunUp)
 		time.Sleep(3 * time.Second)
 	}
@@ -212,8 +202,6 @@ func updateUI(mProxy, mTun, mRule, mGlobal, mDirect *systray.MenuItem, proxy, tu
 	confMu.RUnlock()
 }
 
-// --- 托盘事件控制 ---
-
 func onReady() {
 	systray.SetIcon(getIcon("default.ico"))
 	
@@ -227,9 +215,9 @@ func onReady() {
 	mDirect := systray.AddMenuItemCheckbox("直连模式", "", conf.Mode == "direct")
 	systray.AddSeparator()
 	mSet := systray.AddMenuItem("高级管理", "")
-	mRes := mSet.AddSubMenuItem("手动拉起/重启内核", "")
-	mSvc := mSet.AddSubMenuItem("管理系统服务 (BAT)", "")
-	mHide := mSet.AddSubMenuItem("后台运行 (隐藏托盘)", "")
+	mRes := mSet.AddSubMenuItem("手动重启内核", "")
+	mSvc := mSet.AddSubMenuItem("管理系统服务", "")
+	mHide := mSet.AddSubMenuItem("隐藏托盘 (后台运行)", "")
 	mExit := mSet.AddSubMenuItem("完全退出", "")
 
 	go syncStateLoop(mProxy, mTun, mRule, mGlobal, mDirect)
@@ -253,19 +241,27 @@ func onReady() {
 		case <-mDirect.ClickedCh: setMode("direct")
 		case <-mWeb.ClickedCh: windows.ShellExecute(0, nil, syscall.StringToUTF16Ptr(API_URL+"/ui"), nil, nil, windows.SW_SHOWNORMAL)
 		case <-mRes.ClickedCh: go runCoreAndExclude()
+		case <-mSvc.ClickedCh:
+			// 执行服务脚本逻辑
+			serviceBat := filepath.Join(baseDir, "mihomo-service", "mihomo-service.bat")
+			cmd := exec.Command("cmd", "/c", "start", "", "cmd", "/c", serviceBat)
+			cmd.Dir = filepath.Dir(serviceBat)
+			cmd.SysProcAttr = &windows.SysProcAttr{HideWindow: true}
+			cmd.Start()
 		case <-mHide.ClickedCh:
 			confMu.Lock()
 			conf.TrayHidden = true
 			confMu.Unlock()
 			saveIni()
-			os.Exit(0) // 隐藏即退出 UI 进程，依靠守护进程存活
+			systray.Quit() // 退出托盘循环
+			return         // 结束 onReady，回到 main 的阻塞监听
 		case <-mExit.ClickedCh:
 			cleanExit()
 		}
 	}
 }
 
-// --- 基础工具 (Registry, INI, Exit) ---
+// --- 基础工具 ---
 
 func setProxyReg(e bool) {
 	k, _, _ := registry.CreateKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.ALL_ACCESS)
@@ -320,7 +316,7 @@ func saveIni() {
 func cleanExit() {
 	isExiting = true
 	setProxyReg(false)
-	if hJob != 0 { windows.CloseHandle(hJob) } // 关闭 Job 句柄，内核自动陪葬
+	if hJob != 0 { windows.CloseHandle(hJob) }
 	os.Exit(0)
 }
 
@@ -328,8 +324,6 @@ func getIcon(n string) []byte {
 	d, _ := iconFs.ReadFile("icons/" + n)
 	return d
 }
-
-// --- 入口 ---
 
 func main() {
 	if !isAdmin() { runAsAdmin(); return }
@@ -339,10 +333,9 @@ func main() {
 	coreExe = filepath.Join(baseDir, "mihomo.exe")
 	iniPath = filepath.Join(baseDir, "mihomo-launcher.ini")
 
-	// 1. 单实例与救活逻辑
-	mutex, err := windows.CreateMutex(nil, false, syscall.StringToUTF16Ptr(APP_MUTEX))
-	if err != nil || windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
-		// 救活：新进程写配置，旧进程轮询会发现 TrayHidden 变 false 并显形
+	mutex, _ := windows.CreateMutex(nil, false, syscall.StringToUTF16Ptr(APP_MUTEX))
+	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
+		// 救活逻辑：如果已经运行，修改配置让它“显形”，然后退出当前实例
 		loadIni()
 		conf.TrayHidden = false
 		saveIni()
@@ -352,19 +345,14 @@ func main() {
 
 	loadIni()
 	initJobObject()
-
-	// 2. 独立协程启动守护回路
 	go monitorCore()
 
-	// 3. UI 显隐逻辑
-	if conf.TrayHidden {
-		// 如果隐藏模式启动，主线程仅保持同步
-		for {
-			loadIni()
-			if !conf.TrayHidden { break } // 被救活了，跳出循环进入托盘
-			time.Sleep(2 * time.Second)
+	// 只要程序没完全退出，就持续监听配置变化来“救活”托盘
+	for {
+		loadIni()
+		if !conf.TrayHidden {
+			systray.Run(onReady, nil)
 		}
+		time.Sleep(2 * time.Second)
 	}
-
-	systray.Run(onReady, nil)
 }
