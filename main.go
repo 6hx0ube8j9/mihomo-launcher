@@ -36,7 +36,7 @@ var (
 	baseDir         = filepath.Dir(exePath)
 )
 
-// --- 进程树绑定 ---
+// --- 进程树绑定：确保主程序崩溃时内核也退出，但正常隐藏时不影响 ---
 func initJobObject() {
 	h, _ := windows.CreateJobObject(nil, nil)
 	if h != 0 {
@@ -50,6 +50,7 @@ func initJobObject() {
 	}
 }
 
+// --- 权限与调用 ---
 func isAdmin() bool {
 	var token windows.Token
 	err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token)
@@ -65,16 +66,12 @@ func runAsAdmin() {
 	windows.ShellExecute(0, verb, exePtr, nil, cwdPtr, windows.SW_HIDE)
 }
 
-// --- 核心修复：BAT 运行逻辑 ---
+// 修复后的命令执行：强制指定子目录并使用绝对路径
 func runCmdSilent(fullPath string) {
 	dir := filepath.Dir(fullPath)
-	base := filepath.Base(fullPath)
-	
-	// 使用 cmd /C 并在执行前切换目录，确保 BAT 内部相对路径有效
-	cmd := exec.Command("cmd.exe", "/C", base)
-	cmd.Dir = dir 
+	cmd := exec.Command("cmd.exe", "/C", filepath.Base(fullPath))
+	cmd.Dir = dir // 关键：切换到脚本所在目录
 	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-	
 	if hJob != 0 {
 		_ = cmd.Start()
 		hp, _ := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
@@ -119,7 +116,7 @@ func monitorKernel() {
 		if isReallyExiting { return }
 		_, err := httpClient.Get(API_URL)
 		if err != nil {
-			// 如果内核没跑，启动它
+			// 内核不在运行，启动它
 			runCmdSilent(target)
 		}
 		time.Sleep(5 * time.Second)
@@ -143,12 +140,13 @@ func onReady() {
 	mSvcUninst := mSvcRoot.AddSubMenuItem("卸载服务", "")
 	
 	mAuto := systray.AddMenuItemCheckbox("开机自动启动", "", false)
-	mHide := systray.AddMenuItem("隐藏托盘图标", "")
+	mHide := systray.AddMenuItem("隐藏托盘图标", "点击后图标消失，进程常驻后台")
 	systray.AddSeparator()
 
 	mRestart := systray.AddMenuItem("重启内核", "")
 	mExit := systray.AddMenuItem("彻底退出", "")
 
+	// 自动同步状态
 	go func() {
 		for {
 			if isReallyExiting { return }
@@ -184,9 +182,10 @@ func onReady() {
 		case <-mAuto.ClickedCh:
 			toggleAutoStart(!mAuto.Checked())
 		case <-mHide.ClickedCh:
-			// --- 核心修复：隐藏图标而不退出 ---
+			// 仅退出托盘 UI 循环，不杀死进程
 			systray.Quit()
 		case <-mRestart.ClickedCh:
+			// 杀死内核进程，monitorKernel 会自动拉起
 			exec.Command("taskkill", "/F", "/IM", "mihomo.exe", "/T").Run()
 		case <-mExit.ClickedCh:
 			isReallyExiting = true
@@ -260,7 +259,7 @@ func getIcon(n string) []byte {
 }
 
 func onExit() {
-	// --- 核心修复：拦截隐藏导致的退出 ---
+	// 关键逻辑：如果标志位为假，说明是“隐藏”操作，不执行 os.Exit(0)
 	if isReallyExiting {
 		if hJob != 0 { windows.CloseHandle(hJob) }
 		os.Exit(0)
