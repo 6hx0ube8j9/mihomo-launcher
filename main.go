@@ -24,19 +24,19 @@ var iconFs embed.FS
 const (
 	API_URL    = "http://127.0.0.1:9090"
 	PROXY_ADDR = "127.0.0.1:7890"
-	APP_MUTEX  = "Global\\MihomoUltimateManager_V14"
+	APP_MUTEX  = "Global\\MihomoUltimateManager_V15"
 	REG_RUN    = `Software\Microsoft\Windows\CurrentVersion\Run`
 )
 
 var (
-	isExiting      bool
-	hJob           windows.Handle
-	httpClient     = &http.Client{Timeout: 2 * time.Second}
-	exePath, _     = os.Executable()
-	baseDir        = filepath.Dir(exePath)
+	isReallyExiting bool // 只有点击“彻底退出”才会设为真
+	hJob            windows.Handle
+	httpClient      = &http.Client{Timeout: 2 * time.Second}
+	exePath, _      = os.Executable()
+	baseDir         = filepath.Dir(exePath)
 )
 
-// --- 进程联动核心：Job Object ---
+// --- 进程树绑定 ---
 func initJobObject() {
 	h, _ := windows.CreateJobObject(nil, nil)
 	if h != 0 {
@@ -50,7 +50,6 @@ func initJobObject() {
 	}
 }
 
-// --- 权限与静默调用 ---
 func isAdmin() bool {
 	var token windows.Token
 	err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token)
@@ -66,10 +65,16 @@ func runAsAdmin() {
 	windows.ShellExecute(0, verb, exePtr, nil, cwdPtr, windows.SW_HIDE)
 }
 
-func runCmdSilent(path string, args ...string) {
-	cmd := exec.Command(path, args...)
-	cmd.Dir = baseDir
+// --- 核心修复：BAT 运行逻辑 ---
+func runCmdSilent(fullPath string) {
+	dir := filepath.Dir(fullPath)
+	base := filepath.Base(fullPath)
+	
+	// 使用 cmd /C 并在执行前切换目录，确保 BAT 内部相对路径有效
+	cmd := exec.Command("cmd.exe", "/C", base)
+	cmd.Dir = dir 
 	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+	
 	if hJob != 0 {
 		_ = cmd.Start()
 		hp, _ := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
@@ -80,7 +85,6 @@ func runCmdSilent(path string, args ...string) {
 	}
 }
 
-// --- 服务检测逻辑 ---
 func isServiceInstalled() bool {
 	m, _ := windows.OpenSCManager(nil, nil, windows.SC_MANAGER_CONNECT)
 	if m == 0 { return false }
@@ -112,50 +116,42 @@ func main() {
 func monitorKernel() {
 	target := filepath.Join(baseDir, "mihomo.exe")
 	for {
-		if isExiting { return }
+		if isReallyExiting { return }
 		_, err := httpClient.Get(API_URL)
 		if err != nil {
-			runCmdSilent(target, "-d", baseDir)
+			// 如果内核没跑，启动它
+			runCmdSilent(target)
 		}
 		time.Sleep(5 * time.Second)
 	}
 }
 
 func onReady() {
-	// 初始化图标
 	systray.SetIcon(getIcon("default.ico"))
 
-	// 1. 顶部菜单
 	mWeb := systray.AddMenuItem("控制面板", "")
 	mDir := systray.AddMenuItem("打开程序目录", "")
 	systray.AddSeparator()
 
-	// 2. 模式切换
 	mProxy := systray.AddMenuItemCheckbox("系统代理", "", false)
 	mTun := systray.AddMenuItemCheckbox("TUN 模式", "", false)
 	systray.AddSeparator()
 
-	// 3. 服务管理菜单 (带状态置灰)
 	mSvcRoot := systray.AddMenuItem("服务管理", "")
 	mSvcBat := mSvcRoot.AddSubMenuItem("管理服务 (BAT)", "")
 	mSvcInst := mSvcRoot.AddSubMenuItem("安装服务", "")
 	mSvcUninst := mSvcRoot.AddSubMenuItem("卸载服务", "")
 	
-	// 4. 自启与隐藏
 	mAuto := systray.AddMenuItemCheckbox("开机自动启动", "", false)
 	mHide := systray.AddMenuItem("隐藏托盘图标", "")
 	systray.AddSeparator()
 
-	// 5. 退出
 	mRestart := systray.AddMenuItem("重启内核", "")
 	mExit := systray.AddMenuItem("彻底退出", "")
 
-	// 循环更新 UI 状态
 	go func() {
 		for {
-			if isExiting { return }
-			
-			// A. 服务按钮状态同步
+			if isReallyExiting { return }
 			installed := isServiceInstalled()
 			if installed {
 				mSvcInst.Disable()
@@ -164,15 +160,11 @@ func onReady() {
 				mSvcInst.Enable()
 				mSvcUninst.Disable()
 			}
-
-			// B. 代理与 TUN 状态图标同步
 			syncUI(mProxy, mTun, mAuto)
-			
 			time.Sleep(2 * time.Second)
 		}
 	}()
 
-	// 交互事件处理
 	for {
 		select {
 		case <-mWeb.ClickedCh:
@@ -192,18 +184,18 @@ func onReady() {
 		case <-mAuto.ClickedCh:
 			toggleAutoStart(!mAuto.Checked())
 		case <-mHide.ClickedCh:
-			systray.Quit() // 销毁托盘，但不设置 isExiting，进程保持后台运行
+			// --- 核心修复：隐藏图标而不退出 ---
+			systray.Quit()
 		case <-mRestart.ClickedCh:
-			runCmdSilent("taskkill", "/F", "/IM", "mihomo.exe", "/T")
+			exec.Command("taskkill", "/F", "/IM", "mihomo.exe", "/T").Run()
 		case <-mExit.ClickedCh:
-			isExiting = true
+			isReallyExiting = true
 			systray.Quit()
 		}
 	}
 }
 
 func syncUI(mP, mT, mA *systray.MenuItem) {
-	// 系统代理
 	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.QUERY_VALUE)
 	proxyOn := false
 	if err == nil {
@@ -215,7 +207,6 @@ func syncUI(mP, mT, mA *systray.MenuItem) {
 		k.Close()
 	}
 
-	// 自启状态
 	k2, err := registry.OpenKey(registry.CURRENT_USER, REG_RUN, registry.QUERY_VALUE)
 	if err == nil {
 		_, _, e := k2.GetStringValue("MihomoLauncher")
@@ -223,13 +214,11 @@ func syncUI(mP, mT, mA *systray.MenuItem) {
 		k2.Close()
 	}
 
-	// 内核状态与图标切换 (default, tun, proxy)
 	resp, err := httpClient.Get(API_URL + "/configs")
 	if err == nil {
 		var d struct { Tun struct { Enable bool } `json:"tun"` }
 		json.NewDecoder(resp.Body).Decode(&d)
 		resp.Body.Close()
-
 		if d.Tun.Enable {
 			mT.Check()
 			systray.SetIcon(getIcon("tun.ico"))
@@ -271,7 +260,8 @@ func getIcon(n string) []byte {
 }
 
 func onExit() {
-	if isExiting {
+	// --- 核心修复：拦截隐藏导致的退出 ---
+	if isReallyExiting {
 		if hJob != 0 { windows.CloseHandle(hJob) }
 		os.Exit(0)
 	}
