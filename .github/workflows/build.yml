@@ -1,38 +1,31 @@
-name: Build Mihomo Launcher
-
+name: build
 on:
   push:
     branches: [ main ]
-  workflow_dispatch:
-
+  pull_request:
+    branches: [ main ]
 jobs:
   build:
     runs-on: windows-latest
     steps:
-      - name: Checkout Code
+      - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Setup Go
+      - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.21'
+          go-version: '1.22'
+          cache: true
 
-      - name: Install Dependencies
+      - name: Initialize Mod
         run: |
-          go mod init mihomo-launcher || echo "exists"
-          go get github.com/getlantern/systray
-          go get golang.org/x/sys/windows
+          if (!(Test-Path "go.mod")) {
+            go mod init mihomo-launcher
+          }
           go mod tidy
-          go install github.com/akavel/rsrc@latest
-
-      - name: Generate Resource
-        run: |
-          # 确保仓库 icons/default.ico 路径正确
-          rsrc -ico icons/default.ico -o main.syso
 
       - name: Build
         run: |
-          # 彻底解决变量未使用报错：在 main.go 中已处理
           go build -ldflags="-H windowsgui -s -w" -o mihomo-launcher.exe main.go
 
       - name: Upload
