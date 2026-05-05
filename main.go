@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -41,13 +42,30 @@ type Config struct {
 
 var (
 	conf        Config
-	fullExeP, _ = os.Executable()
-	baseDir     = filepath.Dir(fullExeP)
-	coreExe     = filepath.Join(baseDir, "mihomo.exe")
-	svcExe      = filepath.Join(baseDir, "mihomo-service", "mihomo-service.exe")
-	iniPath     = filepath.Join(baseDir, "mihomo-launcher.ini")
+	fullExeP    string
+	baseDir     string
+	coreExe     string
+	svcExe      string
+	iniPath     string
 	ctx, cancel = context.WithCancel(context.Background())
+	
+	startMu     sync.Mutex
+	lastStart   time.Time
+	httpClient  = &http.Client{Timeout: 2 * time.Second}
 )
+
+func initPaths() error {
+	p, err := os.Executable()
+	if err != nil {
+		return err
+	}
+	fullExeP = p
+	baseDir = filepath.Dir(fullExeP)
+	coreExe = filepath.Join(baseDir, "mihomo.exe")
+	svcExe = filepath.Join(baseDir, "mihomo-service", "mihomo-service.exe")
+	iniPath = filepath.Join(baseDir, "mihomo-launcher.ini")
+	return nil
+}
 
 func runSilent(dir, name string, args ...string) error {
 	cmd := exec.Command(name, args...)
@@ -65,15 +83,16 @@ func checkServiceRealStatus() bool {
 
 func manageService(action string) {
 	svcDir := filepath.Dir(svcExe)
-	if action == "install" {
+	switch action {
+	case "install":
 		_ = runSilent(svcDir, svcExe, "stop")
 		_ = runSilent(svcDir, svcExe, "install")
 		_ = runSilent(svcDir, svcExe, "start")
-	} else if action == "uninstall" {
+	case "uninstall":
 		_ = runSilent(svcDir, svcExe, "stop")
 		killProcess("mihomo.exe")
 		_ = runSilent(svcDir, svcExe, "uninstall")
-	} else {
+	default:
 		_ = runSilent(svcDir, svcExe, action)
 	}
 	conf.ServiceMode = checkServiceRealStatus()
@@ -95,12 +114,9 @@ func engineKeeper() {
 			return
 		case <-ticker.C:
 			if !conf.ServiceMode {
-				resp, err := http.Get(API_URL + "/version")
+				resp, err := httpClient.Get(API_URL + "/version")
 				if err != nil {
-					cmd := exec.Command(coreExe, "-d", baseDir)
-					cmd.Dir = baseDir
-					cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-					_ = cmd.Start()
+					tryStartCore()
 				} else {
 					resp.Body.Close()
 				}
@@ -110,9 +126,35 @@ func engineKeeper() {
 	}
 }
 
+func tryStartCore() {
+	startMu.Lock()
+	defer startMu.Unlock()
+
+	if time.Since(lastStart) < 5*time.Second {
+		return
+	}
+
+	if _, err := os.Stat(coreExe); os.IsNotExist(err) {
+		return
+	}
+
+	cmd := exec.Command(coreExe, "-d", baseDir)
+	cmd.Dir = baseDir
+	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+	
+	if err := cmd.Start(); err == nil {
+		lastStart = time.Now()
+		go func() {
+			_ = cmd.Wait()
+		}()
+	}
+}
+
 func syncStateToCore() {
-	resp, err := http.Get(API_URL + "/configs")
-	if err != nil { return }
+	resp, err := httpClient.Get(API_URL + "/configs")
+	if err != nil {
+		return
+	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
 	data := string(b)
@@ -156,7 +198,13 @@ func onReady() {
 			case <-ctx.Done():
 				return
 			case <-ticker.C:
-				if conf.ServiceMode { mInst.Disable(); mUnin.Enable() } else { mInst.Enable(); mUnin.Disable() }
+				if conf.ServiceMode {
+					mInst.Disable()
+					mUnin.Enable()
+				} else {
+					mInst.Enable()
+					mUnin.Disable()
+				}
 				refreshIcon(mProxy, mTun, mRule, mGlobal, mDirect)
 			}
 		}
@@ -164,24 +212,45 @@ func onReady() {
 
 	for {
 		select {
-		case <-mWeb.ClickedCh: windows.ShellExecute(0, nil, syscall.StringToUTF16Ptr(API_URL+"/ui"), nil, nil, windows.SW_SHOWNORMAL)
-		case <-mProxy.ClickedCh: conf.SystemProxy = !mProxy.Checked(); saveIni()
-		case <-mTun.ClickedCh: conf.TunEnabled = !mTun.Checked(); saveIni()
-		case <-mRule.ClickedCh: conf.Mode = "rule"; saveIni()
-		case <-mGlobal.ClickedCh: conf.Mode = "global"; saveIni()
-		case <-mDirect.ClickedCh: conf.Mode = "direct"; saveIni()
+		case <-mWeb.ClickedCh:
+			windows.ShellExecute(0, nil, syscall.StringToUTF16Ptr(API_URL+"/ui"), nil, nil, windows.SW_SHOWNORMAL)
+		case <-mProxy.ClickedCh:
+			conf.SystemProxy = !mProxy.Checked()
+			saveIni()
+		case <-mTun.ClickedCh:
+			conf.TunEnabled = !mTun.Checked()
+			saveIni()
+		case <-mRule.ClickedCh:
+			conf.Mode = "rule"
+			saveIni()
+		case <-mGlobal.ClickedCh:
+			conf.Mode = "global"
+			saveIni()
+		case <-mDirect.ClickedCh:
+			conf.Mode = "direct"
+			saveIni()
 		case <-mAuto.ClickedCh:
 			conf.AutoStart = !mAuto.Checked()
 			updateAutoStart(conf.AutoStart)
 			saveIni()
-		case <-mInst.ClickedCh: manageService("install")
-		case <-mUnin.ClickedCh: manageService("uninstall")
+		case <-mInst.ClickedCh:
+			manageService("install")
+		case <-mUnin.ClickedCh:
+			manageService("uninstall")
 		case <-mRes.ClickedCh:
-			if conf.ServiceMode { manageService("restart") } else { killProcess("mihomo.exe") }
+			if conf.ServiceMode {
+				manageService("restart")
+			} else {
+				killProcess("mihomo.exe")
+			}
 		case <-mFull.ClickedCh:
 			cancel()
 			setProxyReg(false)
-			if conf.ServiceMode { manageService("stop") } else { killProcess("mihomo.exe") }
+			if conf.ServiceMode {
+				manageService("stop")
+			} else {
+				killProcess("mihomo.exe")
+			}
 			os.Exit(0)
 		case <-mHide.ClickedCh:
 			conf.TrayHidden = true
@@ -192,28 +261,48 @@ func onReady() {
 }
 
 func refreshIcon(mP, mT, mR, mG, mD *systray.MenuItem) {
-	resp, err := http.Get(API_URL + "/configs")
-	if err != nil { systray.SetIcon(getIcon("stop.ico")); return }
+	resp, err := httpClient.Get(API_URL + "/configs")
+	if err != nil {
+		systray.SetIcon(getIcon("stop.ico"))
+		return
+	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
 	s := string(b)
 
-	if strings.Contains(s, `"mode":"rule"`) { mR.Check(); mG.Uncheck(); mD.Uncheck()
-	} else if strings.Contains(s, `"mode":"global"`) { mR.Uncheck(); mG.Check(); mD.Uncheck()
-	} else if strings.Contains(s, `"mode":"direct"`) { mR.Uncheck(); mG.Uncheck(); mD.Check() }
+	if strings.Contains(s, `"mode":"rule"`) {
+		mR.Check()
+		mG.Uncheck()
+		mD.Uncheck()
+	} else if strings.Contains(s, `"mode":"global"`) {
+		mR.Uncheck()
+		mG.Check()
+		mD.Uncheck()
+	} else if strings.Contains(s, `"mode":"direct"`) {
+		mR.Uncheck()
+		mG.Uncheck()
+		mD.Check()
+	}
 
 	if strings.Contains(s, `"tun":{"enable":true`) {
-		systray.SetIcon(getIcon("tun.ico")); mT.Check()
+		systray.SetIcon(getIcon("tun.ico"))
+		mT.Check()
 	} else if isProxyInReg() {
-		systray.SetIcon(getIcon("proxy.ico")); mP.Check(); mT.Uncheck()
+		systray.SetIcon(getIcon("proxy.ico"))
+		mP.Check()
+		mT.Uncheck()
 	} else {
-		systray.SetIcon(getIcon("default.ico")); mP.Uncheck(); mT.Uncheck()
+		systray.SetIcon(getIcon("default.ico"))
+		mP.Uncheck()
+		mT.Uncheck()
 	}
 }
 
 func isProxyInReg() bool {
 	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.QUERY_VALUE)
-	if err != nil { return false }
+	if err != nil {
+		return false
+	}
 	defer k.Close()
 	v, _, _ := k.GetIntegerValue("ProxyEnable")
 	return v == 1
@@ -221,39 +310,50 @@ func isProxyInReg() bool {
 
 func setProxyReg(e bool) {
 	k, _, err := registry.CreateKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.ALL_ACCESS)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer k.Close()
 	if e {
 		_ = k.SetDWordValue("ProxyEnable", 1)
 		_ = k.SetStringValue("ProxyServer", PROXY_ADDR)
 	} else {
 		_ = k.SetDWordValue("ProxyEnable", 0)
-		_ = k.DeleteValue("ProxyServer") // 彻底清除
+		_ = k.DeleteValue("ProxyServer")
 	}
 	windows.NewLazySystemDLL("user32.dll").NewProc("UpdatePerUserSystemParameters").Call(0, 0, 0, 0)
 }
 
 func updateAutoStart(e bool) {
 	k, _ := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.ALL_ACCESS)
-	if e { _ = k.SetStringValue("MihomoLauncher", "\""+fullExeP+"\" -silent") } else { _ = k.DeleteValue("MihomoLauncher") }
+	if e {
+		_ = k.SetStringValue("MihomoLauncher", "\""+fullExeP+"\" -silent")
+	} else {
+		_ = k.DeleteValue("MihomoLauncher")
+	}
 	k.Close()
 }
 
 func sendPatch(j string) {
 	req, _ := http.NewRequest("PATCH", API_URL+"/configs", bytes.NewBuffer([]byte(j)))
-	client := &http.Client{Timeout: time.Second}
-	if resp, err := client.Do(req); err == nil { resp.Body.Close() }
+	if resp, err := httpClient.Do(req); err == nil {
+		resp.Body.Close()
+	}
 }
 
 func getIcon(n string) []byte {
 	d, err := iconFs.ReadFile("icons/" + n)
-	if err != nil { return nil }
+	if err != nil {
+		return nil
+	}
 	return d
 }
 
 func saveIni() {
 	f, err := os.Create(iniPath)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer f.Close()
 	fmt.Fprintf(f, "[Settings]\nauto_start = %v\ntray_hidden = %v\ntun_enabled = %v\nsystem_proxy = %v\nmode = %s\nservice_mode = %v\n",
 		conf.AutoStart, conf.TrayHidden, conf.TunEnabled, conf.SystemProxy, conf.Mode, conf.ServiceMode)
@@ -262,21 +362,38 @@ func saveIni() {
 func loadIni() {
 	conf.Mode = "rule"
 	f, err := os.ReadFile(iniPath)
-	if err != nil { saveIni(); return }
+	if err != nil {
+		saveIni()
+		return
+	}
 	s := string(f)
 	conf.AutoStart = strings.Contains(s, "auto_start = true")
 	conf.TrayHidden = strings.Contains(s, "tray_hidden = true")
 	conf.TunEnabled = strings.Contains(s, "tun_enabled = true")
 	conf.SystemProxy = strings.Contains(s, "system_proxy = true")
-	if strings.Contains(s, "mode = global") { conf.Mode = "global" } else if strings.Contains(s, "mode = direct") { conf.Mode = "direct" }
+	if strings.Contains(s, "mode = global") {
+		conf.Mode = "global"
+	} else if strings.Contains(s, "mode = direct") {
+		conf.Mode = "direct"
+	}
 	conf.ServiceMode = checkServiceRealStatus()
 }
 
 func main() {
+	if err := initPaths(); err != nil {
+		os.Exit(1)
+	}
+
 	isSilent := false
-	for _, a := range os.Args { if a == "-silent" { isSilent = true } }
+	for _, a := range os.Args {
+		if a == "-silent" {
+			isSilent = true
+		}
+	}
 	loadIni()
-	if !isSilent { conf.TrayHidden = false }
+	if !isSilent {
+		conf.TrayHidden = false
+	}
 
 	ln, err := net.Listen("tcp", IPC_PORT)
 	if err != nil {
@@ -292,7 +409,9 @@ func main() {
 		defer ln.Close()
 		for {
 			c, err := ln.Accept()
-			if err != nil { return }
+			if err != nil {
+				return
+			}
 			buf := make([]byte, 11)
 			_ = c.SetReadDeadline(time.Now().Add(time.Second))
 			n, _ := c.Read(buf)
@@ -311,7 +430,9 @@ func main() {
 		select {}
 	} else {
 		systray.Run(onReady, func() {
-			if conf.TrayHidden { select {} }
+			if conf.TrayHidden {
+				select {}
+			}
 		})
 	}
 }
