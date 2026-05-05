@@ -3,19 +3,18 @@ package main
 import (
 	"embed"
 	"encoding/json"
-	"fmt"
 	"io/ioutil"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sync"
-	"syscall"
 	"time"
 
 	"github.com/getlantern/systray"
 )
 
+// --- 资源嵌入 (仅嵌入图标，不嵌入后端) ---
 //go:embed icons/*.ico
 var iconFs embed.FS
 
@@ -29,20 +28,18 @@ type Config struct {
 }
 
 var (
-	conf      Config
-	mu        sync.Mutex
+	conf       Config
+	mu         sync.Mutex
 	exePath, _ = os.Executable()
 	baseDir    = filepath.Dir(exePath)
-	pipeName   = `\\.\pipe\mihomo_launcher_wakeup`
+	// 核心后端路径：指向根目录下的 mihomo.exe
+	coreExe    = filepath.Join(baseDir, "mihomo.exe")
 )
 
 func main() {
-	// 1. 单实例检测 (双击唤醒逻辑)
-	l, err := net.Listen("unix", pipeName) // Windows 下 net.Listen 模拟命名管道或使用特定库
-	// 简易 Windows 方案：尝试监听一个固定端口或使用命名管道
-	ln, err := net.Listen("tcp", "127.0.0.1:54321") 
+	// 1. 单实例检测 (TCP 握手实现双击唤醒信号)
+	ln, err := net.Listen("tcp", "127.0.0.1:54321")
 	if err != nil {
-		// 发送唤醒信号给已存在的实例
 		conn, _ := net.Dial("tcp", "127.0.0.1:54321")
 		if conn != nil {
 			conn.Write([]byte("WAKEUP"))
@@ -54,20 +51,10 @@ func main() {
 
 	loadConfig()
 	
-	// 监听唤醒信号
-	go func() {
-		for {
-			conn, _ := ln.Accept()
-			if conn != nil {
-				// 收到信号，重置隐藏状态并刷新 UI
-				conf.TrayHidden = false
-				saveConfig()
-				// 注意：systray 不支持动态从退出状态恢复，
-				// 这里的唤醒建议配合图标重新加载逻辑
-				conn.Close()
-			}
-		}
-	}()
+	// 启动内核管理协程 (如果不是服务模式，则由 Launcher 负责拉起)
+	if !conf.ServiceMode {
+		go manageCoreLifecycle()
+	}
 
 	systray.Run(onReady, onExit)
 }
@@ -76,19 +63,17 @@ func onReady() {
 	refreshIcon("default.ico")
 	systray.SetTitle("Mihomo Launcher")
 
-	// 核心开关
+	// --- 菜单项构建 ---
 	mProxy := systray.AddMenuItemCheckbox("系统代理", "", conf.SystemProxy)
 	mTun := systray.AddMenuItemCheckbox("虚拟网卡 (TUN)", "", conf.TunEnabled)
 	systray.AddSeparator()
 
-	// 模式切换
 	mModes := systray.AddMenuItem("模式切换", "")
 	mRule := mModes.AddSubMenuItemCheckbox("规则模式", "", conf.ProxyMode == "rule")
 	mGlobal := mModes.AddSubMenuItemCheckbox("全局模式", "", conf.ProxyMode == "global")
 	mDirect := mModes.AddSubMenuItemCheckbox("直连模式", "", conf.ProxyMode == "direct")
 	systray.AddSeparator()
 
-	// 自启动设置
 	mSettings := systray.AddMenuItem("自启动设置", "")
 	mAutoStart := mSettings.AddSubMenuItemCheckbox("开机自动启动", "", conf.AutoStart)
 	mInstallSvc := mSettings.AddSubMenuItem("安装后台服务", "")
@@ -100,16 +85,25 @@ func onReady() {
 	mRestart := systray.AddMenuItem("重启内核", "")
 	mExit := systray.AddMenuItem("退出程序", "")
 
-	// 初始化 UI 状态
 	updateMenuState(mInstallSvc, mUninstallSvc)
 
-	// 事件循环
+	// --- 异步事件处理 ---
 	go func() {
 		for {
 			select {
 			case <-mProxy.ClickedCh:
 				conf.SystemProxy = !mProxy.Checked()
 				if conf.SystemProxy { mProxy.Check() } else { mProxy.Uncheck() }
+				saveConfig()
+			case <-mTun.ClickedCh:
+				conf.TunEnabled = !mTun.Checked()
+				if conf.TunEnabled { 
+					mTun.Check()
+					refreshIcon("tun.ico") 
+				} else { 
+					mTun.Uncheck()
+					refreshIcon("proxy.ico") 
+				}
 				saveConfig()
 			case <-mInstallSvc.ClickedCh:
 				runSvcCmd("install")
@@ -124,33 +118,55 @@ func onReady() {
 			case <-mRunBat.ClickedCh:
 				batPath := filepath.Join(baseDir, "mihomo-service", "mihomo-service.bat")
 				exec.Command("cmd", "/c", "start", "", batPath).Run()
+			case <-mRestart.ClickedCh:
+				terminateCore() // 先杀掉
+				if !conf.ServiceMode { go manageCoreLifecycle() } // 便携模式重启
 			case <-mHide.ClickedCh:
 				conf.TrayHidden = true
 				saveConfig()
 				systray.Quit()
 			case <-mExit.ClickedCh:
-				terminateAll()
+				refreshIcon("stop.ico")
+				terminateAll() // 暴力清理所有残留
 				systray.Quit()
 			}
 		}
 	}()
 }
 
-// 彻底退出逻辑
-func terminateAll() {
-	// 1. 关闭系统代理
-	exec.Command("reg", "add", `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "0", "/f").Run()
-	// 2. 停止服务 (如果开启)
-	if conf.ServiceMode {
-		exec.Command("sc", "stop", "mihomo").Run()
+// 核心后端生命周期管理 (针对便携模式)
+func manageCoreLifecycle() {
+	if _, err := os.Stat(coreExe); os.IsNotExist(err) {
+		refreshIcon("error.ico")
+		return
 	}
-	// 3. 暴力清场
+	// 启动外部 mihomo.exe
+	cmd := exec.Command(coreExe)
+	// 隐藏后端黑窗口
+	cmd.SysProcAttr = &os.ProcAttr{Files: []*os.File{nil, nil, nil}} 
+	cmd.Run()
+}
+
+func terminateCore() {
 	exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe").Run()
 }
 
+func terminateAll() {
+	// 1. 关闭注册表系统代理
+	exec.Command("reg", "add", `HKCU\Software\Microsoft\Windows\CurrentVersion\Internet Settings`, "/v", "ProxyEnable", "/t", "REG_DWORD", "/d", "0", "/f").Run()
+	// 2. 暴力杀掉所有相关进程
+	terminateCore()
+	// 3. 如果是服务模式，停止服务
+	if conf.ServiceMode {
+		exec.Command("sc", "stop", "mihomo").Run()
+	}
+}
+
 func refreshIcon(name string) {
-	data, _ := iconFs.ReadFile("icons/" + name)
-	systray.SetIcon(data)
+	data, err := iconFs.ReadFile("icons/" + name)
+	if err == nil {
+		systray.SetIcon(data)
+	}
 }
 
 func updateMenuState(ins, unins *systray.MenuItem) {
@@ -164,8 +180,12 @@ func updateMenuState(ins, unins *systray.MenuItem) {
 }
 
 func loadConfig() {
-	data, _ := ioutil.ReadFile(filepath.Join(baseDir, "config.json"))
-	json.Unmarshal(data, &conf)
+	data, err := ioutil.ReadFile(filepath.Join(baseDir, "config.json"))
+	if err == nil {
+		json.Unmarshal(data, &conf)
+	} else {
+		conf = Config{ProxyMode: "rule", ServiceMode: false}
+	}
 }
 
 func saveConfig() {
