@@ -44,7 +44,7 @@ var (
 	hJob       windows.Handle
 )
 
-// --- 系统底层控制 (解决权限与黑框) ---
+// --- 系统底层控制 ---
 
 func isAdmin() bool {
 	var token windows.Token
@@ -75,19 +75,17 @@ func initJob() {
 	}
 }
 
-// --- 内核守护逻辑 (解决拉不起内核与自动重启) ---
+// --- 内核守护逻辑 ---
 
 func startCoreLoop() {
 	for {
-		// 清理残留
 		kill := exec.Command("taskkill", "/F", "/IM", "mihomo.exe", "/T")
 		kill.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 		kill.Run()
 		time.Sleep(500 * time.Millisecond)
 
-		// 核心修复：显式指定 Dir 并传入绝对路径驱动
 		cmd := exec.Command(coreExe, "-d", baseDir)
-		cmd.Dir = baseDir // 必须设定，否则内核找不到 yaml
+		cmd.Dir = baseDir
 		cmd.SysProcAttr = &windows.SysProcAttr{
 			CreationFlags: windows.CREATE_NO_WINDOW | windows.CREATE_BREAKAWAY_FROM_JOB,
 		}
@@ -99,7 +97,6 @@ func startCoreLoop() {
 				windows.CloseHandle(hProc)
 			}
 			
-			// 强力拉起 TUN (根据 run 逻辑)
 			if _, err := os.Stat(filepath.Join(baseDir, LOCK_FILE)); err == nil {
 				go func() {
 					for i := 0; i < 10; i++ {
@@ -110,19 +107,17 @@ func startCoreLoop() {
 			}
 			cmd.Wait()
 		} else {
-			// 如果连启动都失败，切换到 error 图标
 			systray.SetIcon(getIcon("error.ico"))
 		}
 		time.Sleep(2 * time.Second)
 	}
 }
 
-// --- 托盘 UI 逻辑 (严格遵循你的菜单排序) ---
+// --- 托盘 UI 逻辑 ---
 
 func onReady() {
 	systray.SetIcon(getIcon("default.ico"))
 	
-	// 一级菜单
 	mWeb := systray.AddMenuItem("进入 Web 面板", "")
 	systray.AddSeparator()
 	mProxy := systray.AddMenuItemCheckbox("系统代理", "", false)
@@ -139,7 +134,7 @@ func onReady() {
 	mInstallSvc := mStartSet.AddSubMenuItem("安装后台服务", "")
 	mUninstallSvc := mStartSet.AddSubMenuItem("卸载后台服务", "")
 	mRunBat := mStartSet.AddSubMenuItem("管理服务 (BAT)", "")
-	mStartSet.AddSeparator()
+	// 注意：MenuItem 没有 AddSeparator 方法，所以这里去掉了子菜单的分隔符
 	mRestart := mStartSet.AddSubMenuItem("重启内核", "")
 	mFullExit := mStartSet.AddSubMenuItem("彻底退出程序", "")
 
@@ -147,7 +142,6 @@ func onReady() {
 	mOpenDir := systray.AddMenuItem("打开程序目录", "")
 	mHide := systray.AddMenuItem("隐藏托盘图标", "")
 
-	// 状态同步
 	go func() {
 		for {
 			syncStatus(mProxy, mTun, mRule, mGlobal, mDirect)
@@ -155,7 +149,6 @@ func onReady() {
 		}
 	}()
 
-	// 事件循环
 	go func() {
 		for {
 			select {
@@ -181,6 +174,14 @@ func onReady() {
 				setAutoStart(conf.AutoStart)
 				saveConfig()
 				if conf.AutoStart { mAutoStart.Check() } else { mAutoStart.Uncheck() }
+
+			case <-mInstallSvc.ClickedCh:
+				// 处理服务安装逻辑
+				runServiceBat("install")
+			case <-mUninstallSvc.ClickedCh:
+				// 处理服务卸载逻辑
+				runServiceBat("uninstall")
+
 			case <-mRestart.ClickedCh:
 				systray.SetIcon(getIcon("stop.ico"))
 				exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe").Run()
@@ -191,8 +192,7 @@ func onReady() {
 			case <-mOpenDir.ClickedCh:
 				exec.Command("explorer", baseDir).Run()
 			case <-mRunBat.ClickedCh:
-				bat := filepath.Join(baseDir, "mihomo-service", "mihomo-service.bat")
-				windows.ShellExecute(0, nil, syscall.StringToUTF16Ptr("cmd"), syscall.StringToUTF16Ptr("/c start /d "+filepath.Dir(bat)+" "+filepath.Base(bat)), nil, windows.SW_HIDE)
+				runServiceBat("")
 			case <-mHide.ClickedCh:
 				systray.Quit()
 			}
@@ -200,10 +200,19 @@ func onReady() {
 	}()
 }
 
+// 提取出的通用运行 BAT 函数
+func runServiceBat(action string) {
+	bat := filepath.Join(baseDir, "mihomo-service", "mihomo-service.bat")
+	args := "/c start /d " + filepath.Dir(bat) + " " + filepath.Base(bat)
+	if action != "" {
+		args += " " + action
+	}
+	windows.ShellExecute(0, nil, syscall.StringToUTF16Ptr("cmd"), syscall.StringToUTF16Ptr(args), nil, windows.SW_HIDE)
+}
+
 // --- 辅助函数 ---
 
 func syncStatus(mP, mT, mR, mG, mD *systray.MenuItem) {
-	// 代理状态
 	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.QUERY_VALUE)
 	isP := false
 	if err == nil {
@@ -212,7 +221,6 @@ func syncStatus(mP, mT, mR, mG, mD *systray.MenuItem) {
 		if v == 1 { mP.Check(); isP = true } else { mP.Uncheck() }
 	}
 
-	// 物理网卡状态
 	isT := false
 	ifaces, _ := net.Interfaces()
 	for _, i := range ifaces {
@@ -221,7 +229,6 @@ func syncStatus(mP, mT, mR, mG, mD *systray.MenuItem) {
 		}
 	}
 
-	// API 状态
 	resp, err := http.Get(API_URL + "/configs")
 	if err != nil {
 		systray.SetIcon(getIcon("stop.ico"))
@@ -231,7 +238,6 @@ func syncStatus(mP, mT, mR, mG, mD *systray.MenuItem) {
 	body, _ := ioutil.ReadAll(resp.Body)
 	data := string(body)
 
-	// 图标切换逻辑机
 	isTunApi := strings.Contains(data, `"tun":{"enable":true`)
 	if isTunApi && isT {
 		mT.Check(); systray.SetIcon(getIcon("tun.ico"))
@@ -240,7 +246,6 @@ func syncStatus(mP, mT, mR, mG, mD *systray.MenuItem) {
 		if isP { systray.SetIcon(getIcon("proxy.ico")) } else { systray.SetIcon(getIcon("default.ico")) }
 	}
 
-	// 模式同步
 	if strings.Contains(data, `"mode":"rule"`) { mR.Check(); mG.Uncheck(); mD.Uncheck() }
 	if strings.Contains(data, `"mode":"global"`) { mR.Uncheck(); mG.Check(); mD.Uncheck() }
 	if strings.Contains(data, `"mode":"direct"`) { mR.Uncheck(); mG.Uncheck(); mD.Check() }
@@ -298,7 +303,6 @@ func main() {
 	if !isAdmin() { runAsAdmin(); return }
 	initJob()
 
-	// 端口占位防止多开
 	ln, err := net.Listen("tcp", LOCK_PORT)
 	if err != nil { return }
 	defer ln.Close()
