@@ -1,0 +1,40 @@
+name: Build Mihomo Launcher
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v3
+
+      - name: Setup Go
+        uses: actions/setup-go@v4
+        with:
+          go-version: '1.20'
+
+      - name: Install Dependencies
+        run: |
+          go mod init mihomo-launcher || tye
+          go mod tidy
+          go install github.com/akavel/rsrc@latest
+
+      - name: Generate Resource File (EXE Icon)
+        run: |
+          # 假设你的图标在 icons/default.ico
+          rsrc -ico icons/default.ico -o main.syso
+
+      - name: Build EXE
+        run: |
+          # -H windowsgui 隐藏控制台, -s -w 减小体积
+          go build -ldflags="-H windowsgui -s -w" -o mihomo-launcher.exe main.go
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v3
+        with:
+          name: mihomo-launcher
+          path: mihomo-launcher.exe
