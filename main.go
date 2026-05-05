@@ -1,42 +1,44 @@
 package main
 
 import (
-	"bytes"
+	"bufio"
 	"embed"
-	"encoding/json"
 	"fmt"
+	"net"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 	"unsafe"
 
 	"github.com/getlantern/systray"
 	"golang.org/x/sys/windows"
-	"golang.org/x/sys/windows/registry"
 )
 
 //go:embed icons/*.ico
 var iconFs embed.FS
 
 const (
-	API_URL    = "http://127.0.0.1:9090"
-	PROXY_ADDR = "127.0.0.1:7890"
-	APP_MUTEX  = "Global\\MihomoUltimateManager_V15"
-	REG_RUN    = `Software\Microsoft\Windows\CurrentVersion\Run`
+	PIPE_NAME   = `\\.\pipe\MihomoLauncherWakeup`
+	APP_MUTEX   = "Global\\MihomoUltimateManager_V19"
+	API_URL     = "http://127.0.0.1:9090"
+	CONFIG_FILE = "mihomo-launcher.ini"
 )
 
 var (
-	isReallyExiting bool // 只有点击“彻底退出”才会设为真
+	isReallyExiting bool
+	isHidden        bool
 	hJob            windows.Handle
 	httpClient      = &http.Client{Timeout: 2 * time.Second}
 	exePath, _      = os.Executable()
 	baseDir         = filepath.Dir(exePath)
 )
 
-// --- 进程树绑定：确保主程序崩溃时内核也退出，但正常隐藏时不影响 ---
+// --- 基础工具 ---
+
 func initJobObject() {
 	h, _ := windows.CreateJobObject(nil, nil)
 	if h != 0 {
@@ -50,63 +52,113 @@ func initJobObject() {
 	}
 }
 
-// --- 权限与调用 ---
-func isAdmin() bool {
-	var token windows.Token
-	err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token)
-	if err != nil { return false }
-	defer token.Close()
-	return token.IsElevated()
-}
-
-func runAsAdmin() {
-	verb, _ := syscall.UTF16PtrFromString("runas")
-	exePtr, _ := syscall.UTF16PtrFromString(exePath)
-	cwdPtr, _ := syscall.UTF16PtrFromString(baseDir)
-	windows.ShellExecute(0, verb, exePtr, nil, cwdPtr, windows.SW_HIDE)
-}
-
-// 修复后的命令执行：强制指定子目录并使用绝对路径
-func runCmdSilent(fullPath string) {
-	dir := filepath.Dir(fullPath)
-	cmd := exec.Command("cmd.exe", "/C", filepath.Base(fullPath))
-	cmd.Dir = dir // 关键：切换到脚本所在目录
-	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-	if hJob != 0 {
-		_ = cmd.Start()
-		hp, _ := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
-		_ = windows.AssignProcessToJobObject(hJob, hp)
-		windows.CloseHandle(hp)
-	} else {
-		_ = cmd.Start()
-	}
-}
-
-func isServiceInstalled() bool {
-	m, _ := windows.OpenSCManager(nil, nil, windows.SC_MANAGER_CONNECT)
-	if m == 0 { return false }
-	defer windows.CloseServiceHandle(m)
-	s, err := windows.OpenService(m, windows.StringToUTF16Ptr("mihomo"), windows.SERVICE_QUERY_CONFIG)
-	if err == nil {
-		windows.CloseServiceHandle(s)
-		return true
+func isProcessRunning(name string) bool {
+	snapshot, _ := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if snapshot == 0 { return false }
+	defer windows.CloseHandle(snapshot)
+	var proc windows.ProcessEntry32
+	proc.Size = uint32(unsafe.Sizeof(proc))
+	for windows.Process32Next(snapshot, &proc) == nil {
+		if strings.EqualFold(windows.UTF16ToString(proc.ExeFile[:]), name) {
+			return true
+		}
 	}
 	return false
 }
 
+// --- 核心修复：服务管理逻辑 ---
+
+func runServiceBat() {
+	// 对应 \mihomo\mihomo-service\mihomo-service.bat
+	target := filepath.Join(baseDir, "mihomo-service", "mihomo-service.bat")
+	verbPtr, _ := syscall.UTF16PtrFromString("runas")
+	pathPtr, _ := syscall.UTF16PtrFromString(target)
+	dirPtr, _ := syscall.UTF16PtrFromString(filepath.Dir(target))
+	windows.ShellExecute(0, verbPtr, pathPtr, nil, dirPtr, windows.SW_SHOWNORMAL)
+}
+
+func manageService(action string) {
+	svcExe := filepath.Join(baseDir, "mihomo-service", "mihomo-service.exe")
+	svcDir := filepath.Dir(svcExe)
+
+	run := func(args ...string) {
+		cmd := exec.Command(svcExe, args...)
+		cmd.Dir = svcDir
+		cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+		_ = cmd.Run()
+	}
+
+	if action == "install" {
+		run("stop")
+		run("install")
+		run("start")
+	} else if action == "uninstall" {
+		run("stop")
+		// 杀掉相关进程
+		exec.Command("taskkill", "/f", "/t", "/im", "mihomo-launcher.exe").Run()
+		exec.Command("taskkill", "/f", "/t", "/im", "mihomo.exe").Run()
+		run("uninstall")
+	}
+}
+
+// --- IPC 唤醒逻辑 ---
+
+func startIpcServer() {
+	l, err := net.Listen("pipe", PIPE_NAME)
+	if err != nil { return }
+	for {
+		conn, err := l.Accept()
+		if err != nil { continue }
+		go func(c net.Conn) {
+			defer c.Close()
+			scanner := bufio.NewScanner(c)
+			if scanner.Scan() && scanner.Text() == "WAKEUP" {
+				isHidden = false
+				saveHiddenState(false)
+				systray.SetIcon(getIcon("default.ico")) // 重新显示图标
+			}
+		}(conn)
+	}
+}
+
+func wakeupExistingInstance() {
+	conn, err := net.Dial("pipe", PIPE_NAME)
+	if err == nil {
+		fmt.Fprintln(conn, "WAKEUP")
+		conn.Close()
+	}
+}
+
+// --- 配置持久化 ---
+
+func loadHiddenState() bool {
+	data, _ := os.ReadFile(filepath.Join(baseDir, CONFIG_FILE))
+	return strings.Contains(string(data), "hidden=true")
+}
+
+func saveHiddenState(h bool) {
+	s := "hidden=false"
+	if h { s = "hidden=true" }
+	_ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), []byte(s), 0644)
+}
+
+// --- 主程序 ---
+
 func main() {
-	if !isAdmin() { runAsAdmin(); os.Exit(0) }
-	
 	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
 	h, err := windows.CreateMutex(nil, false, mName)
 	if err != nil || windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
-		if h != 0 { windows.CloseHandle(h) }
+		wakeupExistingInstance()
 		os.Exit(0)
 	}
 
 	initJobObject()
 	os.Chdir(baseDir)
+	isHidden = loadHiddenState()
+
+	go startIpcServer()
 	go monitorKernel()
+
 	systray.Run(onReady, onExit)
 }
 
@@ -115,53 +167,40 @@ func monitorKernel() {
 	for {
 		if isReallyExiting { return }
 		_, err := httpClient.Get(API_URL)
-		if err != nil {
-			// 内核不在运行，启动它
-			runCmdSilent(target)
+		// 仅在 API 失败且 进程不存在时才启动，防止无限多开
+		if err != nil && !isProcessRunning("mihomo.exe") {
+			cmd := exec.Command(target, "-d", baseDir)
+			cmd.Dir = baseDir
+			cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+			_ = cmd.Start()
+			if hJob != 0 {
+				hp, _ := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
+				_ = windows.AssignProcessToJobObject(hJob, hp)
+				windows.CloseHandle(hp)
+			}
 		}
 		time.Sleep(5 * time.Second)
 	}
 }
 
 func onReady() {
-	systray.SetIcon(getIcon("default.ico"))
+	if isHidden {
+		systray.SetIcon([]byte{})
+	} else {
+		systray.SetIcon(getIcon("default.ico"))
+	}
 
 	mWeb := systray.AddMenuItem("控制面板", "")
 	mDir := systray.AddMenuItem("打开程序目录", "")
 	systray.AddSeparator()
 
-	mProxy := systray.AddMenuItemCheckbox("系统代理", "", false)
-	mTun := systray.AddMenuItemCheckbox("TUN 模式", "", false)
+	mSvcBat := systray.AddMenuItem("管理服务 (BAT)", "")
+	mSvcInst := systray.AddMenuItem("安装服务", "")
+	mSvcUninst := systray.AddMenuItem("卸载服务", "")
 	systray.AddSeparator()
 
-	mSvcRoot := systray.AddMenuItem("服务管理", "")
-	mSvcBat := mSvcRoot.AddSubMenuItem("管理服务 (BAT)", "")
-	mSvcInst := mSvcRoot.AddSubMenuItem("安装服务", "")
-	mSvcUninst := mSvcRoot.AddSubMenuItem("卸载服务", "")
-	
-	mAuto := systray.AddMenuItemCheckbox("开机自动启动", "", false)
-	mHide := systray.AddMenuItem("隐藏托盘图标", "点击后图标消失，进程常驻后台")
-	systray.AddSeparator()
-
-	mRestart := systray.AddMenuItem("重启内核", "")
+	mHide := systray.AddMenuItem("隐藏托盘图标", "")
 	mExit := systray.AddMenuItem("彻底退出", "")
-
-	// 自动同步状态
-	go func() {
-		for {
-			if isReallyExiting { return }
-			installed := isServiceInstalled()
-			if installed {
-				mSvcInst.Disable()
-				mSvcUninst.Enable()
-			} else {
-				mSvcInst.Enable()
-				mSvcUninst.Disable()
-			}
-			syncUI(mProxy, mTun, mAuto)
-			time.Sleep(2 * time.Second)
-		}
-	}()
 
 	for {
 		select {
@@ -169,88 +208,21 @@ func onReady() {
 			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(API_URL+"/ui"), nil, nil, windows.SW_SHOWNORMAL)
 		case <-mDir.ClickedCh:
 			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
-		case <-mProxy.ClickedCh:
-			toggleProxy(!mProxy.Checked())
-		case <-mTun.ClickedCh:
-			setCfg(fmt.Sprintf(`{"tun":{"enable":%v}}`, !mTun.Checked()))
 		case <-mSvcBat.ClickedCh:
-			runCmdSilent(filepath.Join(baseDir, "mihomo-service", "mihomo-service.bat"))
+			runServiceBat() // 核心修复：调用指定的 .bat
 		case <-mSvcInst.ClickedCh:
-			runCmdSilent(filepath.Join(baseDir, "mihomo-service", "install.bat"))
+			manageService("install")
 		case <-mSvcUninst.ClickedCh:
-			runCmdSilent(filepath.Join(baseDir, "mihomo-service", "uninstall.bat"))
-		case <-mAuto.ClickedCh:
-			toggleAutoStart(!mAuto.Checked())
+			manageService("uninstall")
 		case <-mHide.ClickedCh:
-			// 仅退出托盘 UI 循环，不杀死进程
-			systray.Quit()
-		case <-mRestart.ClickedCh:
-			// 杀死内核进程，monitorKernel 会自动拉起
-			exec.Command("taskkill", "/F", "/IM", "mihomo.exe", "/T").Run()
+			isHidden = true
+			saveHiddenState(true)
+			systray.SetIcon([]byte{}) // 隐藏图标但不退出
 		case <-mExit.ClickedCh:
 			isReallyExiting = true
 			systray.Quit()
 		}
 	}
-}
-
-func syncUI(mP, mT, mA *systray.MenuItem) {
-	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.QUERY_VALUE)
-	proxyOn := false
-	if err == nil {
-		v, _, _ := k.GetIntegerValue("ProxyEnable")
-		if v == 1 { 
-			mP.Check()
-			proxyOn = true
-		} else { mP.Uncheck() }
-		k.Close()
-	}
-
-	k2, err := registry.OpenKey(registry.CURRENT_USER, REG_RUN, registry.QUERY_VALUE)
-	if err == nil {
-		_, _, e := k2.GetStringValue("MihomoLauncher")
-		if e == nil { mA.Check() } else { mA.Uncheck() }
-		k2.Close()
-	}
-
-	resp, err := httpClient.Get(API_URL + "/configs")
-	if err == nil {
-		var d struct { Tun struct { Enable bool } `json:"tun"` }
-		json.NewDecoder(resp.Body).Decode(&d)
-		resp.Body.Close()
-		if d.Tun.Enable {
-			mT.Check()
-			systray.SetIcon(getIcon("tun.ico"))
-		} else if proxyOn {
-			systray.SetIcon(getIcon("proxy.ico"))
-		} else {
-			mT.Uncheck()
-			systray.SetIcon(getIcon("default.ico"))
-		}
-	}
-}
-
-func toggleAutoStart(enable bool) {
-	k, _ := registry.OpenKey(registry.CURRENT_USER, REG_RUN, registry.SET_VALUE)
-	defer k.Close()
-	if enable { k.SetStringValue("MihomoLauncher", exePath) } else { k.DeleteValue("MihomoLauncher") }
-}
-
-func toggleProxy(e bool) {
-	k, _, _ := registry.CreateKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.ALL_ACCESS)
-	if e {
-		k.SetDWordValue("ProxyEnable", 1)
-		k.SetStringValue("ProxyServer", PROXY_ADDR)
-	} else {
-		k.SetDWordValue("ProxyEnable", 0)
-	}
-	k.Close()
-	windows.NewLazySystemDLL("user32.dll").NewProc("UpdatePerUserSystemParameters").Call(0, 0, 0, 0)
-}
-
-func setCfg(j string) {
-	req, _ := http.NewRequest("PATCH", API_URL+"/configs", bytes.NewBuffer([]byte(j)))
-	if r, err := httpClient.Do(req); err == nil { r.Body.Close() }
 }
 
 func getIcon(n string) []byte {
@@ -259,7 +231,6 @@ func getIcon(n string) []byte {
 }
 
 func onExit() {
-	// 关键逻辑：如果标志位为假，说明是“隐藏”操作，不执行 os.Exit(0)
 	if isReallyExiting {
 		if hJob != 0 { windows.CloseHandle(hJob) }
 		os.Exit(0)
