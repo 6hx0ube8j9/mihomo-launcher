@@ -80,7 +80,7 @@ func runAsAdmin() {
 	if len(os.Args) > 1 {
 		argsPtr, _ = syscall.UTF16PtrFromString(strings.Join(os.Args[1:], " "))
 	}
-	windows.ShellExecute(0, verb, exePtr, argsPtr, cwdPtr, windows.SW_SHOWNORMAL)
+	_ = windows.ShellExecute(0, verb, exePtr, argsPtr, cwdPtr, windows.SW_SHOWNORMAL)
 }
 
 func initJobObject() {
@@ -88,7 +88,7 @@ func initJobObject() {
 	if h != 0 {
 		var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 		info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-		windows.NewLazySystemDLL("kernel32.dll").NewProc("SetInformationJobObject").Call(
+		_, _, _ = windows.NewLazySystemDLL("kernel32.dll").NewProc("SetInformationJobObject").Call(
 			uintptr(h),
 			uintptr(windows.JobObjectExtendedLimitInformation),
 			uintptr(unsafe.Pointer(&info)),
@@ -154,8 +154,8 @@ func tryStartCore() {
 		if hJob != 0 {
 			hp, _ := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
 			if hp != 0 {
-				windows.AssignProcessToJobObject(hJob, hp)
-				windows.CloseHandle(hp)
+				_ = windows.AssignProcessToJobObject(hJob, hp)
+				_ = windows.CloseHandle(hp)
 			}
 		}
 		wg.Add(1)
@@ -200,18 +200,21 @@ func syncStateToCore() {
 	b, _ := io.ReadAll(resp.Body)
 	data := string(b)
 
-	confMu.RLock()
-	cTun, cMode, cProxy := conf.TunEnabled, conf.Mode, conf.SystemProxy
-	confMu.RUnlock()
+	confMu.Lock()
+	defer confMu.Unlock()
 
-	if cTun != strings.Contains(data, `"tun":{"enable":true`) {
-		sendPatch(fmt.Sprintf(`{"tun": {"enable": %v}}`, cTun))
+	// 解决问题 3：如果 Web 面板开启了 TUN，同步更新本地配置，而不是强制覆盖
+	realTun := strings.Contains(data, `"tun":{"enable":true`)
+	if conf.TunEnabled != realTun {
+		conf.TunEnabled = realTun
+		saveIni() 
 	}
-	if !strings.Contains(data, fmt.Sprintf(`"mode":"%s"`, cMode)) {
-		sendPatch(fmt.Sprintf(`{"mode": "%s"}`, cMode))
+
+	if !strings.Contains(data, fmt.Sprintf(`"mode":"%s"`, conf.Mode)) {
+		sendPatch(fmt.Sprintf(`{"mode": "%s"}`, conf.Mode))
 	}
-	if isProxyInReg() != cProxy {
-		setProxyReg(cProxy)
+	if isProxyInReg() != conf.SystemProxy {
+		setProxyReg(conf.SystemProxy)
 	}
 }
 
@@ -219,6 +222,7 @@ func onReady() {
 	confMu.RLock()
 	systray.SetIcon(getIcon("default.ico"))
 	mWeb := systray.AddMenuItem("进入 Web 面板", "")
+	mDir := systray.AddMenuItem("打开程序目录", "") // 修复：选项回归
 	systray.AddSeparator()
 	mProxy := systray.AddMenuItemCheckbox("系统代理", "", conf.SystemProxy)
 	mTun := systray.AddMenuItemCheckbox("虚拟网卡 (TUN)", "", conf.TunEnabled)
@@ -248,7 +252,7 @@ func onReady() {
 				return
 			case <-ticker.C:
 				confMu.RLock()
-				isSvc := conf.ServiceMode
+				isSvc, isProxy, isTun := conf.ServiceMode, conf.SystemProxy, conf.TunEnabled
 				confMu.RUnlock()
 				if isSvc {
 					mInst.Disable()
@@ -257,7 +261,10 @@ func onReady() {
 					mInst.Enable()
 					mUnin.Disable()
 				}
-				refreshIcon(mProxy, mTun, mRule, mGlobal, mDirect)
+				// 实时更新菜单勾选状态
+				if isProxy { mProxy.Check() } else { mProxy.Uncheck() }
+				if isTun { mTun.Check() } else { mTun.Uncheck() }
+				refreshIcon()
 			}
 		}
 	}()
@@ -265,7 +272,9 @@ func onReady() {
 	for {
 		select {
 		case <-mWeb.ClickedCh:
-			windows.ShellExecute(0, nil, syscall.StringToUTF16Ptr(API_URL+"/ui"), nil, nil, windows.SW_SHOWNORMAL)
+			_ = windows.ShellExecute(0, nil, syscall.StringToUTF16Ptr(API_URL+"/ui"), nil, nil, windows.SW_SHOWNORMAL)
+		case <-mDir.ClickedCh:
+			_ = windows.ShellExecute(0, nil, syscall.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
 		case <-mProxy.ClickedCh:
 			confMu.Lock()
 			conf.SystemProxy = !mProxy.Checked()
@@ -332,12 +341,11 @@ func cleanExit() {
 	if isSvc {
 		manageService("stop")
 	} else {
-		// JobObject 会在句柄关闭时自动清理子进程，此处主动 kill 是为了双重保险
 		killProcess("mihomo.exe")
 	}
 
 	if hJob != 0 {
-		windows.CloseHandle(hJob)
+		_ = windows.CloseHandle(hJob)
 	}
 
 	wg.Wait()
@@ -387,7 +395,7 @@ func killProcess(name string) {
 	_ = cmd.Run()
 }
 
-func refreshIcon(mP, mT, mR, mG, mD *systray.MenuItem) {
+func refreshIcon() {
 	resp, err := httpClient.Get(API_URL + "/configs")
 	if err != nil {
 		systray.SetIcon(getIcon("stop.ico"))
@@ -397,23 +405,12 @@ func refreshIcon(mP, mT, mR, mG, mD *systray.MenuItem) {
 	b, _ := io.ReadAll(resp.Body)
 	s := string(b)
 
-	if strings.Contains(s, `"mode":"rule"`) {
-		mR.Check(); mG.Uncheck(); mD.Uncheck()
-	} else if strings.Contains(s, `"mode":"global"`) {
-		mR.Uncheck(); mG.Check(); mD.Uncheck()
-	} else if strings.Contains(s, `"mode":"direct"`) {
-		mR.Uncheck(); mG.Uncheck(); mD.Check()
-	}
-
 	if strings.Contains(s, `"tun":{"enable":true`) {
 		systray.SetIcon(getIcon("tun.ico"))
-		mT.Check()
 	} else if isProxyInReg() {
 		systray.SetIcon(getIcon("proxy.ico"))
-		mP.Check(); mT.Uncheck()
 	} else {
 		systray.SetIcon(getIcon("default.ico"))
-		mP.Uncheck(); mT.Uncheck()
 	}
 }
 
@@ -440,7 +437,7 @@ func setProxyReg(e bool) {
 		_ = k.SetDWordValue("ProxyEnable", 0)
 		_ = k.DeleteValue("ProxyServer")
 	}
-	windows.NewLazySystemDLL("user32.dll").NewProc("UpdatePerUserSystemParameters").Call(0, 0, 0, 0)
+	_, _, _ = windows.NewLazySystemDLL("user32.dll").NewProc("UpdatePerUserSystemParameters").Call(0, 0, 0, 0)
 }
 
 func updateAutoStart(e bool) {
@@ -472,8 +469,6 @@ func getIcon(n string) []byte {
 }
 
 func saveIni() {
-	confMu.RLock()
-	defer confMu.RUnlock()
 	f, err := os.Create(iniPath)
 	if err != nil {
 		return
@@ -484,8 +479,6 @@ func saveIni() {
 }
 
 func loadIni() {
-	confMu.Lock()
-	defer confMu.Unlock()
 	conf.Mode = "rule"
 	f, err := os.ReadFile(iniPath)
 	if err != nil {
@@ -505,44 +498,42 @@ func loadIni() {
 }
 
 func main() {
-	// 1. 提权检查
 	if !isAdmin() {
 		runAsAdmin()
 		return
 	}
 
-	// 2. 初始化路径与 JobObject
 	if err := initPaths(); err != nil {
 		os.Exit(1)
 	}
 	initJobObject()
 
-	// 3. 单实例互斥检查
+	// 单实例检测
 	_, err := windows.CreateMutex(nil, false, syscall.StringToUTF16Ptr(APP_MUTEX))
 	if err != nil {
-		conn, _ := net.DialTimeout("tcp", IPC_PORT, time.Second)
-		if conn != nil {
+		// 解决问题 2：如果已经运行，仅发送唤醒指令并立即静默退出
+		conn, err := net.DialTimeout("tcp", IPC_PORT, time.Second)
+		if err == nil {
 			_, _ = conn.Write([]byte("WAKE_UP_PLZ"))
 			conn.Close()
 		}
-		os.Exit(0)
+		os.Exit(0) // 关键：此处直接退出，不清理环境，不杀内核
 	}
 
-	// 4. 处理启动参数
 	isSilent := false
 	for _, a := range os.Args {
 		if a == "-silent" {
 			isSilent = true
 		}
 	}
+
+	confMu.Lock()
 	loadIni()
 	if !isSilent {
-		confMu.Lock()
 		conf.TrayHidden = false
-		confMu.Unlock()
 	}
+	confMu.Unlock()
 
-	// 5. IPC 唤醒监听
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
@@ -552,7 +543,7 @@ func main() {
 		}
 		go func() {
 			<-mainCtx.Done()
-			ln.Close()
+			_ = ln.Close()
 		}()
 		for {
 			c, err := ln.Accept()
@@ -563,10 +554,14 @@ func main() {
 			_ = c.SetReadDeadline(time.Now().Add(time.Second))
 			n, _ := c.Read(buf)
 			if n == 11 && string(buf) == "WAKE_UP_PLZ" {
-				// 收到唤醒信号，如果是隐藏状态则重新启动带 UI 的实例
-				_ = exec.Command(fullExeP).Start()
-				c.Close()
-				cleanExit()
+				// 收到唤醒：如果当前是隐藏状态，强制显示托盘
+				confMu.RLock()
+				hidden := conf.TrayHidden
+				confMu.RUnlock()
+				if hidden {
+					_ = exec.Command(fullExeP).Start() // 启动一个带 UI 的新副本
+					cleanExit() // 当前后台副本由于要交接 UI，安全退出
+				}
 			}
 			c.Close()
 		}
