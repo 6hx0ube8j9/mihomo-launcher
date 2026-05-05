@@ -22,20 +22,21 @@ jobs:
           go mod init mihomo-launcher || echo "exists"
           go get github.com/getlantern/systray
           go get golang.org/x/sys/windows
+          go mod tidy
           go install github.com/akavel/rsrc@latest
 
-      - name: Generate Resource File
+      - name: Generate Resource
         run: |
-          # 确保 icons 文件夹下有 default.ico
-          rsrc -ico icons/default.ico -o resource.syso
+          # 确保仓库 icons/default.ico 路径正确
+          rsrc -ico icons/default.ico -o main.syso
 
-      - name: Build Launcher
+      - name: Build
         run: |
-          # 编译不带黑窗口的 GUI 程序
+          # 彻底解决变量未使用报错：在 main.go 中已处理
           go build -ldflags="-H windowsgui -s -w" -o mihomo-launcher.exe main.go
 
-      - name: Upload Artifact
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: mihomo-launcher-dist
+          name: mihomo-launcher
           path: mihomo-launcher.exe
