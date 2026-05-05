@@ -2,15 +2,14 @@ name: Build Mihomo Launcher
 
 on:
   push:
-    branches: [ "main", "master" ]
-  pull_request:
-    branches: [ "main", "master" ]
-  workflow_dispatch: # 支持手动触发编译
+    branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
   build:
     runs-on: windows-latest
-
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -19,26 +18,30 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
-          check-latest: true
+          cache: false
 
       - name: Prepare Dependencies
         shell: pwsh
         run: |
-          # 如果没有 go.mod 则初始化
-          if (!(Test-Path "go.mod")) {
-            go mod init mihomo-launcher
-          }
-          # 自动下载依赖并生成稳定的 go.sum
+          # 彻底清理并重建依赖环境
+          if (Test-Path "go.mod") { Remove-Item "go.mod" }
+          if (Test-Path "go.sum") { Remove-Item "go.sum" }
+          
+          go mod init mihomo-launcher
+          # 仅拉取必要的外部包
+          go get github.com/getlantern/systray
+          go get golang.org/x/sys/windows
           go mod tidy
 
       - name: Build Executable
         shell: pwsh
         run: |
-          go build -ldflags="-H=windowsgui -s -w" -o mihomo-launcher.exe main.go
+          # -s -w: 压缩体积
+          # -H windowsgui: 彻底消除启动时的黑框
+          go build -ldflags="-s -w -H windowsgui" -o mihomo-launcher.exe main.go
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mihomo-launcher-windows
+          name: mihomo-launcher
           path: mihomo-launcher.exe
-          retention-days: 14
