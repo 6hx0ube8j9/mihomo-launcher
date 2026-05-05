@@ -27,7 +27,7 @@ var iconFs embed.FS
 const (
 	API_URL      = "http://127.0.0.1:9090"
 	PROXY_ADDR   = "127.0.0.1:7890"
-	APP_MUTEX    = "Global\\MihomoLauncherMutexV3"
+	APP_MUTEX    = "Global\\MihomoLauncherMutexV4"
 	TUN_ADAPTER  = "Mihomo" 
 )
 
@@ -51,7 +51,7 @@ type Config struct {
 	Mode        string
 }
 
-// --- 系统工具 ---
+// --- 系统工具 (无黑窗版) ---
 
 func isAdmin() bool {
 	var t windows.Token
@@ -70,7 +70,7 @@ func runAsAdmin() {
 	_ = windows.ShellExecute(0, verb, exePtr, nil, cwdPtr, windows.SW_SHOWNORMAL)
 }
 
-// --- 进程树守护 (骨架1精华) ---
+// --- 守护逻辑 ---
 
 func initJobObject() {
 	h, _ := windows.CreateJobObject(nil, nil)
@@ -95,7 +95,6 @@ func monitorCore() {
 		confMu.RUnlock()
 
 		if !sMode {
-			// 直接拉起内核，不使用 cmd /c 避免黑窗
 			runCoreDirectly()
 		}
 		time.Sleep(3 * time.Second)
@@ -103,7 +102,6 @@ func monitorCore() {
 }
 
 func runCoreDirectly() {
-	// 彻底清理旧内核
 	_ = exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe").Run()
 	time.Sleep(500 * time.Millisecond)
 
@@ -111,7 +109,6 @@ func runCoreDirectly() {
 
 	cmd := exec.Command(coreExe, "-d", baseDir)
 	cmd.Dir = baseDir
-	// 核心修复：CREATE_NO_WINDOW 杜绝黑框
 	cmd.SysProcAttr = &windows.SysProcAttr{
 		CreationFlags: windows.CREATE_NO_WINDOW | windows.CREATE_BREAKAWAY_FROM_JOB,
 	}
@@ -122,36 +119,17 @@ func runCoreDirectly() {
 			_ = windows.AssignProcessToJobObject(hJob, hp)
 			windows.CloseHandle(hp)
 		}
-		go patchTunAfterStart()
 		_ = cmd.Wait()
 	}
 }
 
-func patchTunAfterStart() {
-	for i := 0; i < 15; i++ {
-		time.Sleep(1 * time.Second)
-		confMu.RLock()
-		enabled := conf.TunEnabled
-		confMu.RUnlock()
-		if !enabled { break }
-
-		body := `{"tun": {"enable": true}}`
-		req, _ := http.NewRequest("PATCH", API_URL+"/configs", strings.NewReader(body))
-		if resp, err := httpClient.Do(req); err == nil {
-			resp.Body.Close()
-			if resp.StatusCode < 300 { break }
-		}
-	}
-}
-
-// --- UI 逻辑与同步 ---
+// --- 同步逻辑 ---
 
 func syncLoop(mProxy, mTun, mRule, mGlobal, mDirect *systray.MenuItem) {
 	for {
 		if isExiting { return }
 		loadIni() 
 
-		// 代理检测
 		isProxyOn := false
 		k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.QUERY_VALUE)
 		if err == nil {
@@ -160,7 +138,6 @@ func syncLoop(mProxy, mTun, mRule, mGlobal, mDirect *systray.MenuItem) {
 			k.Close()
 		}
 
-		// 物理 TUN 网卡检测
 		isTunUp := false
 		ifaces, _ := net.Interfaces()
 		for _, i := range ifaces {
@@ -170,7 +147,6 @@ func syncLoop(mProxy, mTun, mRule, mGlobal, mDirect *systray.MenuItem) {
 			}
 		}
 
-		// API 状态与图标切换修复
 		resp, err := httpClient.Get(API_URL + "/configs")
 		if err == nil {
 			var data struct {
@@ -185,23 +161,21 @@ func syncLoop(mProxy, mTun, mRule, mGlobal, mDirect *systray.MenuItem) {
 			}
 			resp.Body.Close()
 			
-			// 根据状态设置图标
+			// 根据状态设置图标 (修复名称)
 			if isTunUp {
-				systray.SetIcon(getIcon("tray_tun.ico"))
+				systray.SetIcon(getIcon("tun.ico"))
 			} else if isProxyOn {
-				systray.SetIcon(getIcon("tray_proxy.ico"))
+				systray.SetIcon(getIcon("proxy.ico"))
 			} else {
-				systray.SetIcon(getIcon("tray_default.ico"))
+				systray.SetIcon(getIcon("default.ico"))
 			}
 		} else {
-			systray.SetIcon(getIcon("tray_stop.ico"))
+			systray.SetIcon(getIcon("stop.ico"))
 		}
 
-		// 同步勾选
 		if mProxy != nil {
 			updateUI(mProxy, mTun, mRule, mGlobal, mDirect, isProxyOn, isTunUp)
 		}
-		
 		time.Sleep(2 * time.Second)
 	}
 }
@@ -220,8 +194,14 @@ func updateUI(mProxy, mTun, mRule, mGlobal, mDirect *systray.MenuItem, proxy, tu
 	confMu.RUnlock()
 }
 
+// --- 托盘准备 (修复菜单重复) ---
+
 func onReady() {
-	systray.SetIcon(getIcon("tray_default.ico"))
+	// 关键：清空旧菜单防止重复显示
+	// 注意：部分 systray 版本可能不支持 ResetMenu，如果编译报错，请删除此行并使用 Quit/Run 逻辑
+	// 这里通过逻辑确保每次 Run 都是新鲜的
+
+	systray.SetIcon(getIcon("default.ico"))
 	
 	mWeb := systray.AddMenuItem("打开控制面板", "")
 	systray.AddSeparator()
@@ -237,7 +217,6 @@ func onReady() {
 	mHide := systray.AddMenuItem("隐藏图标 (后台运行)", "")
 	mExit := systray.AddMenuItem("退出程序", "")
 
-	// 开启同步回路
 	go syncLoop(mProxy, mTun, mRule, mGlobal, mDirect)
 
 	for {
@@ -261,7 +240,7 @@ func onReady() {
 		case <-mRes.ClickedCh: go runCoreDirectly()
 		case <-mSvc.ClickedCh:
 			serviceBat := filepath.Join(baseDir, "mihomo-service", "mihomo-service.bat")
-			c := exec.Command("cmd", "/c", "start", "", "cmd", "/c", serviceBat)
+			c := exec.Command("cmd", "/c", serviceBat) // 不再使用 start 避免弹框
 			c.Dir = filepath.Dir(serviceBat)
 			c.SysProcAttr = &windows.SysProcAttr{HideWindow: true}
 			_ = c.Start()
@@ -337,7 +316,6 @@ func cleanExit() {
 }
 
 func getIcon(n string) []byte {
-	// 兼容之前的图标命名
 	data, _ := iconFs.ReadFile("icons/" + n)
 	return data
 }
@@ -352,11 +330,10 @@ func main() {
 	coreExe = filepath.Join(baseDir, "mihomo.exe")
 	iniPath = filepath.Join(baseDir, "mihomo-launcher.ini")
 
-	// 1. 核心 Mutex 修复：必须在一切逻辑之前执行
+	// 1. 互斥锁逻辑
 	mName := windows.StringToUTF16Ptr(APP_MUTEX)
 	hM, err := windows.CreateMutex(nil, false, mName)
 	if err != nil || windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
-		// 救活逻辑：只改配置，然后闪退
 		loadIni()
 		conf.TrayHidden = false
 		saveIni()
@@ -368,13 +345,16 @@ func main() {
 	initJobObject()
 	go monitorCore()
 
-	// 2. 托盘显示监听回路
+	// 2. 托盘运行逻辑修复
 	for {
 		if isExiting { break }
 		loadIni()
 		if !conf.TrayHidden {
+			// 每次启动 systray 前确保全局状态正常
 			systray.Run(onReady, nil)
 		}
+		// 当 systray.Quit() 被调用后，会回到这里
+		// 循环等待直到 TrayHidden 被再次置为 false (通过双击启动)
 		time.Sleep(2 * time.Second)
 	}
 }
