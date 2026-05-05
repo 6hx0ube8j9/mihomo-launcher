@@ -14,7 +14,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/getlantern/systray"
+	"[github.com/getlantern/systray](https://github.com/getlantern/systray)"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
@@ -23,9 +23,9 @@ import (
 var iconFs embed.FS
 
 const (
-	API_URL    = "http://127.0.0.1:9090"
-	PROXY_ADDR = "127.0.0.1:7890"
-	IPC_PORT   = "127.0.0.1:54321"
+	API_URL      = "[http://127.0.0.1:9090](http://127.0.0.1:9090)"
+	PROXY_ADDR   = "127.0.0.1:7890"
+	IPC_PORT     = "127.0.0.1:54321"
 	SERVICE_NAME = "Mihomo"
 )
 
@@ -45,9 +45,8 @@ var (
 	coreExe    = filepath.Join(baseDir, "mihomo.exe")
 	svcExe     = filepath.Join(baseDir, "mihomo-service", "mihomo-service.exe")
 	iniPath    = filepath.Join(baseDir, "mihomo-launcher.ini")
+	isStopping = false
 )
-
-// --- 基础工具：静默执行指令 ---
 
 func runSilent(dir, name string, args ...string) error {
 	cmd := exec.Command(name, args...)
@@ -56,10 +55,7 @@ func runSilent(dir, name string, args ...string) error {
 	return cmd.Run()
 }
 
-// --- 服务检测与操作 ---
-
 func checkServiceRealStatus() bool {
-	// 静默检测服务是否存在
 	cmd := exec.Command("sc", "query", SERVICE_NAME)
 	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 	out, _ := cmd.Output()
@@ -67,39 +63,36 @@ func checkServiceRealStatus() bool {
 }
 
 func manageService(action string) {
-	// 安装：stop -> install -> start
+	svcDir := filepath.Dir(svcExe)
 	if action == "install" {
-		runSilent(filepath.Dir(svcExe), svcExe, "stop")
-		runSilent(filepath.Dir(svcExe), svcExe, "install")
-		runSilent(filepath.Dir(svcExe), svcExe, "start")
+		runSilent(svcDir, svcExe, "stop")
+		runSilent(svcDir, svcExe, "install")
+		runSilent(svcDir, svcExe, "start")
 	} else if action == "uninstall" {
-		// 卸载：stop -> kill -> uninstall
-		runSilent(filepath.Dir(svcExe), svcExe, "stop")
+		runSilent(svcDir, svcExe, "stop")
 		killProcess("mihomo.exe")
-		runSilent(filepath.Dir(svcExe), svcExe, "uninstall")
+		runSilent(svcDir, svcExe, "uninstall")
 	} else {
-		runSilent(filepath.Dir(svcExe), svcExe, action)
+		runSilent(svcDir, svcExe, action)
 	}
-	// 执行完操作后，根据实际情况更新配置并写入
 	conf.ServiceMode = checkServiceRealStatus()
 	saveIni()
 }
 
 func killProcess(name string) {
-	// 原生静默杀进程，替代 taskkill
 	cmd := exec.Command("taskkill", "/F", "/T", "/IM", name)
 	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 	cmd.Run()
 }
 
-// --- 内核拉起逻辑 (路径锁定) ---
-
 func engineKeeper() {
 	for {
+		if isStopping {
+			return
+		}
 		if !conf.ServiceMode {
 			resp, err := http.Get(API_URL + "/version")
 			if err != nil {
-				// 强制在根目录拉起内核
 				cmd := exec.Command(coreExe, "-d", baseDir)
 				cmd.Dir = baseDir
 				cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
@@ -113,31 +106,25 @@ func engineKeeper() {
 	}
 }
 
-// --- 状态同步：将 .ini 意图下发给内核 ---
-
 func syncStateToCore() {
 	resp, err := http.Get(API_URL + "/configs")
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
 	data := string(b)
 
-	// 同步 TUN
-	isTunOn := strings.Contains(data, `"tun":{"enable":true`)
-	if conf.TunEnabled != isTunOn {
+	if conf.TunEnabled != strings.Contains(data, `"tun":{"enable":true`) {
 		sendPatch(fmt.Sprintf(`{"tun": {"enable": %v}}`, conf.TunEnabled))
 	}
-	// 同步 Mode
 	if !strings.Contains(data, fmt.Sprintf(`"mode":"%s"`, conf.Mode)) {
 		sendPatch(fmt.Sprintf(`{"mode": "%s"}`, conf.Mode))
 	}
-	// 同步系统代理
 	if isProxyInReg() != conf.SystemProxy {
 		setProxyReg(conf.SystemProxy)
 	}
 }
-
-// --- 托盘 UI ---
 
 func onReady() {
 	systray.SetIcon(getIcon("default.ico"))
@@ -161,8 +148,13 @@ func onReady() {
 
 	go func() {
 		for {
-			// 刷新服务按钮状态
-			if conf.ServiceMode { mI, mU := mInst, mUnin; mI.Disable(); mU.Enable() } else { mInst.Enable(); mUnin.Disable() }
+			if conf.ServiceMode {
+				mInst.Disable()
+				mUnin.Enable()
+			} else {
+				mInst.Enable()
+				mUnin.Disable()
+			}
 			refreshIcon(mProxy, mTun, mRule, mGlobal, mDirect)
 			time.Sleep(2 * time.Second)
 		}
@@ -170,27 +162,45 @@ func onReady() {
 
 	for {
 		select {
-		case <-mWeb.ClickedCh: windows.ShellExecute(0, nil, syscall.StringToUTF16Ptr(API_URL+"/ui"), nil, nil, windows.SW_SHOWNORMAL)
-		case <-mProxy.ClickedCh: 
+		case <-mWeb.ClickedCh:
+			windows.ShellExecute(0, nil, syscall.StringToUTF16Ptr(API_URL+"/ui"), nil, nil, windows.SW_SHOWNORMAL)
+		case <-mProxy.ClickedCh:
 			conf.SystemProxy = !mProxy.Checked()
 			saveIni()
 		case <-mTun.ClickedCh:
 			conf.TunEnabled = !mTun.Checked()
 			saveIni()
-		case <-mRule.ClickedCh: conf.Mode = "rule"; saveIni()
-		case <-mGlobal.ClickedCh: conf.Mode = "global"; saveIni()
-		case <-mDirect.ClickedCh: conf.Mode = "direct"; saveIni()
+		case <-mRule.ClickedCh:
+			conf.Mode = "rule"
+			saveIni()
+		case <-mGlobal.ClickedCh:
+			conf.Mode = "global"
+			saveIni()
+		case <-mDirect.ClickedCh:
+			conf.Mode = "direct"
+			saveIni()
 		case <-mAuto.ClickedCh:
 			conf.AutoStart = !mAuto.Checked()
 			updateAutoStart(conf.AutoStart)
 			saveIni()
-		case <-mInst.ClickedCh: manageService("install")
-		case <-mUnin.ClickedCh: manageService("uninstall")
+		case <-mInst.ClickedCh:
+			manageService("install")
+		case <-mUnin.ClickedCh:
+			manageService("uninstall")
 		case <-mRes.ClickedCh:
-			if conf.ServiceMode { manageService("restart") } else { killProcess("mihomo.exe") }
+			if conf.ServiceMode {
+				manageService("restart")
+			} else {
+				killProcess("mihomo.exe")
+			}
 		case <-mFull.ClickedCh:
+			isStopping = true
 			setProxyReg(false)
-			if conf.ServiceMode { manageService("stop") } else { killProcess("mihomo.exe") }
+			if conf.ServiceMode {
+				manageService("stop")
+			} else {
+				killProcess("mihomo.exe")
+			}
 			os.Exit(0)
 		case <-mHide.ClickedCh:
 			conf.TrayHidden = true
@@ -202,28 +212,47 @@ func onReady() {
 
 func refreshIcon(mP, mT, mR, mG, mD *systray.MenuItem) {
 	resp, err := http.Get(API_URL + "/configs")
-	if err != nil { systray.SetIcon(getIcon("stop.ico")); return }
+	if err != nil {
+		systray.SetIcon(getIcon("stop.ico"))
+		return
+	}
 	defer resp.Body.Close()
 	b, _ := io.ReadAll(resp.Body)
 	s := string(b)
 
-	if strings.Contains(s, `"mode":"rule"`) { mR.Check(); mG.Uncheck(); mD.Uncheck() }
-	if strings.Contains(s, `"mode":"global"`) { mR.Uncheck(); mG.Check(); mD.Uncheck() }
-	if strings.Contains(s, `"mode":"direct"`) { mR.Uncheck(); mG.Uncheck(); mD.Check() }
+	if strings.Contains(s, `"mode":"rule"`) {
+		mR.Check()
+		mG.Uncheck()
+		mD.Uncheck()
+	} else if strings.Contains(s, `"mode":"global"`) {
+		mR.Uncheck()
+		mG.Check()
+		mD.Uncheck()
+	} else if strings.Contains(s, `"mode":"direct"`) {
+		mR.Uncheck()
+		mG.Uncheck()
+		mD.Check()
+	}
 
 	if strings.Contains(s, `"tun":{"enable":true`) {
-		systray.SetIcon(getIcon("tun.ico")); mT.Check()
+		systray.SetIcon(getIcon("tun.ico"))
+		mT.Check()
 	} else if isProxyInReg() {
-		systray.SetIcon(getIcon("proxy.ico")); mP.Check()
+		systray.SetIcon(getIcon("proxy.ico"))
+		mP.Check()
+		mT.Uncheck()
 	} else {
-		systray.SetIcon(getIcon("default.ico")); mP.Uncheck(); mT.Uncheck()
+		systray.SetIcon(getIcon("default.ico"))
+		mP.Uncheck()
+		mT.Uncheck()
 	}
 }
 
-// --- 注册表与配置 ---
-
 func isProxyInReg() bool {
-	k, _ := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.QUERY_VALUE)
+	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.QUERY_VALUE)
+	if err != nil {
+		return false
+	}
 	defer k.Close()
 	v, _, _ := k.GetIntegerValue("ProxyEnable")
 	return v == 1
@@ -231,63 +260,95 @@ func isProxyInReg() bool {
 
 func setProxyReg(e bool) {
 	k, _, _ := registry.CreateKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.ALL_ACCESS)
-	if e { k.SetDWordValue("ProxyEnable", 1); k.SetStringValue("ProxyServer", PROXY_ADDR) } else { k.SetDWordValue("ProxyEnable", 0) }
+	if e {
+		k.SetDWordValue("ProxyEnable", 1)
+		k.SetStringValue("ProxyServer", PROXY_ADDR)
+	} else {
+		k.SetDWordValue("ProxyEnable", 0)
+	}
 	k.Close()
-	windows.NewLazySystemDLL("user32.dll").NewProc("UpdatePerUserSystemParameters").Call(0,0,0,0)
+	windows.NewLazySystemDLL("user32.dll").NewProc("UpdatePerUserSystemParameters").Call(0, 0, 0, 0)
 }
 
 func updateAutoStart(e bool) {
 	k, _ := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.ALL_ACCESS)
-	if e { k.SetStringValue("MihomoLauncher", "\""+exePath+"\" -silent") } else { k.DeleteValue("MihomoLauncher") }
+	if e {
+		k.SetStringValue("MihomoLauncher", "\""+exePath+"\" -silent")
+	} else {
+		k.DeleteValue("MihomoLauncher")
+	}
+	k.Close()
 }
 
 func sendPatch(j string) {
 	req, _ := http.NewRequest("PATCH", API_URL+"/configs", bytes.NewBuffer([]byte(j)))
-	(&http.Client{Timeout: time.Second}).Do(req)
+	client := &http.Client{Timeout: time.Second}
+	resp, err := client.Do(req)
+	if err == nil {
+		resp.Body.Close()
+	}
 }
 
-func getIcon(n string) []byte { d, _ := iconFs.ReadFile("icons/" + n); return d }
+func getIcon(n string) []byte {
+	d, _ := iconFs.ReadFile("icons/" + n)
+	return d
+}
 
 func saveIni() {
 	f, _ := os.Create(iniPath)
 	defer f.Close()
-	fmt.Fprintf(f, "[Settings]\nauto_start = %v\ntray_hidden = %v\ntun_enabled = %v\nsystem_proxy = %v\nmode = %s\nservice_mode = %v\n", 
+	fmt.Fprintf(f, "[Settings]\nauto_start = %v\ntray_hidden = %v\ntun_enabled = %v\nsystem_proxy = %v\nmode = %s\nservice_mode = %v\n",
 		conf.AutoStart, conf.TrayHidden, conf.TunEnabled, conf.SystemProxy, conf.Mode, conf.ServiceMode)
 }
 
 func loadIni() {
-	conf.Mode = "rule" // 默认值
+	conf.Mode = "rule"
 	f, err := os.ReadFile(iniPath)
-	if err != nil { saveIni(); return }
+	if err != nil {
+		saveIni()
+		return
+	}
 	s := string(f)
 	conf.AutoStart = strings.Contains(s, "auto_start = true")
 	conf.TrayHidden = strings.Contains(s, "tray_hidden = true")
 	conf.TunEnabled = strings.Contains(s, "tun_enabled = true")
 	conf.SystemProxy = strings.Contains(s, "system_proxy = true")
-	if strings.Contains(s, "mode = global") { conf.Mode = "global" }
-	if strings.Contains(s, "mode = direct") { conf.Mode = "direct" }
-	// 启动时真实检测服务，修正 .ini 里的 service_mode
+	if strings.Contains(s, "mode = global") {
+		conf.Mode = "global"
+	} else if strings.Contains(s, "mode = direct") {
+		conf.Mode = "direct"
+	}
 	conf.ServiceMode = checkServiceRealStatus()
 }
 
 func main() {
 	isSilent := false
-	for _, a := range os.Args { if a == "-silent" { isSilent = true } }
-	
+	for _, a := range os.Args {
+		if a == "-silent" {
+			isSilent = true
+		}
+	}
+
 	loadIni()
-	if !isSilent { conf.TrayHidden = false }
+	if !isSilent {
+		conf.TrayHidden = false
+	}
 
 	go func() {
 		ln, err := net.Listen("tcp", IPC_PORT)
 		if err != nil {
 			conn, _ := net.Dial("tcp", IPC_PORT)
-			if conn != nil { conn.Write([]byte("RESHOW")); conn.Close() }
+			if conn != nil {
+				conn.Write([]byte("WAKE"))
+				conn.Close()
+			}
 			os.Exit(0)
 		}
 		for {
 			c, _ := ln.Accept()
-			b := make([]byte, 10); n, _ := c.Read(b)
-			if string(b[:n]) == "RESHOW" {
+			b := make([]byte, 10)
+			n, _ := c.Read(b)
+			if string(b[:n]) == "WAKE" {
 				exec.Command(exePath).Start()
 				os.Exit(0)
 			}
@@ -300,6 +361,10 @@ func main() {
 	if conf.TrayHidden {
 		select {}
 	} else {
-		systray.Run(onReady, func() {})
+		systray.Run(onReady, func() {
+			if conf.TrayHidden {
+				select {}
+			}
+		})
 	}
 }
