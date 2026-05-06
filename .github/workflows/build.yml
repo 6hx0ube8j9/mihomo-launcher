@@ -8,8 +8,6 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -18,17 +16,13 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
-          cache: false
 
       - name: Prepare Dependencies
         shell: pwsh
         run: |
-          # 彻底清理并重建依赖环境
           if (Test-Path "go.mod") { Remove-Item "go.mod" }
           if (Test-Path "go.sum") { Remove-Item "go.sum" }
-          
           go mod init mihomo-launcher
-          # 仅拉取必要的外部包
           go get github.com/getlantern/systray
           go get golang.org/x/sys/windows
           go mod tidy
@@ -36,12 +30,23 @@ jobs:
       - name: Build Executable
         shell: pwsh
         run: |
-          # -s -w: 压缩体积
-          # -H windowsgui: 彻底消除启动时的黑框
+          # 确保图标文件夹存在，否则 V26 这种非 embed 模式会加载失败
           go build -ldflags="-s -w -H windowsgui" -o mihomo-launcher.exe main.go
+
+      - name: Prepare Release Package
+        shell: pwsh
+        run: |
+          # 创建一个发布文件夹，把 EXE 和 icons 放在一起
+          New-Item -ItemType Directory -Force -Path "publish"
+          Copy-Item "mihomo-launcher.exe" -Destination "publish\"
+          # 关键：必须拷贝图标文件夹
+          if (Test-Path "icons") {
+            Copy-Item -Recurit -Path "icons" -Destination "publish\"
+          }
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mihomo-launcher
-          path: mihomo-launcher.exe
+          name: mihomo-launcher-full
+          # 关键：上传整个文件夹，而不是单个文件
+          path: publish/
