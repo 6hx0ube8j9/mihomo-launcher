@@ -137,7 +137,7 @@ func onReady() {
 	updateIconByState(StateDefault)
 	systray.SetTooltip("Mihomo Launcher")
 
-	// 1. 顶部：Web面板 (作为菜单第一项，Windows 下双击默认执行此项)
+	// 1. 顶部：Web面板 (Windows下双击托盘图标默认触发第一项)
 	mWeb := systray.AddMenuItem("进入 Web 面板", "")
 	systray.AddSeparator()
 
@@ -160,10 +160,12 @@ func onReady() {
 	mAutoRun := systray.AddMenuItemCheckbox("随系统启动", "", isAutoRunEnabled())
 	mDir := systray.AddMenuItem("打开程序目录", "")
 	mRestart := systray.AddMenuItem("重启内核进程", "")
-	mHide := systray.AddMenuItem("隐藏托盘图标", "隐藏后双击exe唤醒")
+	mHide := systray.AddMenuItem("隐藏托盘图标", "后台运行，双击exe唤醒")
 	mExit := systray.AddMenuItem("彻底退出程序", "")
 
+	// 启动核心监控与初始化同步
 	go monitorKernelDaemon()
+	go syncConfigToKernel()
 
 	// 唤醒服务端
 	go func() {
@@ -195,13 +197,30 @@ func onReady() {
 		case <-mRestart.ClickedCh:
 			restartKernel()
 		case <-mHide.ClickedCh:
-			// 稳健隐藏：直接调用 Quit 退出 UI 进程
-			// 因为 isReallyExiting 默认为 false，onExit 不会杀掉内核
+			// 退出UI进程实现隐藏，不标记 isReallyExiting，则内核不杀
 			systray.Quit()
 		case <-mExit.ClickedCh:
 			isReallyExiting = true
 			systray.Quit()
 		}
+	}
+}
+
+// 自动根据配置文件同步状态到内核
+func syncConfigToKernel() {
+	for i := 0; i < 20; i++ {
+		_, err := httpClient.Get(API_URL)
+		if err == nil {
+			// 同步 TUN
+			if getIniConfig("tun") == "true" { setTunMode(true) }
+			// 同步模式
+			curMode := getIniConfig("mode")
+			if curMode != "" { setMihomoMode(curMode) }
+			// 同步系统代理
+			if getIniConfig("system_proxy") == "true" { setSystemProxy(true) }
+			return
+		}
+		time.Sleep(1 * time.Second)
 	}
 }
 
@@ -305,7 +324,6 @@ func saveIniConfig(key, val string) {
 }
 
 func onExit() {
-	// 关键保护：只有在点击“彻底退出”并将 isReallyExiting 设为 true 时，才杀掉内核
 	if !isReallyExiting { return }
 	if hJob != 0 { windows.CloseHandle(hJob) }
 	cmd := exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe")
@@ -321,6 +339,7 @@ func main() {
 	hMutex, _ := windows.CreateMutex(nil, false, mName)
 	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
 		if hMutex != 0 { windows.CloseHandle(hMutex) }
+		// 唤醒逻辑：给已经运行的后端发信号，让其弹出面板
 		httpClient.Get("http://127.0.0.1:" + WAKEUP_PORT + "/wakeup")
 		os.Exit(0)
 	}
