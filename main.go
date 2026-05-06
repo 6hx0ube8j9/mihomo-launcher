@@ -29,6 +29,7 @@ const (
 	API_URL     = "http://127.0.0.1:9090"
 	CONFIG_FILE = "mihomo-launcher.ini"
 	REG_RUN     = `Software\Microsoft\Windows\CurrentVersion\Run`
+	REG_PROXY   = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
 	APP_NAME    = "MihomoLauncher"
 
 	StateStop = 0; StateError = 1; StateTun = 2; StateProxy = 3; StateDefault = 4
@@ -36,7 +37,7 @@ const (
 
 var (
 	isReallyExiting bool
-	isHidden        bool
+	isIconHidden    bool
 	hJob            windows.Handle
 	httpClient      = &http.Client{Timeout: 1 * time.Second}
 	exePath, _      = os.Executable()
@@ -70,16 +71,13 @@ func initJobObject() {
 		var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 		info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
 		windows.NewLazySystemDLL("kernel32.dll").NewProc("SetInformationJobObject").Call(
-			uintptr(h),
-			9,
-			uintptr(unsafe.Pointer(&info)),
-			uintptr(uint32(unsafe.Sizeof(info))),
+			uintptr(h), 9, uintptr(unsafe.Pointer(&info)), uintptr(uint32(unsafe.Sizeof(info))),
 		)
 		hJob = h
 	}
 }
 
-// --- 状态检测 ---
+// --- 状态与代理操作 ---
 
 func checkSystemState() int {
 	_, err := httpClient.Get(API_URL)
@@ -88,7 +86,7 @@ func checkSystemState() int {
 		return StateError
 	}
 	if isInterfaceExisted("Mihomo") { return StateTun }
-	if isProxyEnabledInRegistry() { return StateProxy } // 系统代理检测
+	if isProxyEnabledInRegistry() { return StateProxy }
 	return StateDefault
 }
 
@@ -101,11 +99,21 @@ func isInterfaceExisted(name string) bool {
 }
 
 func isProxyEnabledInRegistry() bool {
-	key, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.QUERY_VALUE)
+	key, err := registry.OpenKey(registry.CURRENT_USER, REG_PROXY, registry.QUERY_VALUE)
 	if err != nil { return false }
 	defer key.Close()
 	val, _, err := key.GetIntegerValue("ProxyEnable")
 	return err == nil && val == 1
+}
+
+func setSystemProxy(enable bool) {
+	key, _ := registry.OpenKey(registry.CURRENT_USER, REG_PROXY, registry.SET_VALUE)
+	defer key.Close()
+	if enable {
+		key.SetDWordValue("ProxyEnable", 1)
+	} else {
+		key.SetDWordValue("ProxyEnable", 0)
+	}
 }
 
 func isProcessRunning(name string) bool {
@@ -125,32 +133,37 @@ func isProcessRunning(name string) bool {
 func onReady() {
 	loadIniConfigAll()
 	updateIconByState(StateDefault)
+	systray.SetTooltip("Mihomo Launcher (双击打开面板)")
 
-	// 1. Web面板：必须置顶以支持左键双击
-	mWeb := systray.AddMenuItem("进入 Web 面板", "左键双击图标亦可进入")
+	// 1. 顶部：Web面板 (双击默认执行项)
+	mWeb := systray.AddMenuItem("进入 Web 面板", "")
 	systray.AddSeparator()
 
-	// 2. 模式切换：由二级改为一级菜单
+	// 2. 模式切换 (一级菜单)
 	mModeR := systray.AddMenuItemCheckbox("规则模式 (Rule)", "", false)
 	mModeG := systray.AddMenuItemCheckbox("全局模式 (Global)", "", false)
 	mModeD := systray.AddMenuItemCheckbox("直连模式 (Direct)", "", false)
 	systray.AddSeparator()
 
-	// 3. 其他控制
+	// 3. 核心开关
 	mTun := systray.AddMenuItemCheckbox("TUN 模式开关", "", false)
+	mSystemProxy := systray.AddMenuItemCheckbox("系统代理开关", "", isProxyEnabledInRegistry())
+	systray.AddSeparator()
+
+	// 4. 程序管理
 	mAutoRun := systray.AddMenuItemCheckbox("随系统启动", "", isAutoRunEnabled())
 	mDir := systray.AddMenuItem("打开程序目录", "")
-	
-	systray.AddSeparator()
 	mRestart := systray.AddMenuItem("重启内核进程", "")
-	mHide := systray.AddMenuItem("隐藏托盘图标", "仅隐藏，内核保持运行")
+	mHide := systray.AddMenuItem("隐藏托盘图标", "隐藏后双击exe唤醒")
 	mExit := systray.AddMenuItem("彻底退出程序", "")
 
 	go monitorKernelDaemon()
 
-	// 唤醒逻辑
+	// 唤醒服务端
 	go func() {
 		http.ListenAndServe("127.0.0.1:"+WAKEUP_PORT, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			isIconHidden = false
+			updateIconByState(StateDefault) // 重新赋予图标显示
 			fmt.Fprint(w, "ok")
 		}))
 	}()
@@ -167,6 +180,8 @@ func onReady() {
 			setMihomoMode("direct"); mModeR.Uncheck(); mModeG.Uncheck(); mModeD.Check()
 		case <-mTun.ClickedCh:
 			if mTun.Checked() { setTunMode(false); mTun.Uncheck() } else { setTunMode(true); mTun.Check() }
+		case <-mSystemProxy.ClickedCh:
+			if mSystemProxy.Checked() { setSystemProxy(false); mSystemProxy.Uncheck() } else { setSystemProxy(true); mSystemProxy.Check() }
 		case <-mAutoRun.ClickedCh:
 			toggleAutoRun()
 			if isAutoRunEnabled() { mAutoRun.Check() } else { mAutoRun.Uncheck() }
@@ -175,10 +190,10 @@ func onReady() {
 		case <-mRestart.ClickedCh:
 			restartKernel()
 		case <-mHide.ClickedCh:
-			// 修复：仅退出托盘，不杀死进程
-			systray.Quit()
+			// 稳健隐藏方案：清空图标字节，不退出程序
+			isIconHidden = true
+			systray.SetIcon([]byte{})
 		case <-mExit.ClickedCh:
-			// 修复：标记真正退出，这才会杀死内核
 			isReallyExiting = true
 			systray.Quit()
 		}
@@ -202,7 +217,8 @@ func monitorKernelDaemon() {
 			}
 		}
 
-		if curr != lastState {
+		// 仅在未隐藏图标时更新
+		if !isIconHidden && curr != lastState {
 			updateIconByState(curr)
 			lastState = curr
 		}
@@ -211,6 +227,7 @@ func monitorKernelDaemon() {
 }
 
 func updateIconByState(state int) {
+	if isIconHidden { return }
 	files := []string{"stop.ico", "error.ico", "tun.ico", "proxy.ico", "default.ico"}
 	b, err := iconFs.ReadFile("icons/" + files[state])
 	if err != nil { b, _ = iconFs.ReadFile("icons/default.ico") }
