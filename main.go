@@ -196,19 +196,33 @@ func monitorKernelDaemon() {
 }
 
 func main() {
-	if !isAdmin() { runAsAdmin(); os.Exit(0) }
+	// 1. 权限检查：非管理员则请求提权并退出当前进程
+	if !isAdmin() {
+		runAsAdmin()
+		os.Exit(0)
+	}
 
+	// 2. 单实例检测 (Mutex)
 	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
-	hMutex, _ := windows.CreateMutex(nil, false, mName)
+	// 修正：使用 _, _ 忽略未使用的变量，直接通过 GetLastError 判断
+	_, _ = windows.CreateMutex(nil, false, mName)
 	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
+		// 如果已存在实例，发送唤醒信号后退出
 		wakeupExistingInstance()
 		os.Exit(0)
 	}
 
-	initJobObject()
-	go startIpcServer()
-	go monitorKernelDaemon()
+	// 3. 环境准备
+	os.Chdir(baseDir)    // 切换工作目录到程序所在位置
+	initJobObject()      // 初始化 Job Object，确保 Launcher 退出时内核跟着退出
+	
+	// 4. 启动后台服务协程
+	go startIpcServer()      // 监听命名管道唤醒信号
+	go monitorKernelDaemon() // 守护内核进程，挂了自动重连
 
+	// 5. 启动托盘 UI 循环 (阻塞运行)
+	// onReady: 初始化菜单和图标逻辑
+	// onExit:  退出时的清理逻辑（如关闭内核、清理代理）
 	systray.Run(onReady, onExit)
 }
 
