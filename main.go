@@ -48,13 +48,13 @@ var (
 	lastState       = -1
 )
 
-// --- 核心优化：精细化夺权 ---
+// --- 细节处理：优雅判定与夺权 ---
 
 func killAndTakeover() {
 	currentPid := os.Getpid()
 	exeName := filepath.Base(exePath)
 
-	// 1. 物理清理：除了自己，全部干掉
+	// 1. 物理清理所有旧实例（不包括自己）
 	snapshot, _ := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
 	if snapshot != 0 {
 		var proc windows.ProcessEntry32
@@ -72,12 +72,11 @@ func killAndTakeover() {
 		windows.CloseHandle(snapshot)
 	}
 
-	// 2. 强力清理端口占用
+	// 2. 暴力清理端口占用
 	exec.Command("cmd", "/c", fmt.Sprintf("for /f \"tokens=5\" %%a in ('netstat -aon ^| findstr :%s') do taskkill /F /PID %%a", CONTROL_PORT)).Run()
 	
-	// 3. 阻塞等待：直到端口真正属于我
-	// 加入了重试限制和更短的间隔，减少“双进程”并存时间
-	for i := 0; i < 100; i++ { 
+	// 3. 循环抢占端口
+	for i := 0; i < 50; i++ { 
 		l, err := net.Listen("tcp", "127.0.0.1:"+CONTROL_PORT)
 		if err == nil {
 			go func() {
@@ -91,7 +90,7 @@ func killAndTakeover() {
 	}
 }
 
-// --- 配置管理 ---
+// --- 基础配置管理 ---
 
 func loadIniConfigAll() {
 	b, _ := os.ReadFile(filepath.Join(baseDir, CONFIG_FILE))
@@ -124,7 +123,7 @@ func saveIniConfig(key, val string) {
 	_ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), buf.Bytes(), 0644)
 }
 
-// --- 守护进程逻辑 ---
+// --- 进程监控与 JobObject ---
 
 func monitorKernelDaemon() {
 	target := filepath.Join(baseDir, "mihomo.exe")
@@ -177,7 +176,7 @@ func isProcessRunning(name string) bool {
 	return false
 }
 
-// --- UI 逻辑 ---
+// --- UI 设置 ---
 
 func onReady() {
 	loadIniConfigAll()
@@ -236,7 +235,6 @@ func onExit() {
 		if hJob != 0 { windows.CloseHandle(hJob) }
 		os.Exit(0)
 	}
-	select {}
 }
 
 // --- 系统工具 ---
@@ -303,33 +301,38 @@ func initJobObject() {
 	}
 }
 
-// --- 入口函数 ---
+// --- 入口判定：解决“插足”问题 ---
 
 func main() {
 	if !isAdmin() { runAsAdmin(); os.Exit(0) }
 
-	// 补丁 1：抢跑判定
-	// 如果 Mutex 已存在且端口也通，说明已有“上位中”的新进程，自己直接退出，防止杀人逻辑重叠
+	// 【关键修改】判定优先级：
+	// 1. 先读取当前配置
+	loadIniConfigAll()
+	mode := getIniConfig("run_mode")
+
+	// 2. 检查旧进程是否存活
 	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
 	h, _ := windows.CreateMutex(nil, false, mName)
-	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
-		// 检查端口，如果端口通，说明对方已经完全上位，我直接消失
-		conn, err := net.DialTimeout("tcp", "127.0.0.1:"+CONTROL_PORT, 50*time.Millisecond)
-		if err == nil {
-			conn.Close()
+	isAlreadyRunning := (windows.GetLastError() == windows.ERROR_ALREADY_EXISTS)
+
+	if isAlreadyRunning {
+		// 如果旧进程正在显示图标（normal），新进程直接退出，不去插足
+		if mode == "normal" || mode == "" {
+			fmt.Println("已有显示中的实例，静默退出")
 			os.Exit(0)
 		}
+		// 如果旧进程是隐藏的（hidden），则说明需要“夺权”来显示图标，继续往下走 killAndTakeover
 	}
 	hMutex = h
 
-	// 2. 执行清场和端口夺取
+	// 3. 只有当旧进程不存在，或者是隐藏模式时，才执行物理夺权
 	killAndTakeover()
 
-	// 3. 初始化资源
+	// 4. 正式接管资源
 	os.Chdir(baseDir)
 	initJobObject()
 	go monitorKernelDaemon()
 
-	// 4. 正式现身
 	systray.Run(onReady, onExit)
 }
