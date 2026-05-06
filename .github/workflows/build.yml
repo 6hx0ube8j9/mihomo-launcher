@@ -1,4 +1,4 @@
-name: Build Mihomo Launcher
+name: Build Launcher
 
 on:
   push:
@@ -9,34 +9,34 @@ jobs:
   build:
     runs-on: windows-latest
     env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true # 解决警告
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
-      - name: Checkout Code
+      - name: Checkout
         uses: actions/checkout@v4
 
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
+          check-latest: true
 
-      - name: Initialize Environment
+      - name: Init Repo
         shell: pwsh
         run: |
-          if (Test-Path "go.mod") { Remove-Item "go.mod" -Force }
+          if (Test-Path "go.mod") { Remove-Item "go.mod" }
           go mod init mihomo-launcher
           go get github.com/getlantern/systray
           go get golang.org/x/sys/windows
           go mod tidy
 
-      - name: Build Standalone EXE
+      - name: Build EXE
         shell: pwsh
         run: |
           $env:CGO_ENABLED="1"
-          # 注意：LDFLAGS 里的 -H windowsgui 后面不需要加等号
           go build -ldflags="-s -w -H windowsgui" -o mihomo-launcher.exe main.go
 
-      - name: Upload Release Artifact
+      - name: Upload
         uses: actions/upload-artifact@v4
         with:
-          name: mihomo-launcher-v26-stable
+          name: mihomo-launcher-stable
           path: mihomo-launcher.exe
