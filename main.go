@@ -137,12 +137,7 @@ func onReady() {
 	updateIconByState(StateDefault)
 	systray.SetTooltip("Mihomo Launcher")
 
-	// 修复双击逻辑：显式绑定左键点击动作到 Web 面板
-	systray.SetOnClick(func() {
-		openWebPanel()
-	})
-
-	// 1. 顶部：Web面板
+	// 1. 顶部：Web面板 (作为菜单第一项，Windows 下双击默认执行此项)
 	mWeb := systray.AddMenuItem("进入 Web 面板", "")
 	systray.AddSeparator()
 
@@ -173,7 +168,6 @@ func onReady() {
 	// 唤醒服务端
 	go func() {
 		http.ListenAndServe("127.0.0.1:"+WAKEUP_PORT, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			// 如果已经是开启状态，收到唤醒请求则弹出面板
 			openWebPanel()
 			fmt.Fprint(w, "ok")
 		}))
@@ -201,7 +195,8 @@ func onReady() {
 		case <-mRestart.ClickedCh:
 			restartKernel()
 		case <-mHide.ClickedCh:
-			// 修复隐藏逻辑：直接退出UI进程，由于isReallyExiting为false，不会杀内核
+			// 稳健隐藏：直接调用 Quit 退出 UI 进程
+			// 因为 isReallyExiting 默认为 false，onExit 不会杀掉内核
 			systray.Quit()
 		case <-mExit.ClickedCh:
 			isReallyExiting = true
@@ -310,7 +305,7 @@ func saveIniConfig(key, val string) {
 }
 
 func onExit() {
-	// 关键保护：只有点击“彻底退出”时才会杀内核
+	// 关键保护：只有在点击“彻底退出”并将 isReallyExiting 设为 true 时，才杀掉内核
 	if !isReallyExiting { return }
 	if hJob != 0 { windows.CloseHandle(hJob) }
 	cmd := exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe")
@@ -326,7 +321,6 @@ func main() {
 	hMutex, _ := windows.CreateMutex(nil, false, mName)
 	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
 		if hMutex != 0 { windows.CloseHandle(hMutex) }
-		// 唤醒逻辑：给已经运行的内核/UI发信号
 		httpClient.Get("http://127.0.0.1:" + WAKEUP_PORT + "/wakeup")
 		os.Exit(0)
 	}
