@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"embed"
 	"fmt"
 	"net"
 	"net/http"
@@ -17,6 +18,11 @@ import (
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
+
+// --- 资源嵌入 ---
+
+//go:embed icons/*.ico
+var iconFs embed.FS
 
 const (
 	WAKEUP_PORT = "18579"
@@ -57,6 +63,9 @@ var (
 	pGetCursorPos    = user32.NewProc("GetCursorPos")
 	pTrackMenu       = user32.NewProc("TrackPopupMenu")
 	pNotifyIconW     = shell32.NewProc("Shell_NotifyIconW")
+	pLoadIconW       = user32.NewProc("LoadIconW")
+	// 用于从内存创建图标
+	pCreateIconFromResource = user32.NewProc("CreateIconFromResourceEx")
 
 	isReallyExiting bool
 	isHidden        bool
@@ -72,23 +81,23 @@ var (
 	mainHwnd        windows.Handle
 )
 
-// NOTIFYICONDATA 结构体修复：HWnd 使用 windows.Handle 以匹配位宽
+// NOTIFYICONDATA 结构体
 type NOTIFYICONDATA struct {
-	CbSize             uint32
-	HWnd               windows.Handle
-	UID                uint32
-	UFlags             uint32
-	UCallbackMessage   uint32
-	HIcon              windows.Handle
-	SzTip              [128]uint16
-	DwState            uint32
-	DwStateMask        uint32
-	SzInfo             [256]uint16
-	UVersion           uint32
-	SzInfoTitle        [64]uint16
-	DwInfoFlags        uint32
-	GuidItem           [16]byte
-	HBalloonIcon       windows.Handle
+	CbSize           uint32
+	HWnd             windows.Handle
+	UID              uint32
+	UFlags           uint32
+	UCallbackMessage uint32
+	HIcon            windows.Handle
+	SzTip            [128]uint16
+	DwState          uint32
+	DwStateMask      uint32
+	SzInfo           [256]uint16
+	UVersion         uint32
+	SzInfoTitle      [64]uint16
+	DwInfoFlags      uint32
+	GuidItem         [16]byte
+	HBalloonIcon     windows.Handle
 }
 
 type WNDCLASSW struct {
@@ -104,7 +113,7 @@ type WNDCLASSW struct {
 	LpszClassName *uint16
 }
 
-type POINT struct { X, Y int32 }
+type POINT struct{ X, Y int32 }
 
 // --- 窗口消息处理 ---
 
@@ -153,7 +162,7 @@ func showMenu(hWnd windows.Handle) {
 		t, _ := windows.UTF16PtrFromString(text)
 		user32.NewProc("AppendMenuW").Call(hMenu, uintptr(flags), id, uintptr(unsafe.Pointer(t)))
 	}
-	
+
 	addM(IDM_SHOW_UI, "进入 Web 面板", 0)
 	addM(IDM_FOLDER, "打开配置目录", 0)
 	user32.NewProc("AppendMenuW").Call(hMenu, 0x800, 0, 0)
@@ -166,7 +175,7 @@ func showMenu(hWnd windows.Handle) {
 	user32.NewProc("AppendMenuW").Call(hMenu, 0x800, 0, 0)
 
 	autoFlag := uint32(0)
-	if isAutoRunEnabled() { autoFlag = 0x0008 } 
+	if isAutoRunEnabled() { autoFlag = 0x0008 }
 	addM(IDM_AUTORUN, "随系统启动", autoFlag)
 	addM(IDM_RESTART, "重启内核进程", 0)
 	addM(IDM_HIDE, "隐藏托盘图标", 0)
@@ -225,13 +234,29 @@ func setMihomoMode(mode string) {
 	resp, err := httpClient.Do(req); if err == nil { resp.Body.Close() }
 }
 
-// --- 底层辅助 ---
+// --- 底层辅助 (内嵌加载优化) ---
 
 func preloadIcons() {
 	files := []string{"stop.ico", "error.ico", "tun.ico", "proxy.ico", "default.ico"}
 	for i, f := range files {
-		path, _ := windows.UTF16PtrFromString(filepath.Join(baseDir, "icons", f))
-		h, _, _ := user32.NewProc("LoadImageW").Call(0, uintptr(unsafe.Pointer(path)), 1, 0, 0, 0x10)
+		// 从内嵌 FS 读取数据
+		data, err := iconFs.ReadFile("icons/" + f)
+		if err != nil {
+			// 加载系统默认图标
+			h, _, _ := pLoadIconW.Call(0, uintptr(32512))
+			iconHandles[i] = windows.Handle(h)
+			continue
+		}
+
+		// 从内存创建句柄
+		h, _, _ := pCreateIconFromResource.Call(
+			uintptr(unsafe.Pointer(&data[0])),
+			uintptr(len(data)),
+			1,          // TRUE
+			0x00030000, // Version
+			0, 0,       // CX, CY (使用默认)
+			0,          // LR_DEFAULTCOLOR
+		)
 		iconHandles[i] = windows.Handle(h)
 	}
 }
@@ -239,14 +264,14 @@ func preloadIcons() {
 func setupWindow() windows.Handle {
 	className, _ := windows.UTF16PtrFromString("MihomoTrayWnd")
 	hInstance, _, _ := kernel32.NewProc("GetModuleHandleW").Call(0)
-	
+
 	wc := WNDCLASSW{
 		HInstance:     windows.Handle(hInstance),
 		LpszClassName: className,
 		LpfnWndProc:   windows.NewCallback(windowProc),
 	}
 	pRegisterClassW.Call(uintptr(unsafe.Pointer(&wc)))
-	
+
 	hwnd, _, _ := pCreateWindowExW.Call(0, uintptr(unsafe.Pointer(className)), uintptr(unsafe.Pointer(className)), 0, 0, 0, 0, 0, 0, 0, hInstance, 0)
 	return windows.Handle(hwnd)
 }
@@ -342,23 +367,23 @@ func main() {
 	// 单实例 IPC
 	resp, err := httpClient.Get("http://127.0.0.1:" + WAKEUP_PORT + "/wakeup")
 	if err == nil { resp.Body.Close(); os.Exit(0) }
-	
+
 	// JobObject 进程绑定
 	hJob, _ = windows.CreateJobObject(nil, nil)
 	var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 	info.BasicLimitInformation.LimitFlags = 0x2000
 	kernel32.NewProc("SetInformationJobObject").Call(uintptr(hJob), 9, uintptr(unsafe.Pointer(&info)), uintptr(uint32(unsafe.Sizeof(info))))
-	
+
 	loadIniConfigAll()
 	preloadIcons()
-	
+
 	mainHwnd = setupWindow()
 	globalNid.HWnd = mainHwnd
 	globalNid.CbSize = uint32(unsafe.Sizeof(globalNid))
 	globalNid.UID = 1001
 	globalNid.UCallbackMessage = 0x0400 + 1001
 	copy(globalNid.SzTip[:], windows.StringToUTF16("Mihomo Manager"))
-	
+
 	go func() {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/wakeup", func(w http.ResponseWriter, r *http.Request) {
@@ -366,10 +391,10 @@ func main() {
 		})
 		http.ListenAndServe("127.0.0.1:"+WAKEUP_PORT, mux)
 	}()
-	
+
 	go runGuardian()
 	if getIniConfig("tray_hidden") != "true" { addTrayIcon() } else { isHidden = true }
-	
+
 	// 原生消息循环
 	var msg struct {
 		HWnd    windows.Handle
