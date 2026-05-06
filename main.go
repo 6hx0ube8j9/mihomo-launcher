@@ -193,23 +193,52 @@ func syncConfigToKernel() {
 	}
 }
 
+// 优化后的核心守护逻辑：优先探测 API 和 进程，存在即静默
 func monitorKernelDaemon() {
 	target := filepath.Join(baseDir, "mihomo.exe")
 	for {
 		if isReallyExiting { return }
-		curr := checkSystemState()
-		if curr == StateStop {
-			cmd := exec.Command(target, "-d", baseDir)
-			cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-			if err := cmd.Start(); err == nil && hJob != 0 {
-				hp, _ := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
-				_ = windows.AssignProcessToJobObject(hJob, hp)
-				windows.CloseHandle(hp)
+
+		// 1. 探测 API 是否通畅 (接管已有服务/进程)
+		_, err := httpClient.Get(API_URL)
+		
+		if err == nil {
+			// 【接管静默】API 正常，仅更新状态，不执行启动
+			curr := StateDefault
+			if isInterfaceExisted("Mihomo") {
+				curr = StateTun
+			} else if isProxyEnabledInRegistry() {
+				curr = StateProxy
 			}
-		}
-		if curr != lastState {
-			updateIconByState(curr)
-			lastState = curr
+
+			if curr != lastState {
+				updateIconByState(curr)
+				lastState = curr
+			}
+		} else {
+			// 2. API 不通，检查进程是否已经在跑 (防止冲突)
+			if isProcessRunning("mihomo.exe") {
+				// 【异常静默】进程在但 API 不响应，不拉起新进程，避免端口冲突
+				if lastState != StateError {
+					updateIconByState(StateError)
+					lastState = StateError
+				}
+			} else {
+				// 3. 【守护拉起】环境空白，执行启动
+				if lastState != StateStop {
+					updateIconByState(StateStop)
+					lastState = StateStop
+				}
+
+				cmd := exec.Command(target, "-d", baseDir)
+				cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+				
+				if err := cmd.Start(); err == nil && hJob != 0 {
+					hp, _ := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
+					_ = windows.AssignProcessToJobObject(hJob, hp)
+					windows.CloseHandle(hp)
+				}
+			}
 		}
 		time.Sleep(2 * time.Second)
 	}
@@ -287,12 +316,12 @@ func saveIniConfig(key, val string) {
 	_ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), buf.Bytes(), 0644)
 }
 
+// 优化后的退出逻辑：仅依赖 JobObject 自动清理自己拉起的进程，不误杀服务
 func onExit() {
 	if !isReallyExiting { return }
-	if hJob != 0 { windows.CloseHandle(hJob) }
-	cmd := exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe")
-	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-	_ = cmd.Run()
+	if hJob != 0 { 
+		windows.CloseHandle(hJob) 
+	}
 	os.Exit(0)
 }
 
