@@ -13,6 +13,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
+	"unsafe" // 必须引入 unsafe 处理内存对齐
 
 	"github.com/getlantern/systray"
 	"golang.org/x/sys/windows"
@@ -30,7 +31,6 @@ const (
 	REG_RUN     = `Software\Microsoft\Windows\CurrentVersion\Run`
 	APP_NAME    = "MihomoLauncher"
 
-	// 状态常量
 	StateStop = 0; StateError = 1; StateTun = 2; StateProxy = 3; StateDefault = 4
 )
 
@@ -47,7 +47,7 @@ var (
 	lastState       = -1
 )
 
-// --- 系统底层：权限、作业对象、注册表 ---
+// --- 系统底层修复 ---
 
 func isAdmin() bool {
 	var token windows.Token
@@ -69,14 +69,19 @@ func initJobObject() {
 	if h != 0 {
 		var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 		info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+		
+		// 修复点：使用 uintptr(unsafe.Pointer(&info)) 和 unsafe.Sizeof
 		windows.NewLazySystemDLL("kernel32.dll").NewProc("SetInformationJobObject").Call(
-			uintptr(h), 9, uintptr(windows.Pointer(&info)), uintptr(uint32(windows.Sizeof(info))),
+			uintptr(h),
+			9, // JobObjectExtendedLimitInformation
+			uintptr(unsafe.Pointer(&info)),
+			uintptr(uint32(unsafe.Sizeof(info))),
 		)
 		hJob = h
 	}
 }
 
-// --- 状态检测逻辑 (平移自 V26) ---
+// --- 状态检测 ---
 
 func checkSystemState() int {
 	_, err := httpClient.Get(API_URL)
@@ -110,28 +115,27 @@ func isProcessRunning(name string) bool {
 	if snapshot == 0 { return false }
 	defer windows.CloseHandle(snapshot)
 	var proc windows.ProcessEntry32
-	proc.Size = uint32(windows.Sizeof(proc))
+	// 修复点：使用 unsafe.Sizeof
+	proc.Size = uint32(unsafe.Sizeof(proc))
 	for windows.Process32Next(snapshot, &proc) == nil {
 		if strings.EqualFold(windows.UTF16ToString(proc.ExeFile[:]), name) { return true }
 	}
 	return false
 }
 
-// --- UI 逻辑 (基于 systray 框架) ---
+// --- UI 逻辑 ---
 
 func onReady() {
 	loadIniConfigAll()
 	isHidden = getIniConfig("tray_hidden") == "true"
 	
-	// 初始化图标
 	if isHidden {
 		systray.SetIcon([]byte{})
 	} else {
 		updateIconByState(StateDefault)
 	}
 
-	// 菜单构建 (第一项对应双击行为)
-	mWeb := systray.AddMenuItem("进入 Web 面板", "打开控制中心")
+	mWeb := systray.AddMenuItem("进入 Web 面板", "")
 	mDir := systray.AddMenuItem("打开程序目录", "")
 	systray.AddSeparator()
 
@@ -145,13 +149,11 @@ func onReady() {
 	
 	systray.AddSeparator()
 	mRestart := systray.AddMenuItem("重启内核进程", "")
-	mHide := systray.AddMenuItem("隐藏托盘图标", "双击程序exe可重新唤醒")
+	mHide := systray.AddMenuItem("隐藏托盘图标", "")
 	mExit := systray.AddMenuItem("彻底退出程序", "")
 
-	// 守护协程
 	go monitorKernelDaemon()
 
-	// HTTP 唤醒服务端 (单实例通信)
 	go func() {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/wakeup", func(w http.ResponseWriter, r *http.Request) {
@@ -165,7 +167,6 @@ func onReady() {
 		http.ListenAndServe("127.0.0.1:"+WAKEUP_PORT, mux)
 	}()
 
-	// 循环监听菜单
 	for {
 		select {
 		case <-mWeb.ClickedCh:
@@ -202,7 +203,6 @@ func monitorKernelDaemon() {
 		if isReallyExiting { return }
 		curr := checkSystemState()
 		
-		// 进程守护：挂了就拉起
 		if curr == StateStop {
 			cmd := exec.Command(target, "-d", baseDir)
 			cmd.Dir = baseDir
@@ -214,7 +214,6 @@ func monitorKernelDaemon() {
 			}
 		}
 
-		// 动态图标切换
 		if !isHidden && curr != lastState {
 			updateIconByState(curr)
 			lastState = curr
@@ -222,8 +221,6 @@ func monitorKernelDaemon() {
 		time.Sleep(2 * time.Second)
 	}
 }
-
-// --- 功能原子化函数 ---
 
 func updateIconByState(state int) {
 	files := []string{"stop.ico", "error.ico", "tun.ico", "proxy.ico", "default.ico"}
@@ -266,8 +263,6 @@ func restartKernel() {
 	exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe").Run()
 }
 
-// --- 配置管理 ---
-
 func loadIniConfigAll() {
 	b, _ := os.ReadFile(filepath.Join(baseDir, CONFIG_FILE))
 	lines := strings.Split(string(b), "\n")
@@ -303,7 +298,6 @@ func onExit() {
 func main() {
 	if !isAdmin() { runAsAdmin(); os.Exit(0) }
 
-	// 互斥体 + HTTP 唤醒
 	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
 	hMutex, _ := windows.CreateMutex(nil, false, mName)
 	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
