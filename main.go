@@ -13,7 +13,7 @@ import (
 	"sync"
 	"syscall"
 	"time"
-	"unsafe" // 必须引入 unsafe 处理内存对齐
+	"unsafe"
 
 	"github.com/getlantern/systray"
 	"golang.org/x/sys/windows"
@@ -47,7 +47,7 @@ var (
 	lastState       = -1
 )
 
-// --- 系统底层修复 ---
+// --- 系统底层 ---
 
 func isAdmin() bool {
 	var token windows.Token
@@ -69,11 +69,9 @@ func initJobObject() {
 	if h != 0 {
 		var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 		info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-		
-		// 修复点：使用 uintptr(unsafe.Pointer(&info)) 和 unsafe.Sizeof
 		windows.NewLazySystemDLL("kernel32.dll").NewProc("SetInformationJobObject").Call(
 			uintptr(h),
-			9, // JobObjectExtendedLimitInformation
+			9,
 			uintptr(unsafe.Pointer(&info)),
 			uintptr(uint32(unsafe.Sizeof(info))),
 		)
@@ -115,7 +113,6 @@ func isProcessRunning(name string) bool {
 	if snapshot == 0 { return false }
 	defer windows.CloseHandle(snapshot)
 	var proc windows.ProcessEntry32
-	// 修复点：使用 unsafe.Sizeof
 	proc.Size = uint32(unsafe.Sizeof(proc))
 	for windows.Process32Next(snapshot, &proc) == nil {
 		if strings.EqualFold(windows.UTF16ToString(proc.ExeFile[:]), name) { return true }
@@ -127,13 +124,8 @@ func isProcessRunning(name string) bool {
 
 func onReady() {
 	loadIniConfigAll()
-	isHidden = getIniConfig("tray_hidden") == "true"
-	
-	if isHidden {
-		systray.SetIcon([]byte{})
-	} else {
-		updateIconByState(StateDefault)
-	}
+	// 每次启动默认显示图标，不再从 INI 读取隐藏状态
+	updateIconByState(StateDefault)
 
 	mWeb := systray.AddMenuItem("进入 Web 面板", "")
 	mDir := systray.AddMenuItem("打开程序目录", "")
@@ -149,19 +141,16 @@ func onReady() {
 	
 	systray.AddSeparator()
 	mRestart := systray.AddMenuItem("重启内核进程", "")
-	mHide := systray.AddMenuItem("隐藏托盘图标", "")
+	mHide := systray.AddMenuItem("隐藏托盘图标", "仅退出托盘，不退内核")
 	mExit := systray.AddMenuItem("彻底退出程序", "")
 
 	go monitorKernelDaemon()
 
+	// 唤醒逻辑：双击 exe 时重新触发 main -> wakeup，此处重载托盘
 	go func() {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/wakeup", func(w http.ResponseWriter, r *http.Request) {
-			if isHidden {
-				isHidden = false
-				saveIniConfig("tray_hidden", "false")
-				updateIconByState(StateDefault)
-			}
+			// 如果已经调用过 systray.Quit()，再次通过 exe 启动会执行新的进程 main 逻辑
 			fmt.Fprint(w, "ok")
 		})
 		http.ListenAndServe("127.0.0.1:"+WAKEUP_PORT, mux)
@@ -187,9 +176,8 @@ func onReady() {
 		case <-mRestart.ClickedCh:
 			restartKernel()
 		case <-mHide.ClickedCh:
-			isHidden = true
-			saveIniConfig("tray_hidden", "true")
-			systray.SetIcon([]byte{})
+			// 修复：仅退出托盘，不设置退出标记，不销毁内核
+			systray.Quit()
 		case <-mExit.ClickedCh:
 			isReallyExiting = true
 			systray.Quit()
@@ -260,7 +248,10 @@ func isAutoRunEnabled() bool {
 }
 
 func restartKernel() {
-	exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe").Run()
+	// 彻底退出时隐藏黑框
+	cmd := exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe")
+	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+	_ = cmd.Run()
 }
 
 func loadIniConfigAll() {
@@ -272,11 +263,6 @@ func loadIniConfigAll() {
 		parts := strings.SplitN(strings.TrimSpace(line), "=", 2)
 		if len(parts) == 2 { configData[parts[0]] = parts[1] }
 	}
-}
-
-func getIniConfig(key string) string {
-	configMu.RLock(); defer configMu.RUnlock()
-	return configData[key]
 }
 
 func saveIniConfig(key, val string) {
@@ -291,7 +277,10 @@ func saveIniConfig(key, val string) {
 func onExit() {
 	if !isReallyExiting { return }
 	if hJob != 0 { windows.CloseHandle(hJob) }
-	exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe").Run()
+	// 修复：彻底退出程序时，隐藏 taskkill 的黑框
+	cmd := exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe")
+	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+	_ = cmd.Run()
 	os.Exit(0)
 }
 
@@ -302,6 +291,7 @@ func main() {
 	hMutex, _ := windows.CreateMutex(nil, false, mName)
 	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
 		if hMutex != 0 { windows.CloseHandle(hMutex) }
+		// 唤醒已有实例并退出（如果已有实例已隐藏托盘，此处仅作探测，新实例由于无法获取 Mutex 会自动退出）
 		httpClient.Get("http://127.0.0.1:" + WAKEUP_PORT + "/wakeup")
 		os.Exit(0)
 	}
