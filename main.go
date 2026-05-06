@@ -271,7 +271,7 @@ func preloadIcons() {
 }
 
 func setupWindow() windows.Handle {
-	className, _ := windows.UTF16PtrFromString("MihomoTrayWnd")
+	className, _ := windows.UTF16PtrFromString("MihomoTrayWndV26")
 	hInstance, _, _ := kernel32.NewProc("GetModuleHandleW").Call(0)
 
 	wc := WNDCLASSW{
@@ -279,9 +279,19 @@ func setupWindow() windows.Handle {
 		LpszClassName: className,
 		LpfnWndProc:   windows.NewCallback(windowProc),
 	}
-	pRegisterClassW.Call(uintptr(unsafe.Pointer(&wc)))
+	
+	res, _, _ := pRegisterClassW.Call(uintptr(unsafe.Pointer(&wc)))
+	if res == 0 {
+		// 即使注册失败（可能已注册），也继续尝试创建
+	}
 
-	hwnd, _, _ := pCreateWindowExW.Call(0, uintptr(unsafe.Pointer(className)), uintptr(unsafe.Pointer(className)), 0, 0, 0, 0, 0, 0, 0, hInstance, 0)
+	hwnd, _, _ := pCreateWindowExW.Call(
+		0, 
+		uintptr(unsafe.Pointer(className)), 
+		uintptr(unsafe.Pointer(className)), 
+		0, 0, 0, 0, 0, 
+		0, 0, hInstance, 0,
+	)
 	return windows.Handle(hwnd)
 }
 
@@ -362,16 +372,46 @@ func restartKernel() { exec.Command("taskkill", "/F", "/IM", "mihomo.exe", "/T")
 func openWebPanel() { windows.ShellExecute(0, windows.StringToUTF16Ptr("open"), windows.StringToUTF16Ptr(API_URL+"/ui"), nil, nil, 1) }
 func openConfigFolder() { windows.ShellExecute(0, windows.StringToUTF16Ptr("open"), windows.StringToUTF16Ptr(baseDir), nil, nil, 1) }
 
+func killOldInstances() {
+	myPid := os.Getpid()
+	snapshot, _ := windows.CreateToolhelp32Snapshot(0x00000002, 0)
+	defer windows.CloseHandle(snapshot)
+	var proc windows.ProcessEntry32
+	proc.Size = uint32(unsafe.Sizeof(proc))
+	for windows.Process32Next(snapshot, &proc) == nil {
+		name := windows.UTF16ToString(proc.ExeFile[:])
+		if strings.EqualFold(name, filepath.Base(exePath)) {
+			if int(proc.ProcessID) != myPid {
+				hp, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, proc.ProcessID)
+				if err == nil {
+					windows.TerminateProcess(hp, 0)
+					windows.CloseHandle(hp)
+				}
+			}
+		}
+	}
+}
+
 func main() {
-	// 1. 管理员权限自提（增加参数判断，防止极少数环境下的死循环）
-	isRestart := false
-	for _, arg := range os.Args {
-		if arg == "--restarted" { isRestart = true; break }
+	// [调试开关] 如果启动失败，取消注释下面两行
+	// f, _ := os.OpenFile("debug.txt", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	// fmt.Fprintln(f, "Program Started at", time.Now().String())
+
+	// 1. 权限与清理
+	killOldInstances() 
+	
+	// 2. 尝试监听端口，失败则尝试唤醒后退出
+	ln, err := net.Listen("tcp", "127.0.0.1:"+WAKEUP_PORT)
+	if err != nil {
+		httpClient.Get("http://127.0.0.1:" + WAKEUP_PORT + "/wakeup")
+		os.Exit(0)
 	}
 
+	// 3. 提权 (保持不变)
+	isRestart := false
+	for _, arg := range os.Args { if arg == "--restarted" { isRestart = true; break } }
 	var token windows.Token
-	err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token)
-	if err == nil {
+	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token); err == nil {
 		if !token.IsElevated() && !isRestart {
 			verb, _ := syscall.UTF16PtrFromString("runas")
 			exe, _ := syscall.UTF16PtrFromString(exePath)
@@ -381,40 +421,25 @@ func main() {
 		}
 	}
 
-	// 2. 健壮的单实例检测与唤醒机制
-	// 先尝试监听端口，如果失败则说明已有实例
-	ln, err := net.Listen("tcp", "127.0.0.1:"+WAKEUP_PORT)
-	if err != nil {
-		// 发送唤醒信号给已存在的实例
-		httpClient.Get("http://127.0.0.1:" + WAKEUP_PORT + "/wakeup")
-		os.Exit(0) // 退出当前新实例
-	}
-	// 成功抢占端口，ln 将在后面的协程中使用，不要在这里 Close
-
-	// 3. 进程绑定到 Job Object（实现 Launcher 退出时内核同步退出）
-	hJob, _ = windows.CreateJobObject(nil, nil)
-	var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
-	info.BasicLimitInformation.LimitFlags = 0x2000 // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-	kernel32.NewProc("SetInformationJobObject").Call(uintptr(hJob), 9, uintptr(unsafe.Pointer(&info)), uintptr(uint32(unsafe.Sizeof(info))))
-
-	// 4. 加载配置与图标
+	// 4. 初始化资源
 	loadIniConfigAll()
 	preloadIcons()
-
-	// 5. 创建隐藏的消息窗口
+	
+	// 5. 关键：创建窗口并检查句柄
 	mainHwnd = setupWindow()
 	if mainHwnd == 0 {
-		os.Exit(1) // 窗口创建失败则退出
+		os.WriteFile("fatal_error.txt", []byte("Failed to create Window Class"), 0644)
+		os.Exit(1)
 	}
 
-	// 初始化托盘数据结构
+	// 6. 设置托盘
 	globalNid.HWnd = mainHwnd
 	globalNid.CbSize = uint32(unsafe.Sizeof(globalNid))
 	globalNid.UID = 1001
-	globalNid.UCallbackMessage = 0x0400 + 1001 // WM_USER_TRAY
+	globalNid.UCallbackMessage = 0x0400 + 1001
 	copy(globalNid.SzTip[:], windows.StringToUTF16("Mihomo Launcher"))
 
-	// 6. 启动唤醒 HTTP 服务 (复用上面成功的监听器)
+	// 7. 启动服务与守护
 	go func() {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/wakeup", func(w http.ResponseWriter, r *http.Request) {
@@ -423,37 +448,22 @@ func main() {
 				saveIniConfig("tray_hidden", "false")
 				addTrayIcon()
 			}
-			// 激活并置顶 Web 面板 (可选)
-			openWebPanel()
 		})
 		http.Serve(ln, mux)
 	}()
-
-	// 7. 启动内核守护协程
 	go runGuardian()
 
-	// 8. 根据配置决定是否显示托盘
 	if getIniConfig("tray_hidden") != "true" {
 		addTrayIcon()
-	} else {
-		isHidden = true
 	}
 
-	// 9. 核心消息循环 (保持进程存活的关键)
+	// 8. 绝对不能中断的消息循环
 	var msg struct {
-		HWnd    windows.Handle
-		Message uint32
-		WParam  uintptr
-		LParam  uintptr
-		Time    uint32
-		Pt      POINT
+		HWnd windows.Handle; Message uint32; WParam uintptr; LParam uintptr; Time uint32; Pt POINT
 	}
 	for {
-		// GetMessageW 会在这里阻塞，直到接收到系统消息
 		ret, _, _ := pGetMessageW.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0)
-		if int32(ret) <= 0 {
-			break
-		}
+		if int32(ret) <= 0 { break }
 		pTranslateMsg.Call(uintptr(unsafe.Pointer(&msg)))
 		pDispatchMsg.Call(uintptr(unsafe.Pointer(&msg)))
 	}
