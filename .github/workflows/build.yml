@@ -1,4 +1,4 @@
-name: Build Mihomo Launcher
+name: Build Mihomo Launcher (Single File)
 
 on:
   push:
@@ -9,7 +9,6 @@ jobs:
   build:
     runs-on: windows-latest
     env:
-      # 消除 Node.js 20 弃用警告
       FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - name: Checkout Code
@@ -19,20 +18,14 @@ jobs:
         uses: actions/setup-go@v5
         with:
           go-version: '1.22'
-          # 禁用自动缓存，防止因找不到 go.sum 报错
           cache: false
 
       - name: Prepare Dependencies
         shell: pwsh
         run: |
-          # 清理旧文件，确保从零开始
           if (Test-Path "go.mod") { Remove-Item "go.mod" -Force }
           if (Test-Path "go.sum") { Remove-Item "go.sum" -Force }
-          
-          # 初始化模块（名称建议与目录名一致）
           go mod init mihomo-launcher
-          
-          # 只拉取核心依赖包
           go get github.com/getlantern/systray
           go get golang.org/x/sys/windows
           go mod tidy
@@ -40,31 +33,12 @@ jobs:
       - name: Build Executable
         shell: pwsh
         run: |
-          # 编译：-H windowsgui 是确保托盘程序不弹黑窗口的关键
+          # 核心命令：-H windowsgui 彻底去除黑窗口
+          # 图标此时已自动被嵌入 EXE 内部
           go build -ldflags="-s -w -H windowsgui" -o mihomo-launcher.exe main.go
-
-      - name: Prepare Release Package
-        shell: pwsh
-        run: |
-          # 创建 dist 目录用于存放最终产物
-          New-Item -ItemType Directory -Force -Path "dist"
-          
-          # 移动 EXE 到 dist
-          Move-Item "mihomo-launcher.exe" -Destination "dist\"
-          
-          # 检查并拷贝 icons 目录
-          if (Test-Path "icons") {
-              # 使用 -Recurse 确保文件夹及其内容都被拷贝
-              Copy-Item -Path "icons" -Destination "dist\" -Recurse -Force
-              Write-Host "Success: Icons directory copied to dist."
-          } else {
-              Write-Error "Error: Icons directory not found in root!"
-              exit 1
-          }
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mihomo-launcher-release
-          # 上传整个 dist 文件夹，这样 EXE 就能找到旁边的 icons 了
-          path: dist/
+          name: mihomo-launcher-standalone
+          path: mihomo-launcher.exe
