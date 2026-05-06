@@ -37,7 +37,7 @@ const (
 
 var (
 	isReallyExiting bool
-	isHandover      bool // 用于标记是否正在交接，防止交接时触发内核清理
+	isHandover      bool
 	hJob            windows.Handle
 	hMutex          windows.Handle
 	httpClient      = &http.Client{Timeout: 1 * time.Second}
@@ -48,28 +48,19 @@ var (
 	lastState       = -1
 )
 
-// --- 1. 核心合并：聪明的夺权逻辑 ---
+// --- 1. 核心：智能接管与唤醒逻辑 ---
 
 func smartTakeover() {
-	// 先尝试唤醒或礼貌交接
 	client := http.Client{Timeout: 300 * time.Millisecond}
-	
-	// 尝试唤醒（针对隐藏图标的情况）
-	_, err := client.Get("http://127.0.0.1:" + CONTROL_PORT + "/wakeup")
+
+	// 如果旧进程在后台隐藏，新进程启动时发送 kill_old 让旧进程退出
+	// 这样新进程就能顺利接管并显示托盘图标
+	_, err := client.Get("http://127.0.0.1:" + CONTROL_PORT + "/kill_old")
 	if err == nil {
-		// 唤醒成功，说明旧进程活得很好，新进程直接消失
-		os.Exit(0)
+		time.Sleep(600 * time.Millisecond)
 	}
 
-	// 如果唤醒失败，尝试让旧进程温和退位（释放句柄）
-	_, err = client.Get("http://127.0.0.1:" + CONTROL_PORT + "/kill_old")
-	if err == nil {
-		// 给旧进程一点释放资源的时间
-		time.Sleep(500 * time.Millisecond)
-	}
-
-	// --- 最后的武力保障（最新版的优点） ---
-	// 如果上面都失败了，说明旧进程可能卡死了，执行物理清场
+	// 物理清理保底（针对卡死的旧进程）
 	currentPid := os.Getpid()
 	exeName := filepath.Base(exePath)
 	snapshot, _ := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
@@ -89,23 +80,24 @@ func smartTakeover() {
 		windows.CloseHandle(snapshot)
 	}
 
-	// 确保端口释放并由我监听
+	// 监听控制端口
 	for i := 0; i < 20; i++ {
 		l, err := net.Listen("tcp", "127.0.0.1:"+CONTROL_PORT)
 		if err == nil {
 			go func() {
 				mux := http.NewServeMux()
-				// 唤醒接口：弹出面板
+				// 唤醒接口（备用）
 				mux.HandleFunc("/wakeup", func(w http.ResponseWriter, r *http.Request) {
 					openWebPanel()
 				})
-				// 交接接口：释放句柄后退出
+				// 接力接口：旧进程收到后释放内核句柄并完全消失
 				mux.HandleFunc("/kill_old", func(w http.ResponseWriter, r *http.Request) {
-					isHandover = true 
+					isHandover = true
 					if hJob != 0 {
 						windows.CloseHandle(hJob)
 						hJob = 0
 					}
+					systray.Quit()
 					os.Exit(0)
 				})
 				_ = http.Serve(l, mux)
@@ -116,7 +108,95 @@ func smartTakeover() {
 	}
 }
 
-// --- 2. 内核守护：不激进的监控 ---
+// --- 2. 界面逻辑：增加双击图标开网页 ---
+
+func onReady() {
+	// 确保此时配置已加载
+	systray.SetTooltip(APP_NAME)
+	updateIconByState(StateDefault)
+
+	// 处理左键双击/点击图标：打开控制面板
+	go func() {
+		for range systray.ClickedCh {
+			openWebPanel()
+		}
+	}()
+
+	mWeb := systray.AddMenuItem("进入控制面板", "")
+	systray.AddSeparator()
+
+	mode := getIniConfig("mode")
+	mModeR := systray.AddMenuItemCheckbox("规则模式", "", mode == "rule" || mode == "")
+	mModeG := systray.AddMenuItemCheckbox("全局模式", "", mode == "global")
+	mModeD := systray.AddMenuItemCheckbox("直连模式", "", mode == "direct")
+	systray.AddSeparator()
+
+	mTun := systray.AddMenuItemCheckbox("TUN 模式", "", getIniConfig("tun") == "true")
+	mSystemProxy := systray.AddMenuItemCheckbox("系统代理", "", getIniConfig("system_proxy") == "true" || isProxyEnabledInRegistry())
+	systray.AddSeparator()
+
+	mAutoRun := systray.AddMenuItemCheckbox("开机自启", "", isAutoRunEnabled())
+	mDir := systray.AddMenuItem("浏览本地文件", "")
+	mRestart := systray.AddMenuItem("重启内核", "")
+	mHide := systray.AddMenuItem("隐藏托盘图标", "")
+	mExit := systray.AddMenuItem("退出程序", "")
+
+	// 启动后立即与内核同步一次配置
+	go syncConfigToKernel()
+
+	for {
+		select {
+		case <-mWeb.ClickedCh:
+			openWebPanel()
+		case <-mModeR.ClickedCh:
+			setMihomoMode("rule")
+			mModeR.Check(); mModeG.Uncheck(); mModeD.Uncheck()
+		case <-mModeG.ClickedCh:
+			setMihomoMode("global")
+			mModeR.Uncheck(); mModeG.Check(); mModeD.Uncheck()
+		case <-mModeD.ClickedCh:
+			setMihomoMode("direct")
+			mModeR.Uncheck(); mModeG.Uncheck(); mModeD.Check()
+		case <-mTun.ClickedCh:
+			enable := !mTun.Checked()
+			setTunMode(enable)
+			if enable { mTun.Check() } else { mTun.Uncheck() }
+		case <-mSystemProxy.ClickedCh:
+			enable := !mSystemProxy.Checked()
+			setSystemProxy(enable)
+			if enable { mSystemProxy.Check() } else { mSystemProxy.Uncheck() }
+		case <-mAutoRun.ClickedCh:
+			toggleAutoRun()
+			if isAutoRunEnabled() { mAutoRun.Check() } else { mAutoRun.Uncheck() }
+		case <-mDir.ClickedCh:
+			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
+		case <-mRestart.ClickedCh:
+			restartKernelForce()
+		case <-mHide.ClickedCh:
+			systray.Quit() // 仅销毁图标，main 循环会保持后台运行
+		case <-mExit.ClickedCh:
+			isReallyExiting = true
+			systray.Quit()
+		}
+	}
+}
+
+func onExit() {
+	if isReallyExiting {
+		restartKernelForce()
+		if hJob != 0 {
+			windows.CloseHandle(hJob)
+			hJob = 0
+		}
+		os.Exit(0)
+	}
+	// 隐藏模式下，此循环保持后台运行
+	for {
+		time.Sleep(time.Hour)
+	}
+}
+
+// --- 3. 内核守护与工具函数 ---
 
 func monitorKernelDaemon() {
 	target := filepath.Join(baseDir, "mihomo.exe")
@@ -125,27 +205,22 @@ func monitorKernelDaemon() {
 
 		_, err := httpClient.Get(API_URL)
 		if err != nil {
-			// 只有当进程真的不存在时才启动，避免最新版中“偶尔重启”的问题
 			if !isProcessRunning("mihomo.exe") {
+				// 进程彻底消失才拉起
 				cmd := exec.Command(target, "-d", baseDir)
 				cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 				if err := cmd.Start(); err == nil && hJob != 0 {
 					hp, _ := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
 					_ = windows.AssignProcessToJobObject(hJob, hp)
 					windows.CloseHandle(hp)
-					
-					// 启动后给内核一点时间初始化，不要立即进行下一次检测
 					time.Sleep(2 * time.Second)
-					go syncConfigToKernel() 
+					go syncConfigToKernel()
 				}
-				updateIconByState(StateStop)
 				lastState = StateStop
-			} else {
-				// 进程在跑但 API 不通，说明可能是初始化中或配置错误
-				if lastState != StateError {
-					updateIconByState(StateError)
-					lastState = StateError
-				}
+				updateIconByState(StateStop)
+			} else if lastState != StateError {
+				updateIconByState(StateError)
+				lastState = StateError
 			}
 		} else {
 			curr := checkSystemState()
@@ -158,7 +233,21 @@ func monitorKernelDaemon() {
 	}
 }
 
-// --- 基础工具函数（保留原始逻辑） ---
+func syncConfigToKernel() {
+	// 等待内核 API 就绪后同步 INI 里的状态
+	for i := 0; i < 15; i++ {
+		_, err := httpClient.Get(API_URL)
+		if err == nil {
+			configMu.RLock()
+			if configData["tun"] == "true" { setTunMode(true) }
+			if m := configData["mode"]; m != "" { setMihomoMode(m) }
+			if configData["system_proxy"] == "true" { setSystemProxy(true) }
+			configMu.RUnlock()
+			return
+		}
+		time.Sleep(time.Second)
+	}
+}
 
 func isAdmin() bool {
 	var token windows.Token
@@ -188,7 +277,6 @@ func initJobObject() {
 }
 
 func checkSystemState() int {
-	// 注意：此处不再重复 Get API，由 monitor 统一处理
 	if isInterfaceExisted("Mihomo") { return StateTun }
 	if isProxyEnabledInRegistry() { return StateProxy }
 	return StateDefault
@@ -220,85 +308,6 @@ func isProcessRunning(name string) bool {
 		if strings.EqualFold(windows.UTF16ToString(proc.ExeFile[:]), name) { return true }
 	}
 	return false
-}
-
-func syncConfigToKernel() {
-	for i := 0; i < 10; i++ {
-		_, err := httpClient.Get(API_URL)
-		if err == nil {
-			configMu.RLock()
-			if configData["tun"] == "true" { setTunMode(true) }
-			if m := configData["mode"]; m != "" { setMihomoMode(m) }
-			if configData["system_proxy"] == "true" { setSystemProxy(true) }
-			configMu.RUnlock()
-			return
-		}
-		time.Sleep(time.Second)
-	}
-}
-
-// --- 界面逻辑 ---
-
-func onReady() {
-	loadIniConfigAll()
-	systray.SetTooltip(APP_NAME)
-	updateIconByState(StateDefault)
-
-	mWeb := systray.AddMenuItem("进入控制面板", "")
-	systray.AddSeparator()
-
-	mode := getIniConfig("mode")
-	mModeR := systray.AddMenuItemCheckbox("规则模式", "", mode == "rule" || mode == "")
-	mModeG := systray.AddMenuItemCheckbox("全局模式", "", mode == "global")
-	mModeD := systray.AddMenuItemCheckbox("直连模式", "", mode == "direct")
-	systray.AddSeparator()
-
-	mTun := systray.AddMenuItemCheckbox("TUN 模式", "", getIniConfig("tun") == "true")
-	mSystemProxy := systray.AddMenuItemCheckbox("系统代理", "", getIniConfig("system_proxy") == "true" || isProxyEnabledInRegistry())
-	systray.AddSeparator()
-
-	mAutoRun := systray.AddMenuItemCheckbox("开机自启", "", isAutoRunEnabled())
-	mDir := systray.AddMenuItem("浏览本地文件", "")
-	mRestart := systray.AddMenuItem("重启内核", "")
-	mHide := systray.AddMenuItem("隐藏托盘图标", "")
-	mExit := systray.AddMenuItem("退出程序", "")
-
-	go syncConfigToKernel()
-
-	for {
-		select {
-		case <-mWeb.ClickedCh: openWebPanel()
-		case <-mModeR.ClickedCh: setMihomoMode("rule"); mModeR.Check(); mModeG.Uncheck(); mModeD.Uncheck()
-		case <-mModeG.ClickedCh: setMihomoMode("global"); mModeR.Uncheck(); mModeG.Check(); mModeD.Uncheck()
-		case <-mModeD.ClickedCh: setMihomoMode("direct"); mModeR.Uncheck(); mModeG.Uncheck(); mModeD.Check()
-		case <-mTun.ClickedCh:
-			enable := !mTun.Checked(); setTunMode(enable)
-			if enable { mTun.Check() } else { mTun.Uncheck() }
-		case <-mSystemProxy.ClickedCh:
-			enable := !mSystemProxy.Checked(); setSystemProxy(enable)
-			if enable { mSystemProxy.Check() } else { mSystemProxy.Uncheck() }
-		case <-mAutoRun.ClickedCh:
-			toggleAutoRun()
-			if isAutoRunEnabled() { mAutoRun.Check() } else { mAutoRun.Uncheck() }
-		case <-mDir.ClickedCh:
-			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
-		case <-mRestart.ClickedCh: restartKernelForce()
-		case <-mHide.ClickedCh: systray.Quit()
-		case <-mExit.ClickedCh:
-			isReallyExiting = true
-			systray.Quit()
-		}
-	}
-}
-
-func onExit() {
-	if isReallyExiting {
-		restartKernelForce()
-		if hJob != 0 { windows.CloseHandle(hJob) }
-		os.Exit(0)
-	}
-	// 如果只是隐藏图标，则主线程在这里死循环，保持后端运行
-	for { time.Sleep(time.Hour) }
 }
 
 func updateIconByState(state int) {
@@ -354,12 +363,11 @@ func restartKernelForce() {
 	_ = cmd.Run()
 }
 
-// --- 配置读写（采用最新版的健壮性） ---
-
 func loadIniConfigAll() {
 	b, _ := os.ReadFile(filepath.Join(baseDir, CONFIG_FILE))
 	configMu.Lock()
 	defer configMu.Unlock()
+	configData = make(map[string]string)
 	for _, line := range strings.Split(string(b), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") { continue }
@@ -386,7 +394,7 @@ func saveIniConfig(key, val string) {
 	_ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), buf.Bytes(), 0644)
 }
 
-// --- 入口 ---
+// --- 4. 程序入口 ---
 
 func main() {
 	if !isAdmin() {
@@ -394,19 +402,22 @@ func main() {
 		os.Exit(0)
 	}
 
-	// 互斥检测与接力/唤醒逻辑
+	// 1. 核心：必须先进入目录加载配置
+	os.Chdir(baseDir)
+	loadIniConfigAll()
+
+	// 2. 互斥锁检测
 	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
 	h, _ := windows.CreateMutex(nil, false, mName)
 	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
 		if h != 0 { windows.CloseHandle(h) }
-		// 这里不再直接启动新进程，而是交给 smartTakeover 处理唤醒
 	}
 	hMutex = h
 
-	// 执行合并后的智能接管
+	// 3. 执行智能夺权（唤醒后台图标）
 	smartTakeover()
 
-	os.Chdir(baseDir)
+	// 4. 正式启动
 	initJobObject()
 	go monitorKernelDaemon()
 
