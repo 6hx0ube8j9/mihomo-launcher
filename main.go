@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bufio"
 	"bytes"
 	"embed"
 	"fmt"
@@ -10,293 +11,252 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"syscall"
 	"time"
 	"unsafe"
 
+	"github.com/getlantern/systray"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
 
 // --- 资源嵌入 ---
-
 //go:embed icons/*.ico
 var iconFs embed.FS
 
 const (
-	WAKEUP_PORT = "18579"
-	APP_MUTEX   = "Global\\MihomoUltimateManager_V26"
+	PIPE_NAME   = `\\.\pipe\MihomoLauncherWakeup`
+	APP_MUTEX   = "Global\\MihomoUltimateManager_V27_Official"
 	API_URL     = "http://127.0.0.1:9090"
 	CONFIG_FILE = "mihomo-launcher.ini"
-	REG_RUN     = `Software\Microsoft\Windows\CurrentVersion\Run`
-	APP_NAME    = "MihomoLauncher"
-
-	// 菜单 ID
-	IDM_SHOW_UI  = 2000
-	IDM_EXIT     = 2001
-	IDM_HIDE     = 2002
-	IDM_RESTART  = 2003
-	IDM_FOLDER   = 2004
-	IDM_AUTORUN  = 2005
-	IDM_TUN_ON   = 2006
-	IDM_TUN_OFF  = 2007
-	IDM_MODE_R   = 2101
-	IDM_MODE_G   = 2102
-	IDM_MODE_D   = 2103
-
-	StateStop = 0; StateError = 1; StateTun = 2; StateProxy = 3; StateDefault = 4
+	PROXY_ADDR  = "127.0.0.1:7890"
 )
 
 var (
-	// 原生 DLL 调用声明
-	user32           = windows.NewLazySystemDLL("user32.dll")
-	shell32          = windows.NewLazySystemDLL("shell32.dll")
-	kernel32         = windows.NewLazySystemDLL("kernel32.dll")
-	pRegisterClassW  = user32.NewProc("RegisterClassW")
-	pCreateWindowExW = user32.NewProc("CreateWindowExW")
-	pDefWindowProcW  = user32.NewProc("DefWindowProcW")
-	pPostQuitMessage = user32.NewProc("PostQuitMessage")
-	pGetMessageW     = user32.NewProc("GetMessageW")
-	pTranslateMsg    = user32.NewProc("TranslateMessage")
-	pDispatchMsg     = user32.NewProc("DispatchMessage")
-	pGetCursorPos    = user32.NewProc("GetCursorPos")
-	pTrackMenu       = user32.NewProc("TrackPopupMenu")
-	pNotifyIconW     = shell32.NewProc("Shell_NotifyIconW")
-	pLoadIconW       = user32.NewProc("LoadIconW")
-	// 用于从内存创建图标
-	pCreateIconFromResource = user32.NewProc("CreateIconFromResourceEx")
-
 	isReallyExiting bool
 	isHidden        bool
 	hJob            windows.Handle
-	httpClient      = &http.Client{Timeout: 1 * time.Second}
+	httpClient      = &http.Client{Timeout: 2 * time.Second}
 	exePath, _      = os.Executable()
 	baseDir         = filepath.Dir(exePath)
-	configData      = make(map[string]string)
-	configMu        sync.RWMutex
-	globalNid       NOTIFYICONDATA
-	iconHandles     [5]windows.Handle
-	lastState       = -1
-	mainHwnd        windows.Handle
 )
 
-// NOTIFYICONDATA 结构体
-type NOTIFYICONDATA struct {
-	CbSize           uint32
-	HWnd             windows.Handle
-	UID              uint32
-	UFlags           uint32
-	UCallbackMessage uint32
-	HIcon            windows.Handle
-	SzTip            [128]uint16
-	DwState          uint32
-	DwStateMask      uint32
-	SzInfo           [256]uint16
-	UVersion         uint32
-	SzInfoTitle      [64]uint16
-	DwInfoFlags      uint32
-	GuidItem         [16]byte
-	HBalloonIcon     windows.Handle
+// --- 图标加载核心修复 ---
+func getIconData(name string) []byte {
+	// 确保路径和 embed 指令一致
+	data, err := iconFs.ReadFile("icons/" + name)
+	if err != nil {
+		// 如果找不到图标，返回一个最小化的空图标数据防止 systray 崩溃
+		return nil
+	}
+	return data
 }
 
-type WNDCLASSW struct {
-	Style         uint32
-	LpfnWndProc   uintptr
-	CbClsExtra    int32
-	CbWndExtra    int32
-	HInstance     windows.Handle
-	HIcon         windows.Handle
-	HCursor       windows.Handle
-	HbrBackground windows.Handle
-	LpszMenuName  *uint16
-	LpszClassName *uint16
+// --- 1. 系统底层工具 ---
+
+func isAdmin() bool {
+	var token windows.Token
+	err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token)
+	if err != nil { return false }
+	defer token.Close()
+	return token.IsElevated()
 }
 
-type POINT struct{ X, Y int32 }
+func runAsAdmin() {
+	verb, _ := syscall.UTF16PtrFromString("runas")
+	exe, _ := syscall.UTF16PtrFromString(exePath)
+	cwd, _ := syscall.UTF16PtrFromString(baseDir)
+	windows.ShellExecute(0, verb, exe, nil, cwd, windows.SW_HIDE)
+}
 
-// --- 窗口消息处理 ---
+func setSystemProxy(enable bool) {
+	key, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.SET_VALUE)
+	if err != nil { return }
+	defer key.Close()
 
-func windowProc(hWnd windows.Handle, msg uint32, wParam, lParam uintptr) uintptr {
-	switch msg {
-	case 0x0400 + 1001: // WM_USER_TRAY
-		if lParam == 0x0205 { // WM_RBUTTONUP
-			showMenu(hWnd)
-		} else if lParam == 0x0203 { // WM_LBUTTONDBLCLK
-			openWebPanel()
+	if enable {
+		_ = key.SetDWordValue("ProxyEnable", 1)
+		_ = key.SetStringValue("ProxyServer", PROXY_ADDR)
+	} else {
+		_ = key.SetDWordValue("ProxyEnable", 0)
+	}
+	wininet := windows.NewLazySystemDLL("wininet.dll")
+	wininet.NewProc("InternetSetOptionW").Call(0, 39, 0, 0)
+	wininet.NewProc("InternetSetOptionW").Call(0, 37, 0, 0)
+}
+
+// --- 2. 菜单逻辑 ---
+
+func onReady() {
+	cfg := loadIniConfig()
+	isHidden = cfg["tray_hidden"] == "true"
+
+	// 初始化图标
+	if !isHidden {
+		systray.SetIcon(getIconData("default.ico"))
+	} else {
+		systray.SetIcon([]byte{})
+	}
+	systray.SetTooltip("Mihomo Launcher")
+
+	mWeb := systray.AddMenuItem("打开控制面板", "打开浏览器 UI")
+	mDir := systray.AddMenuItem("打开程序目录", "")
+	systray.AddSeparator()
+
+	mProxyMode := systray.AddMenuItem("代理模式", "")
+	mModeRule := mProxyMode.AddSubMenuItemCheckbox("规则模式", "", cfg["proxy_mode"] == "rule" || cfg["proxy_mode"] == "")
+	mModeGlobal := mProxyMode.AddSubMenuItemCheckbox("全局模式", "", cfg["proxy_mode"] == "global")
+	mModeDirect := mProxyMode.AddSubMenuItemCheckbox("直连模式", "", cfg["proxy_mode"] == "direct")
+
+	mSysProxy := systray.AddMenuItemCheckbox("系统代理", "", cfg["system_proxy"] == "true")
+	mTun := systray.AddMenuItemCheckbox("TUN 模式", "", cfg["tun_on"] == "true")
+
+	systray.AddSeparator()
+	mHide := systray.AddMenuItem("隐藏图标", "")
+	mExit := systray.AddMenuItem("退出程序", "")
+
+	// 周期性检查内核状态并更新图标（可选，增加灵动感）
+	go func() {
+		for {
+			if !isHidden {
+				_, err := httpClient.Get(API_URL)
+				if err != nil {
+					systray.SetIcon(getIconData("stop.ico"))
+				} else {
+					systray.SetIcon(getIconData("default.ico"))
+				}
+			}
+			time.Sleep(5 * time.Second)
 		}
-	case 0x0111: // WM_COMMAND
-		handleMenuCommand(wParam)
-	case 0x0002: // WM_DESTROY
-		pPostQuitMessage.Call(0)
+	}()
+
+	for {
+		select {
+		case <-mWeb.ClickedCh:
+			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(API_URL+"/ui"), nil, nil, windows.SW_SHOWNORMAL)
+		case <-mDir.ClickedCh:
+			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
+		case <-mModeRule.ClickedCh:
+			mModeRule.Check(); mModeGlobal.Uncheck(); mModeDirect.Uncheck()
+			setCfgRemote(`{"mode":"rule"}`); saveIniConfig("proxy_mode", "rule")
+		case <-mModeGlobal.ClickedCh:
+			mModeRule.Uncheck(); mModeGlobal.Check(); mModeDirect.Uncheck()
+			setCfgRemote(`{"mode":"global"}`); saveIniConfig("proxy_mode", "global")
+		case <-mModeDirect.ClickedCh:
+			mModeRule.Uncheck(); mModeGlobal.Uncheck(); mModeCheck := mModeDirect; mModeCheck.Check()
+			setCfgRemote(`{"mode":"direct"}`); saveIniConfig("proxy_mode", "direct")
+		case <-mSysProxy.ClickedCh:
+			if mSysProxy.Checked() {
+				mSysProxy.Uncheck(); setSystemProxy(false); saveIniConfig("system_proxy", "false")
+			} else {
+				mSysProxy.Check(); setSystemProxy(true); saveIniConfig("system_proxy", "true")
+			}
+		case <-mTun.ClickedCh:
+			if mTun.Checked() {
+				mTun.Uncheck(); setCfgRemote(`{"tun":{"enable":false}}`); saveIniConfig("tun_on", "false")
+			} else {
+				mTun.Check(); setCfgRemote(`{"tun":{"enable":true}}`); saveIniConfig("tun_on", "true")
+			}
+		case <-mHide.ClickedCh:
+			isHidden = true; saveIniConfig("tray_hidden", "true")
+			systray.SetIcon([]byte{})
+		case <-mExit.ClickedCh:
+			isReallyExiting = true
+			systray.Quit()
+		}
 	}
-	ret, _, _ := pDefWindowProcW.Call(uintptr(hWnd), uintptr(msg), wParam, lParam)
-	return ret
 }
 
-func handleMenuCommand(id uintptr) {
-	switch id {
-	case IDM_SHOW_UI: openWebPanel()
-	case IDM_MODE_R: setMihomoMode("rule")
-	case IDM_MODE_G: setMihomoMode("global")
-	case IDM_MODE_D: setMihomoMode("direct")
-	case IDM_TUN_ON: setTunMode(true)
-	case IDM_TUN_OFF: setTunMode(false)
-	case IDM_RESTART: restartKernel()
-	case IDM_FOLDER: openConfigFolder()
-	case IDM_AUTORUN: toggleAutoRun()
-	case IDM_HIDE:
-		isHidden = true
-		saveIniConfig("tray_hidden", "true")
-		removeTrayIcon()
-	case IDM_EXIT:
-		isReallyExiting = true
-		removeTrayIcon()
-		os.Exit(0)
-	}
+func onExit() {
+	setSystemProxy(false)
+	if hJob != 0 { windows.CloseHandle(hJob) }
+	exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe").Run()
+	os.Exit(0)
 }
 
-func showMenu(hWnd windows.Handle) {
-	hMenu, _, _ := user32.NewProc("CreatePopupMenu").Call()
-	addM := func(id uintptr, text string, flags uint32) {
-		t, _ := windows.UTF16PtrFromString(text)
-		user32.NewProc("AppendMenuW").Call(hMenu, uintptr(flags), id, uintptr(unsafe.Pointer(t)))
-	}
+// --- 3. 守护逻辑 ---
 
-	addM(IDM_SHOW_UI, "进入 Web 面板", 0)
-	addM(IDM_FOLDER, "打开配置目录", 0)
-	user32.NewProc("AppendMenuW").Call(hMenu, 0x800, 0, 0)
-	addM(IDM_MODE_R, "规则模式 (Rule)", 0)
-	addM(IDM_MODE_G, "全局模式 (Global)", 0)
-	addM(IDM_MODE_D, "直连模式 (Direct)", 0)
-	user32.NewProc("AppendMenuW").Call(hMenu, 0x800, 0, 0)
-	addM(IDM_TUN_ON, "开启 TUN 模式", 0)
-	addM(IDM_TUN_OFF, "关闭 TUN 模式", 0)
-	user32.NewProc("AppendMenuW").Call(hMenu, 0x800, 0, 0)
-
-	autoFlag := uint32(0)
-	if isAutoRunEnabled() { autoFlag = 0x0008 }
-	addM(IDM_AUTORUN, "随系统启动", autoFlag)
-	addM(IDM_RESTART, "重启内核进程", 0)
-	addM(IDM_HIDE, "隐藏托盘图标", 0)
-	user32.NewProc("AppendMenuW").Call(hMenu, 0x800, 0, 0)
-	addM(IDM_EXIT, "彻底退出", 0)
-
-	user32.NewProc("SetForegroundWindow").Call(uintptr(hWnd))
-	var pos POINT
-	pGetCursorPos.Call(uintptr(unsafe.Pointer(&pos)))
-	pTrackMenu.Call(hMenu, 0x102, uintptr(pos.X), uintptr(pos.Y), 0, uintptr(hWnd), 0)
-}
-
-// --- 核心守护与状态 ---
-
-func runGuardian() {
+func monitorKernelDaemon() {
 	target := filepath.Join(baseDir, "mihomo.exe")
 	for {
 		if isReallyExiting { return }
-		curr := checkSystemState()
-		if curr == StateStop {
+		_, err := httpClient.Get(API_URL)
+		if err != nil && !isProcessRunning("mihomo.exe") {
 			cmd := exec.Command(target, "-d", baseDir)
-			cmd.Dir = baseDir
-			cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: 0x08000000} // CREATE_NO_WINDOW
-			if err := cmd.Start(); err == nil && hJob != 0 {
+			cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+			_ = cmd.Start()
+			if hJob != 0 && cmd.Process != nil {
 				hp, _ := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
-				_ = windows.AssignProcessToJobObject(hJob, hp)
+				windows.AssignProcessToJobObject(hJob, hp)
 				windows.CloseHandle(hp)
 			}
 		}
-		if !isHidden && curr != lastState {
-			updateTrayIcon(curr)
-			lastState = curr
-		}
-		time.Sleep(2 * time.Second)
+		time.Sleep(5 * time.Second)
 	}
 }
 
-func checkSystemState() int {
-	_, err := httpClient.Get(API_URL)
-	if err != nil && !isProcessRunning("mihomo.exe") { return StateStop }
-	if isInterfaceExisted("Mihomo") { return StateTun }
-	if isProxyEnabledInRegistry() { return StateProxy }
-	return StateDefault
+func main() {
+	if !isAdmin() { runAsAdmin(); os.Exit(0) }
+
+	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
+	hMutex, _ := windows.CreateMutex(nil, false, mName)
+	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
+		wakeupExistingInstance()
+		os.Exit(0)
+	}
+
+	initJobObject()
+	go startIpcServer()
+	go monitorKernelDaemon()
+
+	systray.Run(onReady, onExit)
 }
 
-func setTunMode(enable bool) {
-	state := "false"; if enable { state = "true" }
-	jsonBody := []byte(fmt.Sprintf(`{"tun": {"enable": %s}}`, state))
-	req, _ := http.NewRequest("PATCH", API_URL+"/configs", bytes.NewBuffer(jsonBody))
-	resp, err := httpClient.Do(req); if err == nil { resp.Body.Close() }
-}
+// --- 4. 辅助函数 (保持原样，仅修复路径) ---
 
-func setMihomoMode(mode string) {
-	jsonBody := []byte(fmt.Sprintf(`{"mode": "%s"}`, mode))
-	req, _ := http.NewRequest("PATCH", API_URL+"/configs", bytes.NewBuffer(jsonBody))
-	resp, err := httpClient.Do(req); if err == nil { resp.Body.Close() }
-}
-
-// --- 底层辅助 (内嵌加载优化) ---
-
-func preloadIcons() {
-	// 对应 StateStop=0, StateError=1, StateTun=2, StateProxy=3, StateDefault=4
-	files := []string{"stop.ico", "error.ico", "tun.ico", "proxy.ico", "default.ico"}
-	
-	for i, f := range files {
-		// 从 embed.FS 读取二进制数据
-		data, err := iconFs.ReadFile("icons/" + f)
-		
-		var h uintptr
-		if err == nil && len(data) > 0 {
-			// 将内存中的 .ico 数据转换为 Windows 句柄
-			// 参数说明: 数据指针, 数据长度, 资源类型(1为图标), 版本(0x00030000), 宽, 高, 标志
-			h, _, _ = pCreateIconFromResource.Call(
-				uintptr(unsafe.Pointer(&data[0])),
-				uintptr(len(data)),
-				1,          // TRUE (Icon)
-				0x00030000, // Version 3.0
-				0,          // 使用图标默认宽度
-				0,          // 使用图标默认高度
-				0,          // LR_DEFAULTCOLOR
-			)
-		}
-
-		// --- 保底逻辑 ---
-		// 如果 embed 读取失败或 CreateIconFromResource 转换失败 (h == 0)
-		if h == 0 {
-			// 加载系统内置图标 IDI_APPLICATION (32512) 确保程序不崩溃
-			h, _, _ = pLoadIconW.Call(0, uintptr(32512))
-		}
-		
-		iconHandles[i] = windows.Handle(h)
+func startIpcServer() {
+	l, err := net.Listen("pipe", PIPE_NAME)
+	if err != nil { return }
+	for {
+		conn, err := l.Accept()
+		if err != nil { continue }
+		go func(c net.Conn) {
+			defer c.Close()
+			scanner := bufio.NewScanner(c)
+			if scanner.Scan() && scanner.Text() == "WAKEUP" {
+				isHidden = false
+				saveIniConfig("tray_hidden", "false")
+				systray.SetIcon(getIconData("default.ico"))
+			}
+		}(conn)
 	}
 }
 
-func setupWindow() windows.Handle {
-	className, _ := windows.UTF16PtrFromString("MihomoTrayWndV26")
-	hInstance, _, _ := kernel32.NewProc("GetModuleHandleW").Call(0)
-
-	wc := WNDCLASSW{
-		HInstance:     windows.Handle(hInstance),
-		LpszClassName: className,
-		LpfnWndProc:   windows.NewCallback(windowProc),
+func wakeupExistingInstance() {
+	conn, err := net.Dial("pipe", PIPE_NAME)
+	if err == nil {
+		fmt.Fprintln(conn, "WAKEUP")
+		conn.Close()
 	}
-	
-	res, _, _ := pRegisterClassW.Call(uintptr(unsafe.Pointer(&wc)))
-	if res == 0 {
-		// 即使注册失败（可能已注册），也继续尝试创建
-	}
+}
 
-	hwnd, _, _ := pCreateWindowExW.Call(
-		0, 
-		uintptr(unsafe.Pointer(className)), 
-		uintptr(unsafe.Pointer(className)), 
-		0, 0, 0, 0, 0, 
-		0, 0, hInstance, 0,
-	)
-	return windows.Handle(hwnd)
+func initJobObject() {
+	h, _ := windows.CreateJobObject(nil, nil)
+	if h != 0 {
+		var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+		info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+		kernel32 := windows.NewLazySystemDLL("kernel32.dll")
+		kernel32.NewProc("SetInformationJobObject").Call(
+			uintptr(h), uintptr(windows.JobObjectExtendedLimitInformation),
+			uintptr(unsafe.Pointer(&info)), uintptr(uint32(unsafe.Sizeof(info))),
+		)
+		hJob = h
+	}
 }
 
 func isProcessRunning(name string) bool {
-	snapshot, _ := windows.CreateToolhelp32Snapshot(0x00000002, 0)
+	snapshot, _ := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if snapshot == 0 { return false }
 	defer windows.CloseHandle(snapshot)
 	var proc windows.ProcessEntry32
 	proc.Size = uint32(unsafe.Sizeof(proc))
@@ -306,165 +266,25 @@ func isProcessRunning(name string) bool {
 	return false
 }
 
-func isInterfaceExisted(name string) bool {
-	ifaces, _ := net.Interfaces()
-	for _, i := range ifaces { if strings.Contains(i.Name, name) { return true } }
-	return false
+func setCfgRemote(jsonStr string) {
+	req, _ := http.NewRequest("PATCH", API_URL+"/configs", bytes.NewBuffer([]byte(jsonStr)))
+	if r, err := httpClient.Do(req); err == nil { r.Body.Close() }
 }
 
-func isProxyEnabledInRegistry() bool {
-	key, _ := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.QUERY_VALUE)
-	defer key.Close()
-	val, _, err := key.GetIntegerValue("ProxyEnable")
-	return err == nil && val == 1
-}
-
-func toggleAutoRun() {
-	key, _ := registry.OpenKey(registry.CURRENT_USER, REG_RUN, registry.SET_VALUE|registry.QUERY_VALUE)
-	defer key.Close()
-	_, _, err := key.GetStringValue(APP_NAME)
-	if err != nil { key.SetStringValue(APP_NAME, exePath) } else { key.DeleteValue(APP_NAME) }
-}
-
-func isAutoRunEnabled() bool {
-	key, err := registry.OpenKey(registry.CURRENT_USER, REG_RUN, registry.QUERY_VALUE)
-	if err != nil { return false }; defer key.Close()
-	_, _, err = key.GetStringValue(APP_NAME)
-	return err == nil
+func loadIniConfig() map[string]string {
+	res := make(map[string]string)
+	data, _ := os.ReadFile(filepath.Join(baseDir, CONFIG_FILE))
+	for _, line := range strings.Split(string(data), "\n") {
+		parts := strings.SplitN(strings.TrimSpace(line), "=", 2)
+		if len(parts) == 2 { res[parts[0]] = parts[1] }
+	}
+	return res
 }
 
 func saveIniConfig(key, val string) {
-	configMu.Lock(); defer configMu.Unlock()
-	configData[key] = val
+	cfg := loadIniConfig()
+	cfg[key] = val
 	var buf bytes.Buffer
-	for k, v := range configData { buf.WriteString(fmt.Sprintf("%s=%s\n", k, v)) }
+	for k, v := range cfg { buf.WriteString(fmt.Sprintf("%s=%s\n", k, v)) }
 	_ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), buf.Bytes(), 0644)
-}
-
-func getIniConfig(key string) string {
-	configMu.RLock(); defer configMu.RUnlock()
-	return configData[key]
-}
-
-func loadIniConfigAll() {
-	b, _ := os.ReadFile(filepath.Join(baseDir, CONFIG_FILE))
-	for _, line := range strings.Split(string(b), "\n") {
-		parts := strings.SplitN(strings.TrimSpace(line), "=", 2)
-		if len(parts) == 2 { configData[parts[0]] = parts[1] }
-	}
-}
-
-func addTrayIcon() {
-	globalNid.UFlags = 0x7 // NIF_MESSAGE | NIF_ICON | NIF_TIP
-	pNotifyIconW.Call(0, uintptr(unsafe.Pointer(&globalNid)))
-}
-
-func updateTrayIcon(state int) {
-	globalNid.HIcon = iconHandles[state]
-	pNotifyIconW.Call(1, uintptr(unsafe.Pointer(&globalNid)))
-}
-
-func removeTrayIcon() {
-	pNotifyIconW.Call(2, uintptr(unsafe.Pointer(&globalNid)))
-}
-
-func restartKernel() { exec.Command("taskkill", "/F", "/IM", "mihomo.exe", "/T").Run() }
-func openWebPanel() { windows.ShellExecute(0, windows.StringToUTF16Ptr("open"), windows.StringToUTF16Ptr(API_URL+"/ui"), nil, nil, 1) }
-func openConfigFolder() { windows.ShellExecute(0, windows.StringToUTF16Ptr("open"), windows.StringToUTF16Ptr(baseDir), nil, nil, 1) }
-
-func killOldInstances() {
-	myPid := os.Getpid()
-	snapshot, _ := windows.CreateToolhelp32Snapshot(0x00000002, 0)
-	defer windows.CloseHandle(snapshot)
-	var proc windows.ProcessEntry32
-	proc.Size = uint32(unsafe.Sizeof(proc))
-	for windows.Process32Next(snapshot, &proc) == nil {
-		name := windows.UTF16ToString(proc.ExeFile[:])
-		if strings.EqualFold(name, filepath.Base(exePath)) {
-			if int(proc.ProcessID) != myPid {
-				hp, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, proc.ProcessID)
-				if err == nil {
-					windows.TerminateProcess(hp, 0)
-					windows.CloseHandle(hp)
-				}
-			}
-		}
-	}
-}
-
-func main() {
-	// [调试开关] 如果启动失败，取消注释下面两行
-	// f, _ := os.OpenFile("debug.txt", os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
-	// fmt.Fprintln(f, "Program Started at", time.Now().String())
-
-	// 1. 权限与清理
-	killOldInstances() 
-	
-	// 2. 尝试监听端口，失败则尝试唤醒后退出
-	ln, err := net.Listen("tcp", "127.0.0.1:"+WAKEUP_PORT)
-	if err != nil {
-		httpClient.Get("http://127.0.0.1:" + WAKEUP_PORT + "/wakeup")
-		os.Exit(0)
-	}
-
-	// 3. 提权 (保持不变)
-	isRestart := false
-	for _, arg := range os.Args { if arg == "--restarted" { isRestart = true; break } }
-	var token windows.Token
-	if err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token); err == nil {
-		if !token.IsElevated() && !isRestart {
-			verb, _ := syscall.UTF16PtrFromString("runas")
-			exe, _ := syscall.UTF16PtrFromString(exePath)
-			arg, _ := syscall.UTF16PtrFromString("--restarted")
-			windows.ShellExecute(0, verb, exe, arg, nil, 0)
-			os.Exit(0)
-		}
-	}
-
-	// 4. 初始化资源
-	loadIniConfigAll()
-	preloadIcons()
-	
-	// 5. 关键：创建窗口并检查句柄
-	mainHwnd = setupWindow()
-	if mainHwnd == 0 {
-		os.WriteFile("fatal_error.txt", []byte("Failed to create Window Class"), 0644)
-		os.Exit(1)
-	}
-
-	// 6. 设置托盘
-	globalNid.HWnd = mainHwnd
-	globalNid.CbSize = uint32(unsafe.Sizeof(globalNid))
-	globalNid.UID = 1001
-	globalNid.UCallbackMessage = 0x0400 + 1001
-	copy(globalNid.SzTip[:], windows.StringToUTF16("Mihomo Launcher"))
-
-	// 7. 启动服务与守护
-	go func() {
-		mux := http.NewServeMux()
-		mux.HandleFunc("/wakeup", func(w http.ResponseWriter, r *http.Request) {
-			if isHidden {
-				isHidden = false
-				saveIniConfig("tray_hidden", "false")
-				addTrayIcon()
-			}
-		})
-		http.Serve(ln, mux)
-	}()
-	go runGuardian()
-
-	if getIniConfig("tray_hidden") != "true" {
-		addTrayIcon()
-	}
-
-	// 8. 绝对不能中断的消息循环
-	var msg struct {
-		HWnd windows.Handle; Message uint32; WParam uintptr; LParam uintptr; Time uint32; Pt POINT
-	}
-	for {
-		ret, _, _ := pGetMessageW.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0)
-		if int32(ret) <= 0 { break }
-		pTranslateMsg.Call(uintptr(unsafe.Pointer(&msg)))
-		pDispatchMsg.Call(uintptr(unsafe.Pointer(&msg)))
-	}
 }
