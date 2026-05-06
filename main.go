@@ -48,13 +48,13 @@ var (
 	lastState       = -1
 )
 
-// --- 核心逻辑：杀进程、抢端口、再现身 ---
+// --- 核心优化：精细化夺权 ---
 
 func killAndTakeover() {
 	currentPid := os.Getpid()
 	exeName := filepath.Base(exePath)
 
-	// 1. 遍历并强杀所有同名进程（排除自己，防止自杀）
+	// 1. 物理清理：除了自己，全部干掉
 	snapshot, _ := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
 	if snapshot != 0 {
 		var proc windows.ProcessEntry32
@@ -72,25 +72,22 @@ func killAndTakeover() {
 		windows.CloseHandle(snapshot)
 	}
 
-	// 2. 暴力清理可能占用端口的僵尸连接（针对 TIME_WAIT 状态）
+	// 2. 强力清理端口占用
 	exec.Command("cmd", "/c", fmt.Sprintf("for /f \"tokens=5\" %%a in ('netstat -aon ^| findstr :%s') do taskkill /F /PID %%a", CONTROL_PORT)).Run()
 	
-	// 3. 阻塞式监听：只有抢到端口，才说明夺权成功，允许现身
-	for {
+	// 3. 阻塞等待：直到端口真正属于我
+	// 加入了重试限制和更短的间隔，减少“双进程”并存时间
+	for i := 0; i < 100; i++ { 
 		l, err := net.Listen("tcp", "127.0.0.1:"+CONTROL_PORT)
 		if err == nil {
-			// 成功占领阵地，启动后台指令监听服务
 			go func() {
 				mux := http.NewServeMux()
-				mux.HandleFunc("/wakeup", func(w http.ResponseWriter, r *http.Request) {
-					// 此处可以预留远程唤醒逻辑
-				})
-				http.Serve(l, mux)
+				mux.HandleFunc("/wakeup", func(w http.ResponseWriter, r *http.Request) {})
+				_ = http.Serve(l, mux)
 			}()
-			return // 夺权完成，退出阻塞
+			return 
 		}
-		// 抢夺失败，说明旧实例还没释放资源，稍后再试
-		time.Sleep(150 * time.Millisecond)
+		time.Sleep(50 * time.Millisecond)
 	}
 }
 
@@ -180,11 +177,11 @@ func isProcessRunning(name string) bool {
 	return false
 }
 
-// --- UI 交互 ---
+// --- UI 逻辑 ---
 
 func onReady() {
 	loadIniConfigAll()
-	saveIniConfig("run_mode", "normal") // 启动托盘意味着从隐藏恢复
+	saveIniConfig("run_mode", "normal") 
 	
 	updateIconByState(StateDefault)
 
@@ -239,11 +236,10 @@ func onExit() {
 		if hJob != 0 { windows.CloseHandle(hJob) }
 		os.Exit(0)
 	}
-	// 如果是隐藏图标，main 会继续运行，此协程阻塞
 	select {}
 }
 
-// --- 系统功能组件 ---
+// --- 系统工具 ---
 
 func setMihomoMode(mode string) {
 	saveIniConfig("mode", mode)
@@ -312,18 +308,28 @@ func initJobObject() {
 func main() {
 	if !isAdmin() { runAsAdmin(); os.Exit(0) }
 
-	// 1. 强力清场并抢夺端口
-	killAndTakeover()
-
-	// 2. 拿到端口后，初始化 Mutex 锁和 JobObject
+	// 补丁 1：抢跑判定
+	// 如果 Mutex 已存在且端口也通，说明已有“上位中”的新进程，自己直接退出，防止杀人逻辑重叠
 	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
 	h, _ := windows.CreateMutex(nil, false, mName)
+	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
+		// 检查端口，如果端口通，说明对方已经完全上位，我直接消失
+		conn, err := net.DialTimeout("tcp", "127.0.0.1:"+CONTROL_PORT, 50*time.Millisecond)
+		if err == nil {
+			conn.Close()
+			os.Exit(0)
+		}
+	}
 	hMutex = h
 
+	// 2. 执行清场和端口夺取
+	killAndTakeover()
+
+	// 3. 初始化资源
 	os.Chdir(baseDir)
 	initJobObject()
 	go monitorKernelDaemon()
 
-	// 3. 启动 UI
+	// 4. 正式现身
 	systray.Run(onReady, onExit)
 }
