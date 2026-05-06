@@ -7,7 +7,6 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strings"
 	"time"
 	"unsafe"
 
@@ -29,7 +28,6 @@ const (
 	ID_TUN_MODE     = 2007
 	ID_AUTO_START   = 2008
 	ID_SVC_INSTALL  = 2009
-	ID_SVC_UNINST   = 2010
 	ID_HIDE_TRAY    = 2011
 	ID_EXIT         = 2012
 )
@@ -37,7 +35,7 @@ const (
 const (
 	WM_USER_TRAY = 0x0400 + 2026
 	WAKEUP_PORT  = "18579"
-	APP_MUTEX    = "Global\\MihomoUltimate_V31_Final"
+	APP_MUTEX    = "Global\\MihomoUltimate_V32_Stable"
 )
 
 type NOTIFYICONDATA struct {
@@ -69,10 +67,11 @@ var (
 	autoStart    = false
 )
 
-// --- 1. 系统功能工具 ---
+// --- 系统工具 ---
 
 func setSystemProxy(enable bool) {
-	key, _ := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.SET_VALUE)
+	key, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.SET_VALUE)
+	if err != nil { return }
 	defer key.Close()
 	if enable {
 		_ = key.SetDWordValue("ProxyEnable", 1)
@@ -87,7 +86,8 @@ func setSystemProxy(enable bool) {
 }
 
 func setAutoStart(enable bool) {
-	key, _ := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.SET_VALUE)
+	key, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Run`, registry.SET_VALUE)
+	if err != nil { return }
 	defer key.Close()
 	exe, _ := os.Executable()
 	if enable {
@@ -99,12 +99,20 @@ func setAutoStart(enable bool) {
 }
 
 func getIconHandle(name string) windows.Handle {
-	data, _ := iconFs.ReadFile("icons/" + name)
+	data, err := iconFs.ReadFile("icons/" + name)
+	if err != nil { return 0 }
 	h, _, _ := user32.NewProc("CreateIconFromResourceEx").Call(uintptr(unsafe.Pointer(&data[0])), uintptr(len(data)), 1, 0x00030000, 0, 0, 0)
 	return windows.Handle(h)
 }
 
-// --- 2. 菜单与指令逻辑 ---
+func sendPatch(jsonStr string) {
+	go func() {
+		req, _ := http.NewRequest("PATCH", "http://127.0.0.1:9090/configs", bytes.NewBuffer([]byte(jsonStr)))
+		if resp, err := httpClient.Do(req); err == nil { resp.Body.Close() }
+	}()
+}
+
+// --- 菜单与指令 ---
 
 func handleCommand(id uintptr) {
 	switch id {
@@ -128,7 +136,8 @@ func handleCommand(id uintptr) {
 	case ID_AUTO_START:
 		setAutoStart(!autoStart)
 	case ID_SVC_INSTALL:
-		exec.Command("powershell", "-Command", "Start-Process mihomo-service.exe -ArgumentList 'install' -Verb RunAs").Run()
+		svcPath := filepath.Join(baseDir, "mihomo-service.exe")
+		exec.Command("powershell", "-Command", "Start-Process '"+svcPath+"' -ArgumentList 'install' -Verb RunAs").Run()
 	case ID_HIDE_TRAY:
 		pNotifyIcon.Call(2, uintptr(unsafe.Pointer(&nid))) // NIM_DELETE
 		isHidden = true
@@ -140,15 +149,6 @@ func handleCommand(id uintptr) {
 		os.Exit(0)
 	}
 }
-
-func sendPatch(jsonStr string) {
-	go func() {
-		req, _ := http.NewRequest("PATCH", "http://127.0.0.1:9090/configs", bytes.NewBuffer([]byte(jsonStr)))
-		if resp, err := httpClient.Do(req); err == nil { resp.Body.Close() }
-	}()
-}
-
-// --- 3. 窗口过程与右键菜单 ---
 
 func showContextMenu(hWnd windows.Handle) {
 	hMenu, _, _ := user32.NewProc("CreatePopupMenu").Call()
@@ -187,8 +187,8 @@ func windowProc(hWnd windows.Handle, msg uint32, wParam, lParam uintptr) uintptr
 	switch msg {
 	case WM_USER_TRAY:
 		if lParam == 0x0205 { showContextMenu(hWnd) }
-		if lParam == 0x0201 { // 左键点击恢复
-			pNotifyIcon.Call(0, uintptr(unsafe.Pointer(&nid)))
+		if lParam == 0x0201 {
+			pNotifyIcon.Call(0, uintptr(unsafe.Pointer(&nid))) // NIM_ADD
 			isHidden = false
 		}
 	case 0x0111: handleCommand(wParam)
@@ -198,17 +198,16 @@ func windowProc(hWnd windows.Handle, msg uint32, wParam, lParam uintptr) uintptr
 	return ret
 }
 
-// --- 4. Main ---
-
 func main() {
 	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
 	hMutex, _ := windows.CreateMutex(nil, false, mName)
 	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
+		if hMutex != 0 { windows.CloseHandle(hMutex) }
 		httpClient.Get("http://127.0.0.1:" + WAKEUP_PORT + "/wakeup")
 		os.Exit(0)
 	}
 
-	// 初始化状态检查
+	// 初始检查
 	k, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.QUERY_VALUE)
 	if err == nil {
 		v, _, _ := k.GetIntegerValue("ProxyEnable")
@@ -216,7 +215,7 @@ func main() {
 		k.Close()
 	}
 
-	clsName, _ := windows.UTF16PtrFromString("MihomoV31")
+	clsName, _ := windows.UTF16PtrFromString("MihomoV32Cls")
 	wc := struct { Style, LpfnWndProc, CbClsExtra, CbWndExtra, HInstance, HIcon, HCursor, HbrBackground, LpszMenuName, LpszClassName uintptr }{
 		LpfnWndProc: windows.NewCallback(windowProc),
 		LpszClassName: uintptr(unsafe.Pointer(clsName)),
@@ -262,4 +261,7 @@ func main() {
 		user32.NewProc("TranslateMessage").Call(uintptr(unsafe.Pointer(&msg)))
 		user32.NewProc("DispatchMessageW").Call(uintptr(unsafe.Pointer(&msg)))
 	}
+	
+	// 保持句柄引用防止提前被回收
+	_ = hMutex
 }
