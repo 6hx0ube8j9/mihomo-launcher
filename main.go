@@ -43,7 +43,7 @@ const (
 )
 
 var (
-	// DLL 定义 (解决 undefined 错误)
+	// 原生 DLL 调用声明
 	user32           = windows.NewLazySystemDLL("user32.dll")
 	shell32          = windows.NewLazySystemDLL("shell32.dll")
 	kernel32         = windows.NewLazySystemDLL("kernel32.dll")
@@ -72,14 +72,23 @@ var (
 	mainHwnd        windows.Handle
 )
 
-// Win32 结构体定义
+// NOTIFYICONDATA 结构体修复：HWnd 使用 windows.Handle 以匹配位宽
 type NOTIFYICONDATA struct {
-	CbSize, HWnd, UID, UFlags, UCallbackMessage uint32
-	HIcon                                       windows.Handle
-	SzTip                                       [128]uint16
-	DwState, DwStateMask                        uint32
-	SzInfo                                      [256]uint16
-	UVersion, SzInfoTitle, DwInfoFlags          uint32
+	CbSize             uint32
+	HWnd               windows.Handle
+	UID                uint32
+	UFlags             uint32
+	UCallbackMessage   uint32
+	HIcon              windows.Handle
+	SzTip              [128]uint16
+	DwState            uint32
+	DwStateMask        uint32
+	SzInfo             [256]uint16
+	UVersion           uint32
+	SzInfoTitle        [64]uint16
+	DwInfoFlags        uint32
+	GuidItem           [16]byte
+	HBalloonIcon       windows.Handle
 }
 
 type WNDCLASSW struct {
@@ -97,7 +106,7 @@ type WNDCLASSW struct {
 
 type POINT struct { X, Y int32 }
 
-// --- 第一层：原生驱动层 (Native OS) ---
+// --- 窗口消息处理 ---
 
 func windowProc(hWnd windows.Handle, msg uint32, wParam, lParam uintptr) uintptr {
 	switch msg {
@@ -170,7 +179,7 @@ func showMenu(hWnd windows.Handle) {
 	pTrackMenu.Call(hMenu, 0x102, uintptr(pos.X), uintptr(pos.Y), 0, uintptr(hWnd), 0)
 }
 
-// --- 第二层：逻辑守护层 (Guardian Layer) ---
+// --- 核心守护与状态 ---
 
 func runGuardian() {
 	target := filepath.Join(baseDir, "mihomo.exe")
@@ -203,8 +212,6 @@ func checkSystemState() int {
 	return StateDefault
 }
 
-// --- 第三层：状态与配置层 (Config Layer) ---
-
 func setTunMode(enable bool) {
 	state := "false"; if enable { state = "true" }
 	jsonBody := []byte(fmt.Sprintf(`{"tun": {"enable": %s}}`, state))
@@ -218,7 +225,7 @@ func setMihomoMode(mode string) {
 	resp, err := httpClient.Do(req); if err == nil { resp.Body.Close() }
 }
 
-// --- 工具函数集 ---
+// --- 底层辅助 ---
 
 func preloadIcons() {
 	files := []string{"stop.ico", "error.ico", "tun.ico", "proxy.ico", "default.ico"}
@@ -227,14 +234,6 @@ func preloadIcons() {
 		h, _, _ := user32.NewProc("LoadImageW").Call(0, uintptr(unsafe.Pointer(path)), 1, 0, 0, 0x10)
 		iconHandles[i] = windows.Handle(h)
 	}
-}
-
-func initJobObject() {
-	h, _ := windows.CreateJobObject(nil, nil)
-	var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
-	info.BasicLimitInformation.LimitFlags = 0x2000 // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-	kernel32.NewProc("SetInformationJobObject").Call(uintptr(h), 9, uintptr(unsafe.Pointer(&info)), uintptr(uint32(unsafe.Sizeof(info))))
-	hJob = h
 }
 
 func setupWindow() windows.Handle {
@@ -330,7 +329,7 @@ func openWebPanel() { windows.ShellExecute(0, windows.StringToUTF16Ptr("open"), 
 func openConfigFolder() { windows.ShellExecute(0, windows.StringToUTF16Ptr("open"), windows.StringToUTF16Ptr(baseDir), nil, nil, 1) }
 
 func main() {
-	// 管理员权限检查
+	// 管理员权限自提
 	var token windows.Token
 	windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token)
 	if !token.IsElevated() {
@@ -340,11 +339,16 @@ func main() {
 		os.Exit(0)
 	}
 
-	// 单实例检查
+	// 单实例 IPC
 	resp, err := httpClient.Get("http://127.0.0.1:" + WAKEUP_PORT + "/wakeup")
 	if err == nil { resp.Body.Close(); os.Exit(0) }
 	
-	initJobObject()
+	// JobObject 进程绑定
+	hJob, _ = windows.CreateJobObject(nil, nil)
+	var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+	info.BasicLimitInformation.LimitFlags = 0x2000
+	kernel32.NewProc("SetInformationJobObject").Call(uintptr(hJob), 9, uintptr(unsafe.Pointer(&info)), uintptr(uint32(unsafe.Sizeof(info))))
+	
 	loadIniConfigAll()
 	preloadIcons()
 	
@@ -366,6 +370,7 @@ func main() {
 	go runGuardian()
 	if getIniConfig("tray_hidden") != "true" { addTrayIcon() } else { isHidden = true }
 	
+	// 原生消息循环
 	var msg struct {
 		HWnd    windows.Handle
 		Message uint32
