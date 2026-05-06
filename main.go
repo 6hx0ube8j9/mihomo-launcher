@@ -88,7 +88,7 @@ func checkSystemState() int {
 		return StateError
 	}
 	if isInterfaceExisted("Mihomo") { return StateTun }
-	if isProxyEnabledInRegistry() { return StateProxy }
+	if isProxyEnabledInRegistry() { return StateProxy } // 系统代理检测
 	return StateDefault
 }
 
@@ -124,44 +124,41 @@ func isProcessRunning(name string) bool {
 
 func onReady() {
 	loadIniConfigAll()
-	// 每次启动默认显示图标，不再从 INI 读取隐藏状态
 	updateIconByState(StateDefault)
 
-	mWeb := systray.AddMenuItem("进入 Web 面板", "")
-	mDir := systray.AddMenuItem("打开程序目录", "")
+	// 1. Web面板：必须置顶以支持左键双击
+	mWeb := systray.AddMenuItem("进入 Web 面板", "左键双击图标亦可进入")
 	systray.AddSeparator()
 
-	mMode := systray.AddMenuItem("代理模式切换", "")
-	mModeR := mMode.AddSubMenuItemCheckbox("规则模式 (Rule)", "", false)
-	mModeG := mMode.AddSubMenuItemCheckbox("全局模式 (Global)", "", false)
-	mModeD := mMode.AddSubMenuItemCheckbox("直连模式 (Direct)", "", false)
+	// 2. 模式切换：由二级改为一级菜单
+	mModeR := systray.AddMenuItemCheckbox("规则模式 (Rule)", "", false)
+	mModeG := systray.AddMenuItemCheckbox("全局模式 (Global)", "", false)
+	mModeD := systray.AddMenuItemCheckbox("直连模式 (Direct)", "", false)
+	systray.AddSeparator()
 
+	// 3. 其他控制
 	mTun := systray.AddMenuItemCheckbox("TUN 模式开关", "", false)
 	mAutoRun := systray.AddMenuItemCheckbox("随系统启动", "", isAutoRunEnabled())
+	mDir := systray.AddMenuItem("打开程序目录", "")
 	
 	systray.AddSeparator()
 	mRestart := systray.AddMenuItem("重启内核进程", "")
-	mHide := systray.AddMenuItem("隐藏托盘图标", "仅退出托盘，不退内核")
+	mHide := systray.AddMenuItem("隐藏托盘图标", "仅隐藏，内核保持运行")
 	mExit := systray.AddMenuItem("彻底退出程序", "")
 
 	go monitorKernelDaemon()
 
-	// 唤醒逻辑：双击 exe 时重新触发 main -> wakeup，此处重载托盘
+	// 唤醒逻辑
 	go func() {
-		mux := http.NewServeMux()
-		mux.HandleFunc("/wakeup", func(w http.ResponseWriter, r *http.Request) {
-			// 如果已经调用过 systray.Quit()，再次通过 exe 启动会执行新的进程 main 逻辑
+		http.ListenAndServe("127.0.0.1:"+WAKEUP_PORT, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			fmt.Fprint(w, "ok")
-		})
-		http.ListenAndServe("127.0.0.1:"+WAKEUP_PORT, mux)
+		}))
 	}()
 
 	for {
 		select {
 		case <-mWeb.ClickedCh:
 			openWebPanel()
-		case <-mDir.ClickedCh:
-			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
 		case <-mModeR.ClickedCh:
 			setMihomoMode("rule"); mModeR.Check(); mModeG.Uncheck(); mModeD.Uncheck()
 		case <-mModeG.ClickedCh:
@@ -173,12 +170,15 @@ func onReady() {
 		case <-mAutoRun.ClickedCh:
 			toggleAutoRun()
 			if isAutoRunEnabled() { mAutoRun.Check() } else { mAutoRun.Uncheck() }
+		case <-mDir.ClickedCh:
+			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
 		case <-mRestart.ClickedCh:
 			restartKernel()
 		case <-mHide.ClickedCh:
-			// 修复：仅退出托盘，不设置退出标记，不销毁内核
+			// 修复：仅退出托盘，不杀死进程
 			systray.Quit()
 		case <-mExit.ClickedCh:
+			// 修复：标记真正退出，这才会杀死内核
 			isReallyExiting = true
 			systray.Quit()
 		}
@@ -202,7 +202,7 @@ func monitorKernelDaemon() {
 			}
 		}
 
-		if !isHidden && curr != lastState {
+		if curr != lastState {
 			updateIconByState(curr)
 			lastState = curr
 		}
@@ -248,7 +248,6 @@ func isAutoRunEnabled() bool {
 }
 
 func restartKernel() {
-	// 彻底退出时隐藏黑框
 	cmd := exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe")
 	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 	_ = cmd.Run()
@@ -265,19 +264,9 @@ func loadIniConfigAll() {
 	}
 }
 
-func saveIniConfig(key, val string) {
-	configMu.Lock()
-	configData[key] = val
-	var buf bytes.Buffer
-	for k, v := range configData { buf.WriteString(fmt.Sprintf("%s=%s\n", k, v)) }
-	configMu.Unlock()
-	_ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), buf.Bytes(), 0644)
-}
-
 func onExit() {
 	if !isReallyExiting { return }
 	if hJob != 0 { windows.CloseHandle(hJob) }
-	// 修复：彻底退出程序时，隐藏 taskkill 的黑框
 	cmd := exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe")
 	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 	_ = cmd.Run()
@@ -291,7 +280,6 @@ func main() {
 	hMutex, _ := windows.CreateMutex(nil, false, mName)
 	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
 		if hMutex != 0 { windows.CloseHandle(hMutex) }
-		// 唤醒已有实例并退出（如果已有实例已隐藏托盘，此处仅作探测，新实例由于无法获取 Mutex 会自动退出）
 		httpClient.Get("http://127.0.0.1:" + WAKEUP_PORT + "/wakeup")
 		os.Exit(0)
 	}
