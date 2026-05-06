@@ -37,7 +37,6 @@ const (
 
 var (
 	isReallyExiting bool
-	isInitializing  = true 
 	hJob            windows.Handle
 	httpClient      = &http.Client{Timeout: 1 * time.Second}
 	exePath, _      = os.Executable()
@@ -47,32 +46,7 @@ var (
 	lastState       = -1
 )
 
-// --- 状态检测 ---
-func checkSystemState() int {
-	_, err := httpClient.Get(API_URL)
-	if err != nil {
-		if !isProcessRunning("mihomo.exe") { return StateStop }
-		return StateStop 
-	}
-
-	configMu.RLock()
-	expectTun := configData["tun"] == "true"
-	expectProxy := configData["system_proxy"] == "true"
-	configMu.RUnlock()
-
-	hasInterface := isInterfaceExisted("Mihomo")
-	proxyEnabled := isProxyEnabledInRegistry()
-
-	if hasInterface { return StateTun }
-	if expectTun {
-		if isInitializing { return StateDefault }
-		return StateError 
-	}
-	if proxyEnabled || expectProxy { return StateProxy }
-	return StateDefault
-}
-
-// --- 工具函数 ---
+// --- 基础工具函数 ---
 
 func isAdmin() bool {
 	var token windows.Token
@@ -94,11 +68,23 @@ func initJobObject() {
 	if h != 0 {
 		var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
 		info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+		
 		windows.NewLazySystemDLL("kernel32.dll").NewProc("SetInformationJobObject").Call(
 			uintptr(h), 9, uintptr(unsafe.Pointer(&info)), uintptr(uint32(unsafe.Sizeof(info))),
 		)
 		hJob = h
 	}
+}
+
+func checkSystemState() int {
+	_, err := httpClient.Get(API_URL)
+	if err != nil {
+		if !isProcessRunning("mihomo.exe") { return StateStop }
+		return StateError
+	}
+	if isInterfaceExisted("Mihomo") { return StateTun }
+	if isProxyEnabledInRegistry() { return StateProxy }
+	return StateDefault
 }
 
 func isInterfaceExisted(name string) bool {
@@ -138,17 +124,17 @@ func isProcessRunning(name string) bool {
 }
 
 func syncConfigToKernel() {
-	for i := 0; i < 20; i++ {
+	for i := 0; i < 15; i++ {
 		_, err := httpClient.Get(API_URL)
 		if err == nil {
 			configMu.RLock()
-			if configData["tun"] == "true" { setTunMode(true) } else { setTunMode(false) }
+			if configData["tun"] == "true" { setTunMode(true) }
 			if m := configData["mode"]; m != "" { setMihomoMode(m) }
 			if configData["system_proxy"] == "true" { setSystemProxy(true) }
 			configMu.RUnlock()
 			return
 		}
-		time.Sleep(800 * time.Millisecond)
+		time.Sleep(time.Second)
 	}
 }
 
@@ -156,36 +142,41 @@ func monitorKernelDaemon() {
 	target := filepath.Join(baseDir, "mihomo.exe")
 	for {
 		if isReallyExiting { return }
-		curr := checkSystemState()
-
-		if !isInitializing {
+		_, err := httpClient.Get(API_URL)
+		if err == nil {
+			curr := checkSystemState()
 			if curr != lastState {
 				updateIconByState(curr)
 				lastState = curr
 			}
-		}
-
-		if curr == StateStop {
-			cmd := exec.Command(target, "-d", baseDir)
-			cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-			if err := cmd.Start(); err == nil && hJob != 0 {
-				hp, _ := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
-				_ = windows.AssignProcessToJobObject(hJob, hp)
-				windows.CloseHandle(hp)
-				go syncConfigToKernel()
+		} else {
+			if isProcessRunning("mihomo.exe") {
+				if lastState != StateError {
+					updateIconByState(StateError)
+					lastState = StateError
+				}
+			} else {
+				cmd := exec.Command(target, "-d", baseDir)
+				cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+				if err := cmd.Start(); err == nil && hJob != 0 {
+					hp, _ := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
+					_ = windows.AssignProcessToJobObject(hJob, hp)
+					windows.CloseHandle(hp)
+				}
+				lastState = StateStop
+				updateIconByState(StateStop)
 			}
 		}
 		time.Sleep(2 * time.Second)
 	}
 }
 
-// --- UI 逻辑修正 ---
+// --- 界面逻辑 ---
 
 func onReady() {
 	loadIniConfigAll()
 	systray.SetTooltip(APP_NAME)
 	updateIconByState(StateDefault)
-	lastState = StateDefault
 
 	mWeb := systray.AddMenuItem("进入控制面板", "")
 	systray.AddSeparator()
@@ -197,7 +188,7 @@ func onReady() {
 	systray.AddSeparator()
 
 	mTun := systray.AddMenuItemCheckbox("TUN 模式", "", getIniConfig("tun") == "true")
-	mSystemProxy := systray.AddMenuItemCheckbox("系统代理", "", getIniConfig("system_proxy") == "true")
+	mSystemProxy := systray.AddMenuItemCheckbox("系统代理", "", getIniConfig("system_proxy") == "true" || isProxyEnabledInRegistry())
 	systray.AddSeparator()
 
 	mAutoRun := systray.AddMenuItemCheckbox("开机自启", "", isAutoRunEnabled())
@@ -206,54 +197,48 @@ func onReady() {
 	mHide := systray.AddMenuItem("隐藏托盘图标", "")
 	mExit := systray.AddMenuItem("退出程序", "")
 
-	// 关键：将监听逻辑放入协程，不阻塞 onReady
-	go func() {
-		for {
-			select {
-			case <-mWeb.ClickedCh: openWebPanel()
-			case <-mModeR.ClickedCh: setMihomoMode("rule"); mModeR.Check(); mModeG.Uncheck(); mModeD.Uncheck()
-			case <-mModeG.ClickedCh: setMihomoMode("global"); mModeR.Uncheck(); mModeG.Check(); mModeD.Uncheck()
-			case <-mModeD.ClickedCh: setMihomoMode("direct"); mModeR.Uncheck(); mModeG.Uncheck(); mModeD.Check()
-			case <-mTun.ClickedCh:
-				enable := !mTun.Checked()
-				setTunMode(enable)
-				if enable { mTun.Check() } else { mTun.Uncheck() }
-			case <-mSystemProxy.ClickedCh:
-				enable := !mSystemProxy.Checked()
-				setSystemProxy(enable)
-				if enable { mSystemProxy.Check() } else { mSystemProxy.Uncheck() }
-			case <-mAutoRun.ClickedCh:
-				toggleAutoRun()
-				if isAutoRunEnabled() { mAutoRun.Check() } else { mAutoRun.Uncheck() }
-			case <-mDir.ClickedCh:
-				windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
-			case <-mRestart.ClickedCh: restartKernel()
-			case <-mHide.ClickedCh: systray.Quit()
-			case <-mExit.ClickedCh:
-				isReallyExiting = true
-				systray.Quit()
-				return
-			}
-		}
-	}()
+	go syncConfigToKernel()
 
-	// 初始化硬恢复
-	go func() {
-		isInitializing = true
-		syncConfigToKernel()
-		time.Sleep(2 * time.Second)
-		isInitializing = false
-		curr := checkSystemState()
-		updateIconByState(curr)
-		lastState = curr
-	}()
+	for {
+		select {
+		case <-mWeb.ClickedCh: openWebPanel()
+		case <-mModeR.ClickedCh: setMihomoMode("rule"); mModeR.Check(); mModeG.Uncheck(); mModeD.Uncheck()
+		case <-mModeG.ClickedCh: setMihomoMode("global"); mModeR.Uncheck(); mModeG.Check(); mModeD.Uncheck()
+		case <-mModeD.ClickedCh: setMihomoMode("direct"); mModeR.Uncheck(); mModeG.Uncheck(); mModeD.Check()
+		case <-mTun.ClickedCh:
+			enable := !mTun.Checked()
+			setTunMode(enable)
+			if enable { mTun.Check() } else { mTun.Uncheck() }
+		case <-mSystemProxy.ClickedCh:
+			enable := !mSystemProxy.Checked()
+			setSystemProxy(enable)
+			if enable { mSystemProxy.Check() } else { mSystemProxy.Uncheck() }
+		case <-mAutoRun.ClickedCh:
+			toggleAutoRun()
+			if isAutoRunEnabled() { mAutoRun.Check() } else { mAutoRun.Uncheck() }
+		case <-mDir.ClickedCh:
+			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
+		case <-mRestart.ClickedCh: restartKernel()
+		case <-mHide.ClickedCh: 
+			systray.Quit()
+		case <-mExit.ClickedCh:
+			isReallyExiting = true
+			systray.Quit()
+		}
+	}
 }
 
 func onExit() {
 	if isReallyExiting {
 		restartKernel() 
-		if hJob != 0 { windows.CloseHandle(hJob) }
+		if hJob != 0 {
+			windows.CloseHandle(hJob)
+			hJob = 0
+		}
 		os.Exit(0)
+	}
+	for {
+		time.Sleep(time.Hour)
 	}
 }
 
@@ -304,16 +289,13 @@ func restartKernel() {
 
 func loadIniConfigAll() {
 	b, _ := os.ReadFile(filepath.Join(baseDir, CONFIG_FILE))
-	lines := strings.Split(string(b), "\n")
-	configMu.Lock()
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" { continue }
-		if parts := strings.SplitN(line, "=", 2); len(parts) == 2 {
+	for _, line := range strings.Split(string(b), "\n") {
+		if parts := strings.SplitN(strings.TrimSpace(line), "=", 2); len(parts) == 2 {
+			configMu.Lock()
 			configData[parts[0]] = parts[1]
+			configMu.Unlock()
 		}
 	}
-	configMu.Unlock()
 }
 
 func getIniConfig(key string) string {
@@ -333,40 +315,77 @@ func saveIniConfig(key, val string) {
 	_ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), buf.Bytes(), 0644)
 }
 
+// --- 程序入口 (核心逻辑：确保只有接力才活，其他方式全死) ---
 func main() {
-	if !isAdmin() { runAsAdmin(); os.Exit(0) }
+	// 1. 提权检测
+	if !isAdmin() {
+		runAsAdmin()
+		os.Exit(0)
+	}
 
+	// 2. 互斥检测与接力请求
 	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
 	hMutex, _ := windows.CreateMutex(nil, false, mName)
 	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
-		if hMutex != 0 { windows.CloseHandle(hMutex) }
+		// 已经有一个实例在运行了
+		if hMutex != 0 {
+			windows.CloseHandle(hMutex)
+		}
+
+		// 尝试通知旧进程“你可以解绑内核并退位了”
 		client := http.Client{Timeout: 500 * time.Millisecond}
 		_, err := client.Get("http://127.0.0.1:" + WAKEUP_PORT + "/kill_old")
-		if err == nil { time.Sleep(800 * time.Millisecond) }
+
+		// 如果请求成功，等待旧进程释放 JobObject 资源
+		if err == nil {
+			time.Sleep(800 * time.Millisecond)
+		}
+
+		// 启动新实例（接管），然后当前中转进程退出
 		cmd := exec.Command(exePath)
 		cmd.Start()
 		os.Exit(0)
 	}
 
+	// 3. 正式启动逻辑
 	os.Chdir(baseDir)
+	
+	// 初始化 JobObject，绑定“母死子随”规则
 	initJobObject()
+
+	// 启动内核守护协程
 	go monitorKernelDaemon()
 
+	// 4. 接力与唤醒监听服务
 	go func() {
 		mux := http.NewServeMux()
+		
+		// 【生还通道】：只有新 Launcher 启动触发此接口，才会释放句柄让内核活命
 		mux.HandleFunc("/kill_old", func(w http.ResponseWriter, r *http.Request) {
+			fmt.Println("检测到新版本启动，正在交接内核句柄...")
 			if hJob != 0 {
+				// 手动关闭句柄：告诉系统我是主动交接，不要杀掉子进程
 				windows.CloseHandle(hJob)
 				hJob = 0 
 			}
 			os.Exit(0) 
 		})
+		
+		// 唤醒接口：如果已经在运行（隐藏状态），双击图标弹出面板
 		mux.HandleFunc("/wakeup", func(w http.ResponseWriter, r *http.Request) {
 			openWebPanel()
 		})
-		server := &http.Server{Addr: "127.0.0.1:" + WAKEUP_PORT, Handler: mux}
-		server.ListenAndServe()
+		
+		server := &http.Server{
+			Addr:    "127.0.0.1:" + WAKEUP_PORT,
+			Handler: mux,
+		}
+		// 监听本地端口
+		if err := server.ListenAndServe(); err != nil {
+			// 如果端口被占用，可能旧进程还没退完
+		}
 	}()
 
+	// 5. 启动托盘 UI 循环
 	systray.Run(onReady, onExit)
 }
