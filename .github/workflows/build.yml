@@ -1,4 +1,4 @@
-name: Build Mihomo Launcher (Single File)
+name: Build Mihomo Launcher
 
 on:
   push:
@@ -8,8 +8,6 @@ on:
 jobs:
   build:
     runs-on: windows-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
@@ -20,25 +18,23 @@ jobs:
           go-version: '1.22'
           cache: false
 
-      - name: Prepare Dependencies
+      - name: Initialize Module
         shell: pwsh
         run: |
+          # 确保在网页编译环境下初始化环境
           if (Test-Path "go.mod") { Remove-Item "go.mod" -Force }
-          if (Test-Path "go.sum") { Remove-Item "go.sum" -Force }
           go mod init mihomo-launcher
-          go get github.com/getlantern/systray
           go get golang.org/x/sys/windows
           go mod tidy
 
-      - name: Build Executable
+      - name: Build Standalone EXE
         shell: pwsh
         run: |
-          # 核心命令：-H windowsgui 彻底去除黑窗口
-          # 图标此时已自动被嵌入 EXE 内部
+          # -s -w 压缩体积, -H windowsgui 隐藏黑窗口
           go build -ldflags="-s -w -H windowsgui" -o mihomo-launcher.exe main.go
 
-      - name: Upload Artifact
+      - name: Upload Release Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mihomo-launcher-standalone
+          name: mihomo-launcher-v26
           path: mihomo-launcher.exe
