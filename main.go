@@ -48,19 +48,17 @@ var (
 	lastState       = -1
 )
 
-// --- 1. 核心：智能接管与唤醒逻辑 ---
+// --- 1. 唤醒与接管逻辑 ---
 
 func smartTakeover() {
 	client := http.Client{Timeout: 300 * time.Millisecond}
-
-	// 如果旧进程在后台隐藏，新进程启动时发送 kill_old 让旧进程退出
-	// 这样新进程就能顺利接管并显示托盘图标
+	// 通知隐藏在后台的旧进程：有新老板（新托盘）来了，你退位吧
 	_, err := client.Get("http://127.0.0.1:" + CONTROL_PORT + "/kill_old")
 	if err == nil {
 		time.Sleep(600 * time.Millisecond)
 	}
 
-	// 物理清理保底（针对卡死的旧进程）
+	// 强制清理残余进程（保底方案）
 	currentPid := os.Getpid()
 	exeName := filepath.Base(exePath)
 	snapshot, _ := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
@@ -80,24 +78,22 @@ func smartTakeover() {
 		windows.CloseHandle(snapshot)
 	}
 
-	// 监听控制端口
+	// 启动控制端口监听
 	for i := 0; i < 20; i++ {
 		l, err := net.Listen("tcp", "127.0.0.1:"+CONTROL_PORT)
 		if err == nil {
 			go func() {
 				mux := http.NewServeMux()
-				// 唤醒接口（备用）
 				mux.HandleFunc("/wakeup", func(w http.ResponseWriter, r *http.Request) {
 					openWebPanel()
 				})
-				// 接力接口：旧进程收到后释放内核句柄并完全消失
 				mux.HandleFunc("/kill_old", func(w http.ResponseWriter, r *http.Request) {
 					isHandover = true
 					if hJob != 0 {
 						windows.CloseHandle(hJob)
 						hJob = 0
 					}
-					systray.Quit()
+					systray.Quit() // 销毁托盘，让本进程退出
 					os.Exit(0)
 				})
 				_ = http.Serve(l, mux)
@@ -108,20 +104,13 @@ func smartTakeover() {
 	}
 }
 
-// --- 2. 界面逻辑：增加双击图标开网页 ---
+// --- 2. 托盘 UI 逻辑 ---
 
 func onReady() {
-	// 确保此时配置已加载
 	systray.SetTooltip(APP_NAME)
 	updateIconByState(StateDefault)
 
-	// 处理左键双击/点击图标：打开控制面板
-	go func() {
-		for range systray.ClickedCh {
-			openWebPanel()
-		}
-	}()
-
+	// 菜单定义
 	mWeb := systray.AddMenuItem("进入控制面板", "")
 	systray.AddSeparator()
 
@@ -141,7 +130,7 @@ func onReady() {
 	mHide := systray.AddMenuItem("隐藏托盘图标", "")
 	mExit := systray.AddMenuItem("退出程序", "")
 
-	// 启动后立即与内核同步一次配置
+	// 同步配置到内核
 	go syncConfigToKernel()
 
 	for {
@@ -173,7 +162,7 @@ func onReady() {
 		case <-mRestart.ClickedCh:
 			restartKernelForce()
 		case <-mHide.ClickedCh:
-			systray.Quit() // 仅销毁图标，main 循环会保持后台运行
+			systray.Quit() // 仅销毁 UI，后台协程 monitorKernelDaemon 依然在 main 中存活
 		case <-mExit.ClickedCh:
 			isReallyExiting = true
 			systray.Quit()
@@ -186,27 +175,20 @@ func onExit() {
 		restartKernelForce()
 		if hJob != 0 {
 			windows.CloseHandle(hJob)
-			hJob = 0
 		}
 		os.Exit(0)
 	}
-	// 隐藏模式下，此循环保持后台运行
-	for {
-		time.Sleep(time.Hour)
-	}
 }
 
-// --- 3. 内核守护与工具函数 ---
+// --- 3. 内核与配置管理 ---
 
 func monitorKernelDaemon() {
 	target := filepath.Join(baseDir, "mihomo.exe")
 	for {
 		if isReallyExiting || isHandover { return }
-
 		_, err := httpClient.Get(API_URL)
 		if err != nil {
 			if !isProcessRunning("mihomo.exe") {
-				// 进程彻底消失才拉起
 				cmd := exec.Command(target, "-d", baseDir)
 				cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 				if err := cmd.Start(); err == nil && hJob != 0 {
@@ -234,7 +216,6 @@ func monitorKernelDaemon() {
 }
 
 func syncConfigToKernel() {
-	// 等待内核 API 就绪后同步 INI 里的状态
 	for i := 0; i < 15; i++ {
 		_, err := httpClient.Get(API_URL)
 		if err == nil {
@@ -394,7 +375,7 @@ func saveIniConfig(key, val string) {
 	_ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), buf.Bytes(), 0644)
 }
 
-// --- 4. 程序入口 ---
+// --- 4. Main 入口 ---
 
 func main() {
 	if !isAdmin() {
@@ -402,11 +383,11 @@ func main() {
 		os.Exit(0)
 	}
 
-	// 1. 核心：必须先进入目录加载配置
+	// 1. 启动即进入目录加载配置
 	os.Chdir(baseDir)
 	loadIniConfigAll()
 
-	// 2. 互斥锁检测
+	// 2. 互斥锁处理
 	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
 	h, _ := windows.CreateMutex(nil, false, mName)
 	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
@@ -414,12 +395,13 @@ func main() {
 	}
 	hMutex = h
 
-	// 3. 执行智能夺权（唤醒后台图标）
+	// 3. 智能接管（双击时找回图标）
 	smartTakeover()
 
-	// 4. 正式启动
+	// 4. 资源与守护进程启动
 	initJobObject()
 	go monitorKernelDaemon()
 
+	// 5. 启动托盘 UI
 	systray.Run(onReady, onExit)
 }
