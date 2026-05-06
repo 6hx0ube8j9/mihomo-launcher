@@ -46,6 +46,8 @@ var (
 	lastState       = -1
 )
 
+// --- 基础工具函数 (保持不动) ---
+
 func isAdmin() bool {
 	var token windows.Token
 	err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token)
@@ -120,10 +122,52 @@ func isProcessRunning(name string) bool {
 	return false
 }
 
+// --- 核心守护逻辑 (已优化) ---
+
+func monitorKernelDaemon() {
+	target := filepath.Join(baseDir, "mihomo.exe")
+	for {
+		// 即使托盘退出了，只要 isReallyExiting 是 false，这个循环就一直跑
+		if isReallyExiting { return }
+
+		_, err := httpClient.Get(API_URL)
+		if err == nil {
+			// 接管模式：静默并同步 UI 状态
+			curr := checkSystemState()
+			if curr != lastState {
+				updateIconByState(curr)
+				lastState = curr
+			}
+		} else {
+			if isProcessRunning("mihomo.exe") {
+				// 异常静默：进程在但 API 不通，不操作
+				if lastState != StateError {
+					updateIconByState(StateError)
+					lastState = StateError
+				}
+			} else {
+				// 守护拉起：环境空白，主动补位
+				cmd := exec.Command(target, "-d", baseDir)
+				cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+				if err := cmd.Start(); err == nil && hJob != 0 {
+					hp, _ := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
+					_ = windows.AssignProcessToJobObject(hJob, hp)
+					windows.CloseHandle(hp)
+				}
+				lastState = StateStop
+				updateIconByState(StateStop)
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
+}
+
+// --- 界面逻辑 (支持假退出) ---
+
 func onReady() {
 	loadIniConfigAll()
-	updateIconByState(StateDefault)
 	systray.SetTooltip(APP_NAME)
+	updateIconByState(StateDefault)
 
 	mWeb := systray.AddMenuItem("进入控制面板", "")
 	systray.AddSeparator()
@@ -144,14 +188,7 @@ func onReady() {
 	mHide := systray.AddMenuItem("隐藏托盘图标", "")
 	mExit := systray.AddMenuItem("退出程序", "")
 
-	go monitorKernelDaemon()
 	go syncConfigToKernel()
-
-	go func() {
-		http.ListenAndServe("127.0.0.1:"+WAKEUP_PORT, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			openWebPanel()
-		}))
-	}()
 
 	for {
 		select {
@@ -173,13 +210,25 @@ func onReady() {
 		case <-mDir.ClickedCh:
 			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
 		case <-mRestart.ClickedCh: restartKernel()
-		case <-mHide.ClickedCh: systray.Quit()
+		case <-mHide.ClickedCh: 
+			// 假退出：只退出托盘循环，不设置 isReallyExiting
+			systray.Quit()
 		case <-mExit.ClickedCh:
 			isReallyExiting = true
 			systray.Quit()
 		}
 	}
 }
+
+func onExit() {
+	if isReallyExiting {
+		if hJob != 0 { windows.CloseHandle(hJob) }
+		os.Exit(0)
+	}
+	// 隐藏模式下，此函数执行完后，控制权回到 main 的 for 循环
+}
+
+// --- 其余功能函数 (保持不动) ---
 
 func syncConfigToKernel() {
 	for i := 0; i < 15; i++ {
@@ -193,58 +242,8 @@ func syncConfigToKernel() {
 	}
 }
 
-// 优化后的核心守护逻辑：优先探测 API 和 进程，存在即静默
-func monitorKernelDaemon() {
-	target := filepath.Join(baseDir, "mihomo.exe")
-	for {
-		if isReallyExiting { return }
-
-		// 1. 探测 API 是否通畅 (接管已有服务/进程)
-		_, err := httpClient.Get(API_URL)
-		
-		if err == nil {
-			// 【接管静默】API 正常，仅更新状态，不执行启动
-			curr := StateDefault
-			if isInterfaceExisted("Mihomo") {
-				curr = StateTun
-			} else if isProxyEnabledInRegistry() {
-				curr = StateProxy
-			}
-
-			if curr != lastState {
-				updateIconByState(curr)
-				lastState = curr
-			}
-		} else {
-			// 2. API 不通，检查进程是否已经在跑 (防止冲突)
-			if isProcessRunning("mihomo.exe") {
-				// 【异常静默】进程在但 API 不响应，不拉起新进程，避免端口冲突
-				if lastState != StateError {
-					updateIconByState(StateError)
-					lastState = StateError
-				}
-			} else {
-				// 3. 【守护拉起】环境空白，执行启动
-				if lastState != StateStop {
-					updateIconByState(StateStop)
-					lastState = StateStop
-				}
-
-				cmd := exec.Command(target, "-d", baseDir)
-				cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-				
-				if err := cmd.Start(); err == nil && hJob != 0 {
-					hp, _ := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
-					_ = windows.AssignProcessToJobObject(hJob, hp)
-					windows.CloseHandle(hp)
-				}
-			}
-		}
-		time.Sleep(2 * time.Second)
-	}
-}
-
 func updateIconByState(state int) {
+	if state < 0 { return }
 	files := []string{"stop.ico", "error.ico", "tun.ico", "proxy.ico", "default.ico"}
 	b, err := iconFs.ReadFile("icons/" + files[state])
 	if err != nil { b, _ = iconFs.ReadFile("icons/default.ico") }
@@ -316,25 +315,46 @@ func saveIniConfig(key, val string) {
 	_ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), buf.Bytes(), 0644)
 }
 
-// 优化后的退出逻辑：仅依赖 JobObject 自动清理自己拉起的进程，不误杀服务
-func onExit() {
-	if !isReallyExiting { return }
-	if hJob != 0 { 
-		windows.CloseHandle(hJob) 
-	}
-	os.Exit(0)
-}
+// --- 程序入口 (真假退出核心控制) ---
 
 func main() {
 	if !isAdmin() { runAsAdmin(); os.Exit(0) }
+	
 	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
 	hMutex, _ := windows.CreateMutex(nil, false, mName)
 	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
 		if hMutex != 0 { windows.CloseHandle(hMutex) }
+		// 唤醒逻辑：重复开启时，打开 Web 界面并静默退出
 		httpClient.Get("http://127.0.0.1:" + WAKEUP_PORT)
 		os.Exit(0)
 	}
+
 	os.Chdir(baseDir)
 	initJobObject()
-	systray.Run(onReady, onExit)
+
+	// 启动后台守护进程 (它是常驻的，不随托盘图标消失而消失)
+	go monitorKernelDaemon()
+
+	// 唤醒监听服务
+	go func() {
+		http.ListenAndServe("127.0.0.1:"+WAKEUP_PORT, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			openWebPanel()
+		}))
+	}()
+
+	// 托盘控制循环
+	for {
+		systray.Run(onReady, onExit)
+		
+		// 如果点击的是“退出程序”，isReallyExiting 为真，跳出循环彻底结束进程
+		if isReallyExiting {
+			break
+		}
+		
+		// 如果点击的是“隐藏图标”，此处会阻塞，直到程序被强杀或外部触发
+		// 此时 monitorKernelDaemon 依然在后台 go 协程中运行
+		select {
+		case <-time.After(time.Hour * 8760): // 潜伏一年
+		}
+	}
 }
