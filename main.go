@@ -137,18 +137,23 @@ func onReady() {
 	updateIconByState(StateDefault)
 	systray.SetTooltip("Mihomo Launcher")
 
-	// 1. 顶部：Web面板 (双击默认项)
+	// 修复双击逻辑：显式绑定左键点击动作到 Web 面板
+	systray.SetOnClick(func() {
+		openWebPanel()
+	})
+
+	// 1. 顶部：Web面板
 	mWeb := systray.AddMenuItem("进入 Web 面板", "")
 	systray.AddSeparator()
 
-	// 2. 模式切换 (从配置加载状态)
+	// 2. 模式切换
 	mode := getIniConfig("mode")
 	mModeR := systray.AddMenuItemCheckbox("规则模式 (Rule)", "", mode == "rule" || mode == "")
 	mModeG := systray.AddMenuItemCheckbox("全局模式 (Global)", "", mode == "global")
 	mModeD := systray.AddMenuItemCheckbox("直连模式 (Direct)", "", mode == "direct")
 	systray.AddSeparator()
 
-	// 3. 核心开关 (从配置加载状态)
+	// 3. 核心开关
 	tunOn := getIniConfig("tun") == "true"
 	mTun := systray.AddMenuItemCheckbox("TUN 模式开关", "", tunOn)
 	
@@ -168,8 +173,8 @@ func onReady() {
 	// 唤醒服务端
 	go func() {
 		http.ListenAndServe("127.0.0.1:"+WAKEUP_PORT, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			isIconHidden = false
-			updateIconByState(StateDefault)
+			// 如果已经是开启状态，收到唤醒请求则弹出面板
+			openWebPanel()
 			fmt.Fprint(w, "ok")
 		}))
 	}()
@@ -185,17 +190,9 @@ func onReady() {
 		case <-mModeD.ClickedCh:
 			setMihomoMode("direct"); mModeR.Uncheck(); mModeG.Uncheck(); mModeD.Check()
 		case <-mTun.ClickedCh:
-			if mTun.Checked() { 
-				setTunMode(false); mTun.Uncheck() 
-			} else { 
-				setTunMode(true); mTun.Check() 
-			}
+			if mTun.Checked() { setTunMode(false); mTun.Uncheck() } else { setTunMode(true); mTun.Check() }
 		case <-mSystemProxy.ClickedCh:
-			if mSystemProxy.Checked() { 
-				setSystemProxy(false); mSystemProxy.Uncheck() 
-			} else { 
-				setSystemProxy(true); mSystemProxy.Check() 
-			}
+			if mSystemProxy.Checked() { setSystemProxy(false); mSystemProxy.Uncheck() } else { setSystemProxy(true); mSystemProxy.Check() }
 		case <-mAutoRun.ClickedCh:
 			toggleAutoRun()
 			if isAutoRunEnabled() { mAutoRun.Check() } else { mAutoRun.Uncheck() }
@@ -204,8 +201,8 @@ func onReady() {
 		case <-mRestart.ClickedCh:
 			restartKernel()
 		case <-mHide.ClickedCh:
-			isIconHidden = true
-			systray.SetIcon([]byte{})
+			// 修复隐藏逻辑：直接退出UI进程，由于isReallyExiting为false，不会杀内核
+			systray.Quit()
 		case <-mExit.ClickedCh:
 			isReallyExiting = true
 			systray.Quit()
@@ -284,8 +281,6 @@ func restartKernel() {
 	_ = cmd.Run()
 }
 
-// --- 配置文件管理 ---
-
 func loadIniConfigAll() {
 	b, _ := os.ReadFile(filepath.Join(baseDir, CONFIG_FILE))
 	lines := strings.Split(string(b), "\n")
@@ -308,15 +303,14 @@ func saveIniConfig(key, val string) {
 	configData[key] = val
 	var buf bytes.Buffer
 	for k, v := range configData {
-		if k != "" {
-			buf.WriteString(fmt.Sprintf("%s=%s\n", k, v))
-		}
+		if k != "" { buf.WriteString(fmt.Sprintf("%s=%s\n", k, v)) }
 	}
 	configMu.Unlock()
 	_ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), buf.Bytes(), 0644)
 }
 
 func onExit() {
+	// 关键保护：只有点击“彻底退出”时才会杀内核
 	if !isReallyExiting { return }
 	if hJob != 0 { windows.CloseHandle(hJob) }
 	cmd := exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe")
@@ -332,6 +326,7 @@ func main() {
 	hMutex, _ := windows.CreateMutex(nil, false, mName)
 	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
 		if hMutex != 0 { windows.CloseHandle(hMutex) }
+		// 唤醒逻辑：给已经运行的内核/UI发信号
 		httpClient.Get("http://127.0.0.1:" + WAKEUP_PORT + "/wakeup")
 		os.Exit(0)
 	}
