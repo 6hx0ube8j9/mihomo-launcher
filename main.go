@@ -48,13 +48,13 @@ var (
 	lastState       = -1
 )
 
-// --- 核心优化：精细化清理 ---
+// --- 核心优化：精细化夺权 ---
 
 func killAndTakeover() {
 	currentPid := os.Getpid()
 	exeName := filepath.Base(exePath)
 
-	// 1. 清理旧的托盘进程
+	// 1. 物理清理：除了自己，全部干掉 (此函数仅在确定需要“夺权”时调用)
 	snapshot, _ := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
 	if snapshot != 0 {
 		var proc windows.ProcessEntry32
@@ -72,21 +72,19 @@ func killAndTakeover() {
 		_ = windows.CloseHandle(snapshot)
 	}
 
-	// 2. 强行清理端口占用
+	// 2. 强力清理端口占用
 	_ = exec.Command("cmd", "/c", fmt.Sprintf("for /f \"tokens=5\" %%a in ('netstat -aon ^| findstr :%s') do taskkill /F /PID %%a", CONTROL_PORT)).Run()
-
-	// 3. 阻塞尝试监听控制端口，确保真正接管
-	for i := 0; i < 50; i++ {
+	
+	// 3. 阻塞等待：直到端口真正属于我
+	for i := 0; i < 100; i++ { 
 		l, err := net.Listen("tcp", "127.0.0.1:"+CONTROL_PORT)
 		if err == nil {
 			go func() {
 				mux := http.NewServeMux()
-				mux.HandleFunc("/wakeup", func(w http.ResponseWriter, r *http.Request) {
-					w.WriteHeader(http.StatusOK)
-				})
+				mux.HandleFunc("/wakeup", func(w http.ResponseWriter, r *http.Request) {})
 				_ = http.Serve(l, mux)
 			}()
-			return
+			return 
 		}
 		time.Sleep(50 * time.Millisecond)
 	}
@@ -101,9 +99,7 @@ func loadIniConfigAll() {
 	configData = make(map[string]string)
 	for _, line := range strings.Split(string(b), "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "[") {
-			continue
-		}
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "[") { continue }
 		if parts := strings.SplitN(line, "=", 2); len(parts) == 2 {
 			configData[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
 		}
@@ -121,93 +117,71 @@ func saveIniConfig(key, val string) {
 	configData[key] = val
 	var buf bytes.Buffer
 	for k, v := range configData {
-		if k != "" {
-			buf.WriteString(fmt.Sprintf("%s = %s\n", k, v))
-		}
+		if k != "" { buf.WriteString(fmt.Sprintf("%s = %s\n", k, v)) }
 	}
 	configMu.Unlock()
 	_ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), buf.Bytes(), 0644)
 }
 
-// --- 监控逻辑 ---
+// --- 守护进程逻辑 ---
 
 func monitorKernelDaemon() {
 	target := filepath.Join(baseDir, "mihomo.exe")
 	for {
-		if isReallyExiting || isHandover {
-			return
-		}
+		if isReallyExiting || isHandover { return }
 		_, err := httpClient.Get(API_URL)
 		if err != nil {
-			// API不通时，检查进程是否存在
 			if !isProcessRunning("mihomo.exe") {
-				startMihomo(target)
+				cmd := exec.Command(target, "-d", baseDir)
+				cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+				if err := cmd.Start(); err == nil && hJob != 0 {
+					hp, _ := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
+					_ = windows.AssignProcessToJobObject(hJob, hp)
+					_ = windows.CloseHandle(hp)
+				}
+				lastState = StateStop
+				updateIconByState(StateStop)
 			}
-			lastState = StateStop
-			updateIconByState(StateStop)
 		} else {
 			curr := checkSystemState()
-			if curr != lastState {
-				updateIconByState(curr)
-				lastState = curr
-			}
+			if curr != lastState { updateIconByState(curr); lastState = curr }
 		}
 		time.Sleep(2 * time.Second)
 	}
 }
 
-func startMihomo(target string) {
-	cmd := exec.Command(target, "-d", baseDir)
-	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-	if err := cmd.Start(); err == nil && hJob != 0 {
-		hp, _ := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
-		_ = windows.AssignProcessToJobObject(hJob, hp)
-		_ = windows.CloseHandle(hp)
-	}
-}
-
 func checkSystemState() int {
 	_, err := httpClient.Get(API_URL)
-	if err != nil {
-		return StateError
-	}
+	if err != nil { return StateError }
 	ifaces, _ := net.Interfaces()
 	for _, i := range ifaces {
-		if strings.Contains(strings.ToLower(i.Name), "mihomo") {
-			return StateTun
-		}
+		if strings.Contains(strings.ToLower(i.Name), "mihomo") { return StateTun }
 	}
 	key, _ := registry.OpenKey(registry.CURRENT_USER, REG_PROXY, registry.QUERY_VALUE)
 	val, _, _ := key.GetIntegerValue("ProxyEnable")
 	_ = key.Close()
-	if val == 1 {
-		return StateProxy
-	}
+	if val == 1 { return StateProxy }
 	return StateDefault
 }
 
 func isProcessRunning(name string) bool {
 	snapshot, _ := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
-	if snapshot == 0 {
-		return false
-	}
+	if snapshot == 0 { return false }
 	defer windows.CloseHandle(snapshot)
 	var proc windows.ProcessEntry32
 	proc.Size = uint32(unsafe.Sizeof(proc))
 	for windows.Process32Next(snapshot, &proc) == nil {
-		if strings.EqualFold(windows.UTF16ToString(proc.ExeFile[:]), name) {
-			return true
-		}
+		if strings.EqualFold(windows.UTF16ToString(proc.ExeFile[:]), name) { return true }
 	}
 	return false
 }
 
-// --- UI 设置 ---
+// --- UI 逻辑 ---
 
 func onReady() {
 	loadIniConfigAll()
-	saveIniConfig("run_mode", "normal")
-
+	saveIniConfig("run_mode", "normal") 
+	
 	updateIconByState(StateDefault)
 
 	mWeb := systray.AddMenuItem("进入控制面板", "")
@@ -230,37 +204,20 @@ func onReady() {
 
 	for {
 		select {
-		case <-mWeb.ClickedCh:
-			_ = windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(API_URL+"/ui"), nil, nil, windows.SW_SHOWNORMAL)
-		case <-mModeR.ClickedCh:
-			setMihomoMode("rule")
-			mModeR.Check()
-			mModeG.Uncheck()
-			mModeD.Uncheck()
-		case <-mModeG.ClickedCh:
-			setMihomoMode("global")
-			mModeR.Uncheck()
-			mModeG.Check()
-			mModeD.Uncheck()
-		case <-mModeD.ClickedCh:
-			setMihomoMode("direct")
-			mModeR.Uncheck()
-			mModeG.Uncheck()
-			mModeD.Check()
+		case <-mWeb.ClickedCh: _ = windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(API_URL+"/ui"), nil, nil, windows.SW_SHOWNORMAL)
+		case <-mModeR.ClickedCh: setMihomoMode("rule"); mModeR.Check(); mModeG.Uncheck(); mModeD.Uncheck()
+		case <-mModeG.ClickedCh: setMihomoMode("global"); mModeR.Uncheck(); mModeG.Check(); mModeD.Uncheck()
+		case <-mModeD.ClickedCh: setMihomoMode("direct"); mModeR.Uncheck(); mModeG.Uncheck(); mModeD.Check()
 		case <-mTun.ClickedCh:
-			next := !mTun.Checked()
-			setTunMode(next)
+			next := !mTun.Checked(); setTunMode(next)
 			if next { mTun.Check() } else { mTun.Uncheck() }
 		case <-mProxy.ClickedCh:
-			next := !mProxy.Checked()
-			setProxyRegistry(next)
+			next := !mProxy.Checked(); setProxyRegistry(next)
 			if next { mProxy.Check() } else { mProxy.Uncheck() }
 		case <-mAuto.ClickedCh:
-			next := !mAuto.Checked()
-			toggleAutoStart(next)
+			next := !mAuto.Checked(); toggleAutoStart(next)
 			if next { mAuto.Check() } else { mAuto.Uncheck() }
-		case <-mDir.ClickedCh:
-			_ = windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
+		case <-mDir.ClickedCh: _ = windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
 		case <-mHide.ClickedCh:
 			saveIniConfig("run_mode", "hidden")
 			systray.Quit()
@@ -278,6 +235,7 @@ func onExit() {
 		if hJob != 0 { _ = windows.CloseHandle(hJob) }
 		os.Exit(0)
 	}
+	// 如果不是真正退出（即隐藏模式），这里不做任何事，让 JobObject 维持
 }
 
 // --- 系统工具 ---
@@ -299,8 +257,7 @@ func setTunMode(enable bool) {
 func setProxyRegistry(enable bool) {
 	saveIniConfig("system_proxy_enabled", fmt.Sprint(enable))
 	key, _ := registry.OpenKey(registry.CURRENT_USER, REG_PROXY, registry.SET_VALUE)
-	val := uint32(0)
-	if enable { val = 1 }
+	val := uint32(0); if enable { val = 1 }
 	_ = key.SetDWordValue("ProxyEnable", val)
 	_ = key.Close()
 }
@@ -308,20 +265,14 @@ func setProxyRegistry(enable bool) {
 func toggleAutoStart(enable bool) {
 	saveIniConfig("auto_start", fmt.Sprint(enable))
 	key, _ := registry.OpenKey(registry.CURRENT_USER, REG_RUN, registry.SET_VALUE)
-	if enable {
-		_ = key.SetStringValue(APP_NAME, exePath)
-	} else {
-		_ = key.DeleteValue(APP_NAME)
-	}
+	if enable { _ = key.SetStringValue(APP_NAME, exePath) } else { _ = key.DeleteValue(APP_NAME) }
 	_ = key.Close()
 }
 
 func updateIconByState(state int) {
 	files := []string{"stop.ico", "error.ico", "tun.ico", "proxy.ico", "default.ico"}
 	b, err := iconFs.ReadFile("icons/" + files[state])
-	if err == nil {
-		systray.SetIcon(b)
-	}
+	if err == nil { systray.SetIcon(b) }
 }
 
 func isAdmin() bool {
@@ -351,38 +302,36 @@ func initJobObject() {
 	}
 }
 
-// --- 入口判定 ---
+// --- 入口函数 ---
 
 func main() {
-	// 1. 优先判定权限，且提权前不创建 Mutex
-	if !isAdmin() {
-		runAsAdmin()
-		os.Exit(0)
-	}
+	if !isAdmin() { runAsAdmin(); os.Exit(0) }
 
-	// 2. 检查是否有处于 Normal 模式的实例（解决闪退）
+	// 1. 尝试探测控制端口
 	loadIniConfigAll()
 	conn, err := net.DialTimeout("tcp", "127.0.0.1:"+CONTROL_PORT, 50*time.Millisecond)
 	if err == nil {
 		_ = conn.Close()
+		// 如果端口通，且配置显示是 normal 模式，说明对方活得很好且图标就在那，我直接退出
 		if getIniConfig("run_mode") == "normal" {
-			// 已经有一个显示的托盘在跑了，新起的进程直接悄悄退出
-			return
+			return 
 		}
+		// 如果是 hidden 模式，或者其他情况，我们需要继续执行，去“杀掉”旧托盘并“显示”新托盘
 	}
 
-	// 3. 此时说明需要“接管”或者“显示托盘”，创建 Mutex 占位
+	// 2. 占领 Mutex
 	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
 	h, _ := windows.CreateMutex(nil, false, mName)
 	hMutex = h
 
-	// 4. 清场并夺权
+	// 3. 执行清场和端口夺取 (此时是安全的夺权，因为已确认要么没运行，要么需要唤醒隐藏进程)
 	killAndTakeover()
 
-	// 5. 初始化并启动
+	// 4. 初始化资源
 	_ = os.Chdir(baseDir)
 	initJobObject()
 	go monitorKernelDaemon()
 
+	// 5. 正式现身
 	systray.Run(onReady, onExit)
 }
