@@ -48,19 +48,16 @@ var (
 	lastState       = -1
 )
 
-// --- 配置读写逻辑 ---
+// --- 配置管理 ---
 
 func loadIniConfigAll() {
-	b, err := os.ReadFile(filepath.Join(baseDir, CONFIG_FILE))
-	if err != nil { return }
-	
+	b, _ := os.ReadFile(filepath.Join(baseDir, CONFIG_FILE))
 	configMu.Lock()
 	defer configMu.Unlock()
+	configData = make(map[string]string) // 重置
 	for _, line := range strings.Split(string(b), "\n") {
 		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "[") {
-			continue
-		}
+		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "[") { continue }
 		if parts := strings.SplitN(line, "=", 2); len(parts) == 2 {
 			configData[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
 		}
@@ -78,15 +75,13 @@ func saveIniConfig(key, val string) {
 	configData[key] = val
 	var buf bytes.Buffer
 	for k, v := range configData {
-		if k != "" {
-			buf.WriteString(fmt.Sprintf("%s = %s\n", k, v))
-		}
+		if k != "" { buf.WriteString(fmt.Sprintf("%s = %s\n", k, v)) }
 	}
 	configMu.Unlock()
 	_ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), buf.Bytes(), 0644)
 }
 
-// --- 系统工具函数 ---
+// --- 系统工具 ---
 
 func isAdmin() bool {
 	var token windows.Token
@@ -132,13 +127,7 @@ func monitorKernelDaemon() {
 	for {
 		if isReallyExiting || isHandover { return }
 		_, err := httpClient.Get(API_URL)
-		if err == nil {
-			curr := checkSystemState()
-			if curr != lastState {
-				updateIconByState(curr)
-				lastState = curr
-			}
-		} else {
+		if err != nil {
 			if !isProcessRunning("mihomo.exe") {
 				cmd := exec.Command(target, "-d", baseDir)
 				cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
@@ -150,6 +139,9 @@ func monitorKernelDaemon() {
 				lastState = StateStop
 				updateIconByState(StateStop)
 			}
+		} else {
+			curr := checkSystemState()
+			if curr != lastState { updateIconByState(curr); lastState = curr }
 		}
 		time.Sleep(2 * time.Second)
 	}
@@ -169,14 +161,13 @@ func checkSystemState() int {
 	return StateDefault
 }
 
-// --- UI 与 交互 ---
+// --- UI 逻辑 ---
 
 func onReady() {
 	loadIniConfigAll()
-	saveIniConfig("run_mode", "normal") // 启动托盘后强制标记为 normal
+	saveIniConfig("run_mode", "normal") // 恢复显示
 	
 	updateIconByState(StateDefault)
-
 	mWeb := systray.AddMenuItem("进入控制面板", "")
 	systray.AddSeparator()
 
@@ -197,25 +188,20 @@ func onReady() {
 
 	for {
 		select {
-		case <-mWeb.ClickedCh:
-			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(API_URL+"/ui"), nil, nil, windows.SW_SHOWNORMAL)
+		case <-mWeb.ClickedCh: windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(API_URL+"/ui"), nil, nil, windows.SW_SHOWNORMAL)
 		case <-mModeR.ClickedCh: setMihomoMode("rule"); mModeR.Check(); mModeG.Uncheck(); mModeD.Uncheck()
 		case <-mModeG.ClickedCh: setMihomoMode("global"); mModeR.Uncheck(); mModeG.Check(); mModeD.Uncheck()
 		case <-mModeD.ClickedCh: setMihomoMode("direct"); mModeR.Uncheck(); mModeG.Uncheck(); mModeD.Check()
 		case <-mTun.ClickedCh:
-			next := !mTun.Checked()
-			setTunMode(next)
+			next := !mTun.Checked(); setTunMode(next)
 			if next { mTun.Check() } else { mTun.Uncheck() }
 		case <-mProxy.ClickedCh:
-			next := !mProxy.Checked()
-			setProxyRegistry(next)
+			next := !mProxy.Checked(); setProxyRegistry(next)
 			if next { mProxy.Check() } else { mProxy.Uncheck() }
 		case <-mAuto.ClickedCh:
-			next := !mAuto.Checked()
-			toggleAutoStart(next)
+			next := !mAuto.Checked(); toggleAutoStart(next)
 			if next { mAuto.Check() } else { mAuto.Uncheck() }
-		case <-mDir.ClickedCh:
-			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
+		case <-mDir.ClickedCh: windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
 		case <-mHide.ClickedCh:
 			saveIniConfig("run_mode", "hidden")
 			systray.Quit()
@@ -233,7 +219,8 @@ func onExit() {
 		if hJob != 0 { windows.CloseHandle(hJob) }
 		os.Exit(0)
 	}
-	select {} // 隐藏模式在此阻塞，由 main 里的 HTTP 信号接管
+	// 幽灵模式挂起
+	select {}
 }
 
 func setMihomoMode(mode string) {
@@ -271,54 +258,57 @@ func updateIconByState(state int) {
 	if err == nil { systray.SetIcon(b) }
 }
 
-// --- 入口夺权逻辑 ---
+// --- 入口夺权逻辑 (修正幽灵不死的死穴) ---
 
 func main() {
 	if !isAdmin() { runAsAdmin(); os.Exit(0) }
 
 	loadIniConfigAll()
-	isGhost := getIniConfig("run_mode") == "hidden"
-
 	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
-	h, _ := windows.CreateMutex(nil, false, mName)
 	
+	// 1. 尝试获取 Mutex
+	h, _ := windows.CreateMutex(nil, false, mName)
 	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
+		// 发现旧进程存在
 		if h != 0 { windows.CloseHandle(h) }
 
-		// 尝试踢掉旧进程
-		http.Get("http://127.0.0.1:" + CONTROL_PORT + "/kill_old")
+		// 2. 发送信号通知旧进程自杀
+		httpClient.Get("http://127.0.0.1:" + CONTROL_PORT + "/kill_old")
 
-		if isGhost {
-			// 幽灵模式：死等 Mutex 释放，实现无感替换
-			for i := 0; i < 30; i++ {
-				time.Sleep(100 * time.Millisecond)
-				h, _ = windows.CreateMutex(nil, false, mName)
-				if windows.GetLastError() != windows.ERROR_ALREADY_EXISTS {
-					hMutex = h
-					goto START_SERVICE
-				}
-				if h != 0 { windows.CloseHandle(h) }
+		// 3. 【核心修复】：原地打转，直到抢到 Mutex 为止
+		// 不管是不是 Ghost，既然你想运行新母，就必须在这里等旧母死透
+		success := false
+		for i := 0; i < 50; i++ { // 最多等 5 秒
+			time.Sleep(100 * time.Millisecond)
+			h, _ = windows.CreateMutex(nil, false, mName)
+			if windows.GetLastError() != windows.ERROR_ALREADY_EXISTS {
+				hMutex = h
+				success = true
+				break
 			}
+			if h != 0 { windows.CloseHandle(h) }
 		}
-		// 正常模式：启动新实例后自杀，让新实例接管 UI
-		cmd := exec.Command(exePath)
-		cmd.Start()
-		os.Exit(0)
-	}
-	hMutex = h
 
-START_SERVICE:
+		if !success {
+			// 如果 5 秒都抢不到，说明旧进程卡死了，弹个提示或者强杀
+			os.Exit(1)
+		}
+	} else {
+		hMutex = h
+	}
+
+	// --- 抢到 Mutex 后，新进程才开始正式初始化 ---
 	os.Chdir(baseDir)
 	initJobObject()
 	go monitorKernelDaemon()
 
-	// 控制接口
+	// 启动本地监听
 	go func() {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/kill_old", func(w http.ResponseWriter, r *http.Request) {
 			isHandover = true
 			if hJob != 0 { windows.CloseHandle(hJob); hJob = 0 }
-			windows.CloseHandle(hMutex)
+			windows.CloseHandle(hMutex) // 释放 Mutex
 			os.Exit(0) 
 		})
 		http.ListenAndServe("127.0.0.1:"+CONTROL_PORT, mux)
