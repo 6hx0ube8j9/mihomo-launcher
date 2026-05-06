@@ -237,9 +237,8 @@ func onExit() {
 		}
 		os.Exit(0)
 	}
-	for {
-		time.Sleep(time.Hour)
-	}
+	// 隐藏图标状态：进入静默阻塞，等待 main 中的 HTTP 服务接收退出指令
+	select {} 
 }
 
 func updateIconByState(state int) {
@@ -336,12 +335,12 @@ func main() {
 		client := http.Client{Timeout: 500 * time.Millisecond}
 		_, err := client.Get("http://127.0.0.1:" + WAKEUP_PORT + "/kill_old")
 
-		// 如果请求成功，等待旧进程释放 JobObject 资源
+		// 如果请求成功，等待旧进程释放所有资源
 		if err == nil {
-			time.Sleep(800 * time.Millisecond)
+			time.Sleep(1200 * time.Millisecond)
 		}
 
-		// 启动新实例（接管），然后当前中转进程退出
+		// 启动新实例作为正式母进程，然后当前中转进程退出
 		cmd := exec.Command(exePath)
 		cmd.Start()
 		os.Exit(0)
@@ -349,11 +348,7 @@ func main() {
 
 	// 3. 正式启动逻辑
 	os.Chdir(baseDir)
-	
-	// 初始化 JobObject，绑定“母死子随”规则
 	initJobObject()
-
-	// 启动内核守护协程
 	go monitorKernelDaemon()
 
 	// 4. 接力与唤醒监听服务
@@ -362,7 +357,6 @@ func main() {
 		
 		// 【生还通道】：只有新 Launcher 启动触发此接口，才会释放句柄让内核活命
 		mux.HandleFunc("/kill_old", func(w http.ResponseWriter, r *http.Request) {
-			fmt.Println("检测到新版本启动，正在交接内核句柄...")
 			if hJob != 0 {
 				// 手动关闭句柄：告诉系统我是主动交接，不要杀掉子进程
 				windows.CloseHandle(hJob)
@@ -371,19 +365,13 @@ func main() {
 			os.Exit(0) 
 		})
 		
-		// 唤醒接口：如果已经在运行（隐藏状态），双击图标弹出面板
+		// 唤醒接口：弹出面板
 		mux.HandleFunc("/wakeup", func(w http.ResponseWriter, r *http.Request) {
 			openWebPanel()
 		})
 		
-		server := &http.Server{
-			Addr:    "127.0.0.1:" + WAKEUP_PORT,
-			Handler: mux,
-		}
-		// 监听本地端口
-		if err := server.ListenAndServe(); err != nil {
-			// 如果端口被占用，可能旧进程还没退完
-		}
+		server := &http.Server{Addr: "127.0.0.1:" + WAKEUP_PORT, Handler: mux}
+		_ = server.ListenAndServe()
 	}()
 
 	// 5. 启动托盘 UI 循环
