@@ -77,11 +77,10 @@ type NOTIFYICONDATA struct {
 	DwState          uint32
 	DwStateMask      uint32
 	SzInfo           [256]uint16
-	UVersion         uint32
+	UVersion         uint32 // 注意这个字段，Windows 2000 以后需要它
 	SzInfoTitle      [64]uint16
 	DwInfoFlags      uint32
 }
-
 // --- 1. 核心判断逻辑 (优先级闭环) ---
 
 func checkSystemState() int {
@@ -181,44 +180,75 @@ func removeTrayIcon() {
 }
 
 // --- 5. 主入口 (稳健启动) ---
+func setupWindow() windows.Handle {
+	className, _ := windows.UTF16PtrFromString("MihomoTrayWindow")
+	instance, _ := windows.GetModuleHandle(nil)
+
+	// 注册窗口类
+	wndClass := windows.WNDCLASSW{
+		HInstance:     instance,
+		LpszClassName: className,
+		LpfnWndProc:   windows.NewCallback(windows.DefWindowProc), // 暂时用默认处理
+	}
+	windows.RegisterClassW(&wndClass)
+
+	// 创建隐形窗口
+	hwnd, _ := windows.CreateWindowEx(
+		0, className, className,
+		0, 0, 0, 0, 0,
+		0, 0, instance, nil,
+	)
+	return hwnd
+}
+func initNid() {
+	globalNid.CbSize = uint32(unsafe.Sizeof(globalNid))
+	globalNid.UFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP
+	globalNid.UCallbackMessage = WM_USER_TRAY
+	globalNid.UID = 1001
+    // 这里设置初始提示文字
+	copy(globalNid.SzTip[:], windows.StringToUTF16("Mihomo Launcher"))
+}
 
 func main() {
-	// 权限与单实例
-	if !isAdmin() { runAsAdmin(); os.Exit(0) }
-	if wakeupExisting() { os.Exit(0) }
-
+	// ... 原有的 Admin、Mutex、JobObject 初始化保持不变 ...
+    if !isAdmin() { runAsAdmin(); os.Exit(0) }
+ 	if wakeupExisting() { os.Exit(0) }
 	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
 	hMutex, _ := windows.CreateMutex(nil, false, mName)
 	defer windows.CloseHandle(hMutex)
-
-	os.Chdir(baseDir)
 	initJobObject()
+	// 1. 先建立窗口宿主
+	hwnd := setupWindow()
+	globalNid.HWnd = hwnd // 关键：把图标和窗口绑定
 
-	// 预加载
+	// 2. 正常初始化
 	loadIniConfigAll()
 	preloadIcons()
-	
-	// 初始化 NID (使用隐藏窗口句柄，此处简化为 0)
-	globalNid.CbSize = uint32(unsafe.Sizeof(globalNid))
-	globalNid.UID = 1001
-	globalNid.UFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP
-	copy(globalNid.SzTip[:], windows.StringToUTF16("Mihomo Launcher"))
+	initNid()
 
-	// 启动分层
+	// 3. 启动后台逻辑
 	go startIpcServer()
 	go runGuardian()
 
-	// 初始显示状态
+	// 4. 根据配置决定是否显示
 	if getIniConfig("tray_hidden") != "true" {
 		addTrayIcon()
 	} else {
 		isHidden = true
 	}
 
-	// 保持主进程不退出 (此处可后续添加 WndProc 消息循环)
-	select {} 
+	// 5. 【核心替换】把 select{} 换成下面这个循环
+	var msg windows.Msg
+	for {
+		// GetMessage 会阻塞在这里，直到系统有消息（如刷新、点击、退出）
+		ret, _ := windows.GetMessage(&msg, 0, 0, 0)
+		if ret == 0 {
+			break
+		}
+		windows.TranslateMessage(&msg)
+		windows.DispatchMessage(&msg)
+	}
 }
-
 // --- 原版核心逻辑保留 ---
 
 func isProxyEnabledInRegistry() bool {
