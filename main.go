@@ -237,26 +237,35 @@ func setMihomoMode(mode string) {
 // --- 底层辅助 (内嵌加载优化) ---
 
 func preloadIcons() {
+	// 对应 StateStop=0, StateError=1, StateTun=2, StateProxy=3, StateDefault=4
 	files := []string{"stop.ico", "error.ico", "tun.ico", "proxy.ico", "default.ico"}
+	
 	for i, f := range files {
-		// 从内嵌 FS 读取数据
+		// 从 embed.FS 读取二进制数据
 		data, err := iconFs.ReadFile("icons/" + f)
-		if err != nil {
-			// 加载系统默认图标
-			h, _, _ := pLoadIconW.Call(0, uintptr(32512))
-			iconHandles[i] = windows.Handle(h)
-			continue
+		
+		var h uintptr
+		if err == nil && len(data) > 0 {
+			// 将内存中的 .ico 数据转换为 Windows 句柄
+			// 参数说明: 数据指针, 数据长度, 资源类型(1为图标), 版本(0x00030000), 宽, 高, 标志
+			h, _, _ = pCreateIconFromResource.Call(
+				uintptr(unsafe.Pointer(&data[0])),
+				uintptr(len(data)),
+				1,          // TRUE (Icon)
+				0x00030000, // Version 3.0
+				0,          // 使用图标默认宽度
+				0,          // 使用图标默认高度
+				0,          // LR_DEFAULTCOLOR
+			)
 		}
 
-		// 从内存创建句柄
-		h, _, _ := pCreateIconFromResource.Call(
-			uintptr(unsafe.Pointer(&data[0])),
-			uintptr(len(data)),
-			1,          // TRUE
-			0x00030000, // Version
-			0, 0,       // CX, CY (使用默认)
-			0,          // LR_DEFAULTCOLOR
-		)
+		// --- 保底逻辑 ---
+		// 如果 embed 读取失败或 CreateIconFromResource 转换失败 (h == 0)
+		if h == 0 {
+			// 加载系统内置图标 IDI_APPLICATION (32512) 确保程序不崩溃
+			h, _, _ = pLoadIconW.Call(0, uintptr(32512))
+		}
+		
 		iconHandles[i] = windows.Handle(h)
 	}
 }
@@ -354,48 +363,83 @@ func openWebPanel() { windows.ShellExecute(0, windows.StringToUTF16Ptr("open"), 
 func openConfigFolder() { windows.ShellExecute(0, windows.StringToUTF16Ptr("open"), windows.StringToUTF16Ptr(baseDir), nil, nil, 1) }
 
 func main() {
-	// 管理员权限自提
-	var token windows.Token
-	windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token)
-	if !token.IsElevated() {
-		verb, _ := syscall.UTF16PtrFromString("runas")
-		exe, _ := syscall.UTF16PtrFromString(exePath)
-		windows.ShellExecute(0, verb, exe, nil, nil, 0)
-		os.Exit(0)
+	// 1. 管理员权限自提（增加参数判断，防止极少数环境下的死循环）
+	isRestart := false
+	for _, arg := range os.Args {
+		if arg == "--restarted" { isRestart = true; break }
 	}
 
-	// 单实例 IPC
-	resp, err := httpClient.Get("http://127.0.0.1:" + WAKEUP_PORT + "/wakeup")
-	if err == nil { resp.Body.Close(); os.Exit(0) }
+	var token windows.Token
+	err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token)
+	if err == nil {
+		if !token.IsElevated() && !isRestart {
+			verb, _ := syscall.UTF16PtrFromString("runas")
+			exe, _ := syscall.UTF16PtrFromString(exePath)
+			arg, _ := syscall.UTF16PtrFromString("--restarted")
+			windows.ShellExecute(0, verb, exe, arg, nil, 0)
+			os.Exit(0)
+		}
+	}
 
-	// JobObject 进程绑定
+	// 2. 健壮的单实例检测与唤醒机制
+	// 先尝试监听端口，如果失败则说明已有实例
+	ln, err := net.Listen("tcp", "127.0.0.1:"+WAKEUP_PORT)
+	if err != nil {
+		// 发送唤醒信号给已存在的实例
+		httpClient.Get("http://127.0.0.1:" + WAKEUP_PORT + "/wakeup")
+		os.Exit(0) // 退出当前新实例
+	}
+	// 成功抢占端口，ln 将在后面的协程中使用，不要在这里 Close
+
+	// 3. 进程绑定到 Job Object（实现 Launcher 退出时内核同步退出）
 	hJob, _ = windows.CreateJobObject(nil, nil)
 	var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
-	info.BasicLimitInformation.LimitFlags = 0x2000
+	info.BasicLimitInformation.LimitFlags = 0x2000 // JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
 	kernel32.NewProc("SetInformationJobObject").Call(uintptr(hJob), 9, uintptr(unsafe.Pointer(&info)), uintptr(uint32(unsafe.Sizeof(info))))
 
+	// 4. 加载配置与图标
 	loadIniConfigAll()
 	preloadIcons()
 
+	// 5. 创建隐藏的消息窗口
 	mainHwnd = setupWindow()
+	if mainHwnd == 0 {
+		os.Exit(1) // 窗口创建失败则退出
+	}
+
+	// 初始化托盘数据结构
 	globalNid.HWnd = mainHwnd
 	globalNid.CbSize = uint32(unsafe.Sizeof(globalNid))
 	globalNid.UID = 1001
-	globalNid.UCallbackMessage = 0x0400 + 1001
-	copy(globalNid.SzTip[:], windows.StringToUTF16("Mihomo Manager"))
+	globalNid.UCallbackMessage = 0x0400 + 1001 // WM_USER_TRAY
+	copy(globalNid.SzTip[:], windows.StringToUTF16("Mihomo Launcher"))
 
+	// 6. 启动唤醒 HTTP 服务 (复用上面成功的监听器)
 	go func() {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/wakeup", func(w http.ResponseWriter, r *http.Request) {
-			if isHidden { isHidden = false; saveIniConfig("tray_hidden", "false"); addTrayIcon() }
+			if isHidden {
+				isHidden = false
+				saveIniConfig("tray_hidden", "false")
+				addTrayIcon()
+			}
+			// 激活并置顶 Web 面板 (可选)
+			openWebPanel()
 		})
-		http.ListenAndServe("127.0.0.1:"+WAKEUP_PORT, mux)
+		http.Serve(ln, mux)
 	}()
 
+	// 7. 启动内核守护协程
 	go runGuardian()
-	if getIniConfig("tray_hidden") != "true" { addTrayIcon() } else { isHidden = true }
 
-	// 原生消息循环
+	// 8. 根据配置决定是否显示托盘
+	if getIniConfig("tray_hidden") != "true" {
+		addTrayIcon()
+	} else {
+		isHidden = true
+	}
+
+	// 9. 核心消息循环 (保持进程存活的关键)
 	var msg struct {
 		HWnd    windows.Handle
 		Message uint32
@@ -405,8 +449,11 @@ func main() {
 		Pt      POINT
 	}
 	for {
+		// GetMessageW 会在这里阻塞，直到接收到系统消息
 		ret, _, _ := pGetMessageW.Call(uintptr(unsafe.Pointer(&msg)), 0, 0, 0)
-		if ret == 0 { break }
+		if int32(ret) <= 0 {
+			break
+		}
 		pTranslateMsg.Call(uintptr(unsafe.Pointer(&msg)))
 		pDispatchMsg.Call(uintptr(unsafe.Pointer(&msg)))
 	}
