@@ -37,7 +37,9 @@ const (
 
 var (
 	isReallyExiting bool
+	isHandover      bool // 关键：标记是否处于接力状态
 	hJob            windows.Handle
+	hMutex          windows.Handle
 	httpClient      = &http.Client{Timeout: 1 * time.Second}
 	exePath, _      = os.Executable()
 	baseDir         = filepath.Dir(exePath)
@@ -141,7 +143,7 @@ func syncConfigToKernel() {
 func monitorKernelDaemon() {
 	target := filepath.Join(baseDir, "mihomo.exe")
 	for {
-		if isReallyExiting { return }
+		if isReallyExiting || isHandover { return }
 		_, err := httpClient.Get(API_URL)
 		if err == nil {
 			curr := checkSystemState()
@@ -229,15 +231,20 @@ func onReady() {
 }
 
 func onExit() {
+	// 如果是点击“退出程序”
 	if isReallyExiting {
-		restartKernel() 
+		restartKernel() // 强杀内核
 		if hJob != 0 {
 			windows.CloseHandle(hJob)
 			hJob = 0
 		}
 		os.Exit(0)
 	}
-	// 隐藏图标状态：进入静默阻塞，等待 main 中的 HTTP 服务接收退出指令
+
+	// 如果是在“隐藏图标”状态
+	// 我们进入阻塞，等待 main 里的 HTTP 接力信号
+	// 如果这个阻塞被意外打破（如进程被任务管理器杀掉），
+	// 只要 isHandover 为 false，内核会因为 JobObject 而一起死。
 	select {} 
 }
 
@@ -314,66 +321,66 @@ func saveIniConfig(key, val string) {
 	_ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), buf.Bytes(), 0644)
 }
 
-// --- 程序入口 (核心逻辑：确保只有接力才活，其他方式全死) ---
+// --- 程序入口 ---
 func main() {
-	// 1. 提权检测
 	if !isAdmin() {
 		runAsAdmin()
 		os.Exit(0)
 	}
 
-	// 2. 互斥检测与接力请求
 	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
-	hMutex, _ := windows.CreateMutex(nil, false, mName)
+	
+	// 尝试获取互斥量
+	h, _ := windows.CreateMutex(nil, false, mName)
 	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
-		// 已经有一个实例在运行了
-		if hMutex != 0 {
-			windows.CloseHandle(hMutex)
+		if h != 0 { windows.CloseHandle(h) }
+
+		// 接力：尝试唤醒或替换旧进程
+		client := http.Client{Timeout: 300 * time.Millisecond}
+		client.Get("http://127.0.0.1:" + WAKEUP_PORT + "/kill_old")
+
+		// 循环竞争 Mutex
+		for i := 0; i < 30; i++ {
+			time.Sleep(100 * time.Millisecond)
+			h, _ = windows.CreateMutex(nil, false, mName)
+			if windows.GetLastError() != windows.ERROR_ALREADY_EXISTS {
+				hMutex = h
+				goto SUCCESS
+			}
+			if h != 0 { windows.CloseHandle(h) }
 		}
-
-		// 尝试通知旧进程“你可以解绑内核并退位了”
-		client := http.Client{Timeout: 500 * time.Millisecond}
-		_, err := client.Get("http://127.0.0.1:" + WAKEUP_PORT + "/kill_old")
-
-		// 如果请求成功，等待旧进程释放所有资源
-		if err == nil {
-			time.Sleep(1200 * time.Millisecond)
-		}
-
-		// 启动新实例作为正式母进程，然后当前中转进程退出
+		// 超时则强行启动
 		cmd := exec.Command(exePath)
 		cmd.Start()
 		os.Exit(0)
 	}
+	hMutex = h
 
-	// 3. 正式启动逻辑
+SUCCESS:
 	os.Chdir(baseDir)
 	initJobObject()
 	go monitorKernelDaemon()
 
-	// 4. 接力与唤醒监听服务
+	// 接力监听
 	go func() {
 		mux := http.NewServeMux()
-		
-		// 【生还通道】：只有新 Launcher 启动触发此接口，才会释放句柄让内核活命
 		mux.HandleFunc("/kill_old", func(w http.ResponseWriter, r *http.Request) {
+			isHandover = true // 标记进入接力状态
 			if hJob != 0 {
-				// 手动关闭句柄：告诉系统我是主动交接，不要杀掉子进程
-				windows.CloseHandle(hJob)
+				windows.CloseHandle(hJob) // 释放内核，让它活
 				hJob = 0 
 			}
+			windows.CloseHandle(hMutex) // 释放锁，让新进程进场
 			os.Exit(0) 
 		})
 		
-		// 唤醒接口：弹出面板
 		mux.HandleFunc("/wakeup", func(w http.ResponseWriter, r *http.Request) {
 			openWebPanel()
 		})
 		
 		server := &http.Server{Addr: "127.0.0.1:" + WAKEUP_PORT, Handler: mux}
-		_ = server.ListenAndServe()
+		server.ListenAndServe()
 	}()
 
-	// 5. 启动托盘 UI 循环
 	systray.Run(onReady, onExit)
 }
