@@ -37,6 +37,7 @@ const (
 
 var (
 	isReallyExiting bool
+	isInitializing  = true // 启动初始化标记，用于防抖
 	hJob            windows.Handle
 	httpClient      = &http.Client{Timeout: 1 * time.Second}
 	exePath, _      = os.Executable()
@@ -46,27 +47,47 @@ var (
 	lastState       = -1
 )
 
-// --- 状态检测优化版 ---
+// --- 核心状态检测 ---
 func checkSystemState() int {
+	// 1. API 通信检查
 	_, err := httpClient.Get(API_URL)
 	if err != nil {
-		if !isProcessRunning("mihomo.exe") { return StateStop }
-		return StateError
+		if !isProcessRunning("mihomo.exe") {
+			return StateStop // 红色：内核进程没跑
+		}
+		return StateStop // 进程在但 API 不通，也视为异常
 	}
 
 	configMu.RLock()
 	expectTun := configData["tun"] == "true"
+	expectProxy := configData["system_proxy"] == "true"
 	configMu.RUnlock()
 
 	hasInterface := isInterfaceExisted("Mihomo")
+	proxyEnabled := isProxyEnabledInRegistry()
 
-	// 如果配置开启了 TUN 但网卡还没出来，显示错误状态（红色）
-	if expectTun {
-		if hasInterface { return StateTun }
-		return StateError 
+	// --- 优先级判定逻辑 ---
+
+	// 1. 只要检测到网卡，说明 TUN 成功 -> 绿色
+	if hasInterface {
+		return StateTun
 	}
-	
-	if isProxyEnabledInRegistry() { return StateProxy }
+
+	// 2. 如果配置要求开 TUN，但没网卡
+	if expectTun {
+		// 如果还在启动初始化那几秒，先不报黄，显示默认灰
+		if isInitializing {
+			return StateDefault
+		}
+		return StateError // 初始化结束后还没网卡 -> 黄色
+	}
+
+	// 3. 没开 TUN，但检测到系统代理 -> 蓝色
+	if proxyEnabled || expectProxy {
+		return StateProxy
+	}
+
+	// 4. 默认状态 -> 灰色
 	return StateDefault
 }
 
@@ -135,18 +156,30 @@ func isProcessRunning(name string) bool {
 	return false
 }
 
+// 强行恢复记忆：把 .ini 状态同步给内核 API
 func syncConfigToKernel() {
-	for i := 0; i < 15; i++ {
+	for i := 0; i < 20; i++ {
 		_, err := httpClient.Get(API_URL)
 		if err == nil {
 			configMu.RLock()
-			if configData["tun"] == "true" { setTunMode(true) }
-			if m := configData["mode"]; m != "" { setMihomoMode(m) }
-			if configData["system_proxy"] == "true" { setSystemProxy(true) }
+			// 强行注入 TUN 状态
+			if configData["tun"] == "true" {
+				setTunMode(true)
+			} else {
+				setTunMode(false)
+			}
+			// 强行注入模式
+			if m := configData["mode"]; m != "" {
+				setMihomoMode(m)
+			}
+			// 强行同步系统代理
+			if configData["system_proxy"] == "true" {
+				setSystemProxy(true)
+			}
 			configMu.RUnlock()
 			return
 		}
-		time.Sleep(time.Second)
+		time.Sleep(800 * time.Millisecond)
 	}
 }
 
@@ -155,9 +188,13 @@ func monitorKernelDaemon() {
 	for {
 		if isReallyExiting { return }
 		curr := checkSystemState()
-		if curr != lastState {
-			updateIconByState(curr)
-			lastState = curr
+
+		// 初始化完成后，才允许守护进程根据检测结果修改图标
+		if !isInitializing {
+			if curr != lastState {
+				updateIconByState(curr)
+				lastState = curr
+			}
 		}
 
 		if curr == StateStop {
@@ -167,6 +204,7 @@ func monitorKernelDaemon() {
 				hp, _ := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
 				_ = windows.AssignProcessToJobObject(hJob, hp)
 				windows.CloseHandle(hp)
+				// 内核重启后，再次同步配置
 				go syncConfigToKernel()
 			}
 		}
@@ -180,11 +218,11 @@ func onReady() {
 	loadIniConfigAll()
 	systray.SetTooltip(APP_NAME)
 	
-	// 初始化时立即根据配置刷新一次图标
-	initialState := checkSystemState()
-	updateIconByState(initialState)
-	lastState = initialState
+	// 1. 初始化图标为默认灰色
+	updateIconByState(StateDefault)
+	lastState = StateDefault
 
+	// 2. 加载菜单项
 	mWeb := systray.AddMenuItem("进入控制面板", "")
 	systray.AddSeparator()
 
@@ -204,7 +242,20 @@ func onReady() {
 	mHide := systray.AddMenuItem("隐藏托盘图标", "")
 	mExit := systray.AddMenuItem("退出程序", "")
 
-	go syncConfigToKernel()
+	// 3. 异步执行“硬恢复”并防抖刷新图标
+	go func() {
+		isInitializing = true
+		syncConfigToKernel()
+		
+		// 等待内核处理指令及系统创建网卡（2秒缓冲）
+		time.Sleep(2 * time.Second)
+		
+		isInitializing = false
+		// 恢复完后，进行第一次真实的图标同步
+		finalState := checkSystemState()
+		updateIconByState(finalState)
+		lastState = finalState
+	}()
 
 	for {
 		select {
@@ -240,14 +291,16 @@ func onExit() {
 		if hJob != 0 { windows.CloseHandle(hJob) }
 		os.Exit(0)
 	}
-	for { time.Sleep(time.Hour) }
 }
 
 func updateIconByState(state int) {
 	if state < 0 { return }
 	files := []string{"stop.ico", "error.ico", "tun.ico", "proxy.ico", "default.ico"}
 	b, err := iconFs.ReadFile("icons/" + files[state])
-	if err != nil { b, _ = iconFs.ReadFile("icons/default.ico") }
+	if err != nil { 
+		// 兜底逻辑
+		b, _ = iconFs.ReadFile("icons/default.ico") 
+	}
 	systray.SetIcon(b)
 }
 
@@ -290,13 +343,16 @@ func restartKernel() {
 
 func loadIniConfigAll() {
 	b, _ := os.ReadFile(filepath.Join(baseDir, CONFIG_FILE))
-	for _, line := range strings.Split(string(b), "\n") {
-		if parts := strings.SplitN(strings.TrimSpace(line), "=", 2); len(parts) == 2 {
-			configMu.Lock()
+	lines := strings.Split(string(b), "\n")
+	configMu.Lock()
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" { continue }
+		if parts := strings.SplitN(line, "=", 2); len(parts) == 2 {
 			configData[parts[0]] = parts[1]
-			configMu.Unlock()
 		}
 	}
+	configMu.Unlock()
 }
 
 func getIniConfig(key string) string {
@@ -333,8 +389,11 @@ func main() {
 
 	os.Chdir(baseDir)
 	initJobObject()
+	
+	// 启动核心守护进程
 	go monitorKernelDaemon()
 
+	// 监听端口用于唤醒或关闭旧进程
 	go func() {
 		mux := http.NewServeMux()
 		mux.HandleFunc("/kill_old", func(w http.ResponseWriter, r *http.Request) {
