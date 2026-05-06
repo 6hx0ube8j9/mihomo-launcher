@@ -1,52 +1,31 @@
-name: Build Mihomo Launcher
-
-on:
-  push:
-    branches: [ "main" ]
-  workflow_dispatch:
-
-jobs:
-  build:
-    runs-on: windows-latest
-    steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
-        with:
-          go-version: '1.22'
-
-      - name: Prepare Dependencies
+- name: Build Executable
         shell: pwsh
         run: |
-          if (Test-Path "go.mod") { Remove-Item "go.mod" }
-          if (Test-Path "go.sum") { Remove-Item "go.sum" }
-          go mod init mihomo-launcher
-          go get github.com/getlantern/systray
-          go get golang.org/x/sys/windows
-          go mod tidy
-
-      - name: Build Executable
-        shell: pwsh
-        run: |
-          # 确保图标文件夹存在，否则 V26 这种非 embed 模式会加载失败
+          # 1. 确保在编译时路径正确
+          # 2. -H windowsgui 确保没有黑窗口
           go build -ldflags="-s -w -H windowsgui" -o mihomo-launcher.exe main.go
 
       - name: Prepare Release Package
         shell: pwsh
         run: |
-          # 创建一个发布文件夹，把 EXE 和 icons 放在一起
-          New-Item -ItemType Directory -Force -Path "publish"
-          Copy-Item "mihomo-launcher.exe" -Destination "publish\"
-          # 关键：必须拷贝图标文件夹
+          # 创建发布目录
+          New-Item -ItemType Directory -Force -Path "dist"
+          
+          # 拷贝编译好的 EXE
+          Copy-Item "mihomo-launcher.exe" -Destination "dist\"
+          
+          # 拷贝图标文件夹（关键步骤：保持 V26 代码需要的相对路径）
           if (Test-Path "icons") {
-            Copy-Item -Recurit -Path "icons" -Destination "publish\"
+              Copy-Item -Path "icons" -Destination "dist\" -Recurse -Force
+              Write-Host "Icons directory copied successfully."
+          } else {
+              Write-Error "Icons directory NOT found! Check your repository structure."
+              exit 1
           }
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mihomo-launcher-full
-          # 关键：上传整个文件夹，而不是单个文件
-          path: publish/
+          name: mihomo-launcher-package
+          # 上传整个 dist 文件夹
+          path: dist/
