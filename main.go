@@ -221,14 +221,22 @@ func onReady() {
 }
 
 func onExit() {
+	// 如果是点击菜单的“隐藏图标” (mHide.ClickedCh)
+	// 我们可以调用 systray.Quit()。此时图标消失，但 main 函数由于 go 协程的存在
+	// monitorKernelDaemon 依然在后台运行，内核依然被守护。
+	
 	if isReallyExiting {
+		// 只有真正退出时才清理 Job 和内核
 		if hJob != 0 { windows.CloseHandle(hJob) }
 		os.Exit(0)
 	}
-	// 隐藏模式下，此函数执行完后，控制权回到 main 的 for 循环
+	
+	// 如果不是 isReallyExiting，systray 循环结束，主进程进入“潜伏期”
+	// 我们在 onExit 最后加一个阻塞，防止主进程退出
+	for {
+		time.Sleep(time.Hour)
+	}
 }
-
-// --- 其余功能函数 (保持不动) ---
 
 func syncConfigToKernel() {
 	for i := 0; i < 15; i++ {
@@ -319,42 +327,31 @@ func saveIniConfig(key, val string) {
 
 func main() {
 	if !isAdmin() { runAsAdmin(); os.Exit(0) }
-	
+
 	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
 	hMutex, _ := windows.CreateMutex(nil, false, mName)
 	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
 		if hMutex != 0 { windows.CloseHandle(hMutex) }
-		// 唤醒逻辑：重复开启时，打开 Web 界面并静默退出
-		httpClient.Get("http://127.0.0.1:" + WAKEUP_PORT)
+		// 【唤醒逻辑】再次启动时，不仅打开网页，还可以通知主进程
+		httpClient.Get("http://127.0.0.1:" + WAKEUP_PORT + "/wakeup")
 		os.Exit(0)
 	}
 
 	os.Chdir(baseDir)
 	initJobObject()
 
-	// 启动后台守护进程 (它是常驻的，不随托盘图标消失而消失)
+	// 1. 守护线程永不停止
 	go monitorKernelDaemon()
 
-	// 唤醒监听服务
+	// 2. 唤醒监听
 	go func() {
 		http.ListenAndServe("127.0.0.1:"+WAKEUP_PORT, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			openWebPanel()
+			// 这里由于 systray 的限制，图标一旦隐藏就回不来了
+			// 所以我们通过打开面板来响应用户，告知程序还在运行
+			openWebPanel() 
 		}))
 	}()
 
-	// 托盘控制循环
-	for {
-		systray.Run(onReady, onExit)
-		
-		// 如果点击的是“退出程序”，isReallyExiting 为真，跳出循环彻底结束进程
-		if isReallyExiting {
-			break
-		}
-		
-		// 如果点击的是“隐藏图标”，此处会阻塞，直到程序被强杀或外部触发
-		// 此时 monitorKernelDaemon 依然在后台 go 协程中运行
-		select {
-		case <-time.After(time.Hour * 8760): // 潜伏一年
-		}
-	}
+	// 3. 托盘运行（直到真正点击“退出程序”）
+	systray.Run(onReady, onExit)
 }
