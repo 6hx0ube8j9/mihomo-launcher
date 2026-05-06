@@ -223,10 +223,16 @@ func main() {
 
 func isProxyEnabledInRegistry() bool {
 	key, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.QUERY_VALUE)
-	if err != nil { return false }
+	if err != nil {
+		return false
+	}
 	defer key.Close()
-	val, _, err := key.GetDWordValue("ProxyEnable")
-	return err == nil && val == 1
+
+	val, _, err := key.GetIntegerValue("ProxyEnable")
+	if err != nil {
+		return false
+	}
+	return val == 1
 }
 
 func setSystemProxy(enable bool) {
