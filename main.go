@@ -48,13 +48,59 @@ var (
 	lastState       = -1
 )
 
+// --- 核心逻辑：杀进程、抢端口、再现身 ---
+
+func killAndTakeover() {
+	currentPid := os.Getpid()
+	exeName := filepath.Base(exePath)
+
+	// 1. 遍历并强杀所有同名进程（排除自己，防止自杀）
+	snapshot, _ := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if snapshot != 0 {
+		var proc windows.ProcessEntry32
+		proc.Size = uint32(unsafe.Sizeof(proc))
+		for windows.Process32Next(snapshot, &proc) == nil {
+			name := windows.UTF16ToString(proc.ExeFile[:])
+			if strings.EqualFold(name, exeName) && int(proc.ProcessID) != currentPid {
+				p, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, proc.ProcessID)
+				if err == nil {
+					windows.TerminateProcess(p, 0)
+					windows.CloseHandle(p)
+				}
+			}
+		}
+		windows.CloseHandle(snapshot)
+	}
+
+	// 2. 暴力清理可能占用端口的僵尸连接（针对 TIME_WAIT 状态）
+	exec.Command("cmd", "/c", fmt.Sprintf("for /f \"tokens=5\" %%a in ('netstat -aon ^| findstr :%s') do taskkill /F /PID %%a", CONTROL_PORT)).Run()
+	
+	// 3. 阻塞式监听：只有抢到端口，才说明夺权成功，允许现身
+	for {
+		l, err := net.Listen("tcp", "127.0.0.1:"+CONTROL_PORT)
+		if err == nil {
+			// 成功占领阵地，启动后台指令监听服务
+			go func() {
+				mux := http.NewServeMux()
+				mux.HandleFunc("/wakeup", func(w http.ResponseWriter, r *http.Request) {
+					// 此处可以预留远程唤醒逻辑
+				})
+				http.Serve(l, mux)
+			}()
+			return // 夺权完成，退出阻塞
+		}
+		// 抢夺失败，说明旧实例还没释放资源，稍后再试
+		time.Sleep(150 * time.Millisecond)
+	}
+}
+
 // --- 配置管理 ---
 
 func loadIniConfigAll() {
 	b, _ := os.ReadFile(filepath.Join(baseDir, CONFIG_FILE))
 	configMu.Lock()
 	defer configMu.Unlock()
-	configData = make(map[string]string) // 重置
+	configData = make(map[string]string)
 	for _, line := range strings.Split(string(b), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") || strings.HasPrefix(line, "[") { continue }
@@ -81,46 +127,7 @@ func saveIniConfig(key, val string) {
 	_ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), buf.Bytes(), 0644)
 }
 
-// --- 系统工具 ---
-
-func isAdmin() bool {
-	var token windows.Token
-	err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token)
-	if err != nil { return false }
-	defer token.Close()
-	return token.IsElevated()
-}
-
-func runAsAdmin() {
-	verb, _ := syscall.UTF16PtrFromString("runas")
-	exe, _ := syscall.UTF16PtrFromString(exePath)
-	cwd, _ := syscall.UTF16PtrFromString(baseDir)
-	windows.ShellExecute(0, verb, exe, nil, cwd, windows.SW_HIDE)
-}
-
-func initJobObject() {
-	h, _ := windows.CreateJobObject(nil, nil)
-	if h != 0 {
-		var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
-		info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-		windows.NewLazySystemDLL("kernel32.dll").NewProc("SetInformationJobObject").Call(
-			uintptr(h), 9, uintptr(unsafe.Pointer(&info)), uintptr(uint32(unsafe.Sizeof(info))),
-		)
-		hJob = h
-	}
-}
-
-func isProcessRunning(name string) bool {
-	snapshot, _ := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
-	if snapshot == 0 { return false }
-	defer windows.CloseHandle(snapshot)
-	var proc windows.ProcessEntry32
-	proc.Size = uint32(unsafe.Sizeof(proc))
-	for windows.Process32Next(snapshot, &proc) == nil {
-		if strings.EqualFold(windows.UTF16ToString(proc.ExeFile[:]), name) { return true }
-	}
-	return false
-}
+// --- 守护进程逻辑 ---
 
 func monitorKernelDaemon() {
 	target := filepath.Join(baseDir, "mihomo.exe")
@@ -161,13 +168,26 @@ func checkSystemState() int {
 	return StateDefault
 }
 
-// --- UI 逻辑 ---
+func isProcessRunning(name string) bool {
+	snapshot, _ := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if snapshot == 0 { return false }
+	defer windows.CloseHandle(snapshot)
+	var proc windows.ProcessEntry32
+	proc.Size = uint32(unsafe.Sizeof(proc))
+	for windows.Process32Next(snapshot, &proc) == nil {
+		if strings.EqualFold(windows.UTF16ToString(proc.ExeFile[:]), name) { return true }
+	}
+	return false
+}
+
+// --- UI 交互 ---
 
 func onReady() {
 	loadIniConfigAll()
-	saveIniConfig("run_mode", "normal") // 恢复显示
+	saveIniConfig("run_mode", "normal") // 启动托盘意味着从隐藏恢复
 	
 	updateIconByState(StateDefault)
+
 	mWeb := systray.AddMenuItem("进入控制面板", "")
 	systray.AddSeparator()
 
@@ -219,9 +239,11 @@ func onExit() {
 		if hJob != 0 { windows.CloseHandle(hJob) }
 		os.Exit(0)
 	}
-	// 幽灵模式挂起
+	// 如果是隐藏图标，main 会继续运行，此协程阻塞
 	select {}
 }
+
+// --- 系统功能组件 ---
 
 func setMihomoMode(mode string) {
 	saveIniConfig("mode", mode)
@@ -258,61 +280,50 @@ func updateIconByState(state int) {
 	if err == nil { systray.SetIcon(b) }
 }
 
-// --- 入口夺权逻辑 (修正幽灵不死的死穴) ---
+func isAdmin() bool {
+	var token windows.Token
+	err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token)
+	if err != nil { return false }
+	defer token.Close()
+	return token.IsElevated()
+}
+
+func runAsAdmin() {
+	verb, _ := syscall.UTF16PtrFromString("runas")
+	exe, _ := syscall.UTF16PtrFromString(exePath)
+	cwd, _ := syscall.UTF16PtrFromString(baseDir)
+	windows.ShellExecute(0, verb, exe, nil, cwd, windows.SW_HIDE)
+}
+
+func initJobObject() {
+	h, _ := windows.CreateJobObject(nil, nil)
+	if h != 0 {
+		var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+		info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+		windows.NewLazySystemDLL("kernel32.dll").NewProc("SetInformationJobObject").Call(
+			uintptr(h), 9, uintptr(unsafe.Pointer(&info)), uintptr(uint32(unsafe.Sizeof(info))),
+		)
+		hJob = h
+	}
+}
+
+// --- 入口函数 ---
 
 func main() {
 	if !isAdmin() { runAsAdmin(); os.Exit(0) }
 
-	loadIniConfigAll()
+	// 1. 强力清场并抢夺端口
+	killAndTakeover()
+
+	// 2. 拿到端口后，初始化 Mutex 锁和 JobObject
 	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
-	
-	// 1. 尝试获取 Mutex
 	h, _ := windows.CreateMutex(nil, false, mName)
-	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
-		// 发现旧进程存在
-		if h != 0 { windows.CloseHandle(h) }
+	hMutex = h
 
-		// 2. 发送信号通知旧进程自杀
-		httpClient.Get("http://127.0.0.1:" + CONTROL_PORT + "/kill_old")
-
-		// 3. 【核心修复】：原地打转，直到抢到 Mutex 为止
-		// 不管是不是 Ghost，既然你想运行新母，就必须在这里等旧母死透
-		success := false
-		for i := 0; i < 50; i++ { // 最多等 5 秒
-			time.Sleep(100 * time.Millisecond)
-			h, _ = windows.CreateMutex(nil, false, mName)
-			if windows.GetLastError() != windows.ERROR_ALREADY_EXISTS {
-				hMutex = h
-				success = true
-				break
-			}
-			if h != 0 { windows.CloseHandle(h) }
-		}
-
-		if !success {
-			// 如果 5 秒都抢不到，说明旧进程卡死了，弹个提示或者强杀
-			os.Exit(1)
-		}
-	} else {
-		hMutex = h
-	}
-
-	// --- 抢到 Mutex 后，新进程才开始正式初始化 ---
 	os.Chdir(baseDir)
 	initJobObject()
 	go monitorKernelDaemon()
 
-	// 启动本地监听
-	go func() {
-		mux := http.NewServeMux()
-		mux.HandleFunc("/kill_old", func(w http.ResponseWriter, r *http.Request) {
-			isHandover = true
-			if hJob != 0 { windows.CloseHandle(hJob); hJob = 0 }
-			windows.CloseHandle(hMutex) // 释放 Mutex
-			os.Exit(0) 
-		})
-		http.ListenAndServe("127.0.0.1:"+CONTROL_PORT, mux)
-	}()
-
+	// 3. 启动 UI
 	systray.Run(onReady, onExit)
 }
