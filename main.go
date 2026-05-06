@@ -46,7 +46,31 @@ var (
 	lastState       = -1
 )
 
-// --- 基础工具函数 (保持不动) ---
+// --- 状态检测优化版 ---
+func checkSystemState() int {
+	_, err := httpClient.Get(API_URL)
+	if err != nil {
+		if !isProcessRunning("mihomo.exe") { return StateStop }
+		return StateError
+	}
+
+	configMu.RLock()
+	expectTun := configData["tun"] == "true"
+	configMu.RUnlock()
+
+	hasInterface := isInterfaceExisted("Mihomo")
+
+	// 如果配置开启了 TUN 但网卡还没出来，显示错误状态（红色）
+	if expectTun {
+		if hasInterface { return StateTun }
+		return StateError 
+	}
+	
+	if isProxyEnabledInRegistry() { return StateProxy }
+	return StateDefault
+}
+
+// --- 基础工具函数 ---
 
 func isAdmin() bool {
 	var token windows.Token
@@ -64,30 +88,15 @@ func runAsAdmin() {
 }
 
 func initJobObject() {
-    // 创建作业对象
-    h, _ := windows.CreateJobObject(nil, nil)
-    if h != 0 {
-        var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
-        // 关键标志：JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        // 含义：当指向该作业的所有句柄关闭时，自动终止关联的所有进程
-        info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-        
-        windows.NewLazySystemDLL("kernel32.dll").NewProc("SetInformationJobObject").Call(
-            uintptr(h), 9, uintptr(unsafe.Pointer(&info)), uintptr(uint32(unsafe.Sizeof(info))),
-        )
-        hJob = h
-    }
-}
-
-func checkSystemState() int {
-	_, err := httpClient.Get(API_URL)
-	if err != nil {
-		if !isProcessRunning("mihomo.exe") { return StateStop }
-		return StateError
+	h, _ := windows.CreateJobObject(nil, nil)
+	if h != 0 {
+		var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+		info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+		windows.NewLazySystemDLL("kernel32.dll").NewProc("SetInformationJobObject").Call(
+			uintptr(h), 9, uintptr(unsafe.Pointer(&info)), uintptr(uint32(unsafe.Sizeof(info))),
+		)
+		hJob = h
 	}
-	if isInterfaceExisted("Mihomo") { return StateTun }
-	if isProxyEnabledInRegistry() { return StateProxy }
-	return StateDefault
 }
 
 func isInterfaceExisted(name string) bool {
@@ -126,52 +135,55 @@ func isProcessRunning(name string) bool {
 	return false
 }
 
-// --- 核心守护逻辑 (已优化) ---
+func syncConfigToKernel() {
+	for i := 0; i < 15; i++ {
+		_, err := httpClient.Get(API_URL)
+		if err == nil {
+			configMu.RLock()
+			if configData["tun"] == "true" { setTunMode(true) }
+			if m := configData["mode"]; m != "" { setMihomoMode(m) }
+			if configData["system_proxy"] == "true" { setSystemProxy(true) }
+			configMu.RUnlock()
+			return
+		}
+		time.Sleep(time.Second)
+	}
+}
 
 func monitorKernelDaemon() {
 	target := filepath.Join(baseDir, "mihomo.exe")
 	for {
-		// 即使托盘退出了，只要 isReallyExiting 是 false，这个循环就一直跑
 		if isReallyExiting { return }
+		curr := checkSystemState()
+		if curr != lastState {
+			updateIconByState(curr)
+			lastState = curr
+		}
 
-		_, err := httpClient.Get(API_URL)
-		if err == nil {
-			// 接管模式：静默并同步 UI 状态
-			curr := checkSystemState()
-			if curr != lastState {
-				updateIconByState(curr)
-				lastState = curr
-			}
-		} else {
-			if isProcessRunning("mihomo.exe") {
-				// 异常静默：进程在但 API 不通，不操作
-				if lastState != StateError {
-					updateIconByState(StateError)
-					lastState = StateError
-				}
-			} else {
-				// 守护拉起：环境空白，主动补位
-				cmd := exec.Command(target, "-d", baseDir)
-				cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-				if err := cmd.Start(); err == nil && hJob != 0 {
-					hp, _ := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
-					_ = windows.AssignProcessToJobObject(hJob, hp)
-					windows.CloseHandle(hp)
-				}
-				lastState = StateStop
-				updateIconByState(StateStop)
+		if curr == StateStop {
+			cmd := exec.Command(target, "-d", baseDir)
+			cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+			if err := cmd.Start(); err == nil && hJob != 0 {
+				hp, _ := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
+				_ = windows.AssignProcessToJobObject(hJob, hp)
+				windows.CloseHandle(hp)
+				go syncConfigToKernel()
 			}
 		}
 		time.Sleep(2 * time.Second)
 	}
 }
 
-// --- 界面逻辑 (支持假退出) ---
+// --- UI 逻辑 ---
 
 func onReady() {
 	loadIniConfigAll()
 	systray.SetTooltip(APP_NAME)
-	updateIconByState(StateDefault)
+	
+	// 初始化时立即根据配置刷新一次图标
+	initialState := checkSystemState()
+	updateIconByState(initialState)
+	lastState = initialState
 
 	mWeb := systray.AddMenuItem("进入控制面板", "")
 	systray.AddSeparator()
@@ -183,7 +195,7 @@ func onReady() {
 	systray.AddSeparator()
 
 	mTun := systray.AddMenuItemCheckbox("TUN 模式", "", getIniConfig("tun") == "true")
-	mSystemProxy := systray.AddMenuItemCheckbox("系统代理", "", getIniConfig("system_proxy") == "true" || isProxyEnabledInRegistry())
+	mSystemProxy := systray.AddMenuItemCheckbox("系统代理", "", getIniConfig("system_proxy") == "true")
 	systray.AddSeparator()
 
 	mAutoRun := systray.AddMenuItemCheckbox("开机自启", "", isAutoRunEnabled())
@@ -214,38 +226,21 @@ func onReady() {
 		case <-mDir.ClickedCh:
 			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
 		case <-mRestart.ClickedCh: restartKernel()
-		case <-mHide.ClickedCh: 
-			// 假退出：只退出托盘循环，不设置 isReallyExiting
-			systray.Quit()
+		case <-mHide.ClickedCh: systray.Quit()
 		case <-mExit.ClickedCh:
 			isReallyExiting = true
 			systray.Quit()
 		}
 	}
 }
+
 func onExit() {
-    if isReallyExiting {
-        // 用户主动点击“退出程序”
-        // 1. 杀掉内核
-        restartKernel() 
-        // 2. 释放 Job 句柄
-        if hJob != 0 {
-            windows.CloseHandle(hJob)
-            hJob = 0
-        }
-        // 3. 彻底退出
-        os.Exit(0)
-    }
-    
-    // --- 假退出逻辑 ---
-    // systray.Run 返回到这里，图标已消失。
-    // 我们不释放 hJob，Launcher 进程进入静默阻塞状态。
-    // 此时，如果 Launcher 被任务管理器杀掉，由于 hJob 没被手动释放且进程消失，
-    // 内核 mihomo.exe 会被 Windows 强制杀掉。
-    for {
-        // 如果此循环被打破，或者进程被外界终止，内核必死
-        time.Sleep(time.Hour)
-    }
+	if isReallyExiting {
+		restartKernel() 
+		if hJob != 0 { windows.CloseHandle(hJob) }
+		os.Exit(0)
+	}
+	for { time.Sleep(time.Hour) }
 }
 
 func updateIconByState(state int) {
@@ -321,59 +316,40 @@ func saveIniConfig(key, val string) {
 	_ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), buf.Bytes(), 0644)
 }
 
-// --- 程序入口 (真假退出核心控制) ---
 func main() {
-    if !isAdmin() { runAsAdmin(); os.Exit(0) }
+	if !isAdmin() { runAsAdmin(); os.Exit(0) }
 
-    // --- 1. 互斥检测与接力请求 ---
-    mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
-    hMutex, _ := windows.CreateMutex(nil, false, mName)
-    if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
-        if hMutex != 0 { windows.CloseHandle(hMutex) }
-        
-        // 发现旧进程，发送接力信号
-        // 使用短超时防止新进程卡死
-        client := http.Client{Timeout: 500 * time.Millisecond}
-        client.Get("http://127.0.0.1:" + WAKEUP_PORT + "/kill_old")
-        
-        // 给旧进程释放资源的时间
-        time.Sleep(600 * time.Millisecond)
-        
-        // 启动新实例并退出当前中转进程
-        cmd := exec.Command(exePath)
-        cmd.Start()
-        os.Exit(0)
-    }
+	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
+	hMutex, _ := windows.CreateMutex(nil, false, mName)
+	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
+		if hMutex != 0 { windows.CloseHandle(hMutex) }
+		client := http.Client{Timeout: 500 * time.Millisecond}
+		_, err := client.Get("http://127.0.0.1:" + WAKEUP_PORT + "/kill_old")
+		if err == nil { time.Sleep(800 * time.Millisecond) }
+		cmd := exec.Command(exePath)
+		cmd.Start()
+		os.Exit(0)
+	}
 
-    os.Chdir(baseDir)
-    initJobObject()
+	os.Chdir(baseDir)
+	initJobObject()
+	go monitorKernelDaemon()
 
-    // --- 2. 核心守护协程 ---
-    go monitorKernelDaemon()
+	go func() {
+		mux := http.NewServeMux()
+		mux.HandleFunc("/kill_old", func(w http.ResponseWriter, r *http.Request) {
+			if hJob != 0 {
+				windows.CloseHandle(hJob)
+				hJob = 0 
+			}
+			os.Exit(0) 
+		})
+		mux.HandleFunc("/wakeup", func(w http.ResponseWriter, r *http.Request) {
+			openWebPanel()
+		})
+		server := &http.Server{Addr: "127.0.0.1:" + WAKEUP_PORT, Handler: mux}
+		server.ListenAndServe()
+	}()
 
-    // --- 3. 接力监听服务 ---
-    go func() {
-        mux := http.NewServeMux()
-        // 接力接口：只有通过这个接口退出，内核才能活
-        mux.HandleFunc("/kill_old", func(w http.ResponseWriter, r *http.Request) {
-            if hJob != 0 {
-                // 【核心动作】手动关闭 Job 句柄
-                // 这会导致句柄计数减一，但因为新进程即将接管，
-                // 我们通过“温和”的方式释放，避免触发强制清理
-                windows.CloseHandle(hJob)
-                hJob = 0 
-            }
-            os.Exit(0) 
-        })
-        
-        // 普通唤醒：比如假退出后双击图标（如果接力失败或仅需弹出 UI）
-        mux.HandleFunc("/wakeup", func(w http.ResponseWriter, r *http.Request) {
-            openWebPanel()
-        })
-        
-        server := &http.Server{Addr: "127.0.0.1:" + WAKEUP_PORT, Handler: mux}
-        server.ListenAndServe()
-    }()
-
-    systray.Run(onReady, onExit)
+	systray.Run(onReady, onExit)
 }
