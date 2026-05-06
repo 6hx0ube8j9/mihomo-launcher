@@ -111,8 +111,10 @@ func setSystemProxy(enable bool) {
 	defer key.Close()
 	if enable {
 		key.SetDWordValue("ProxyEnable", 1)
+		saveIniConfig("system_proxy", "true")
 	} else {
 		key.SetDWordValue("ProxyEnable", 0)
+		saveIniConfig("system_proxy", "false")
 	}
 }
 
@@ -133,21 +135,25 @@ func isProcessRunning(name string) bool {
 func onReady() {
 	loadIniConfigAll()
 	updateIconByState(StateDefault)
-	systray.SetTooltip("Mihomo Launcher (双击打开面板)")
+	systray.SetTooltip("Mihomo Launcher")
 
-	// 1. 顶部：Web面板 (双击默认执行项)
+	// 1. 顶部：Web面板 (双击默认项)
 	mWeb := systray.AddMenuItem("进入 Web 面板", "")
 	systray.AddSeparator()
 
-	// 2. 模式切换 (一级菜单)
-	mModeR := systray.AddMenuItemCheckbox("规则模式 (Rule)", "", false)
-	mModeG := systray.AddMenuItemCheckbox("全局模式 (Global)", "", false)
-	mModeD := systray.AddMenuItemCheckbox("直连模式 (Direct)", "", false)
+	// 2. 模式切换 (从配置加载状态)
+	mode := getIniConfig("mode")
+	mModeR := systray.AddMenuItemCheckbox("规则模式 (Rule)", "", mode == "rule" || mode == "")
+	mModeG := systray.AddMenuItemCheckbox("全局模式 (Global)", "", mode == "global")
+	mModeD := systray.AddMenuItemCheckbox("直连模式 (Direct)", "", mode == "direct")
 	systray.AddSeparator()
 
-	// 3. 核心开关
-	mTun := systray.AddMenuItemCheckbox("TUN 模式开关", "", false)
-	mSystemProxy := systray.AddMenuItemCheckbox("系统代理开关", "", isProxyEnabledInRegistry())
+	// 3. 核心开关 (从配置加载状态)
+	tunOn := getIniConfig("tun") == "true"
+	mTun := systray.AddMenuItemCheckbox("TUN 模式开关", "", tunOn)
+	
+	proxyOn := getIniConfig("system_proxy") == "true" || isProxyEnabledInRegistry()
+	mSystemProxy := systray.AddMenuItemCheckbox("系统代理开关", "", proxyOn)
 	systray.AddSeparator()
 
 	// 4. 程序管理
@@ -163,7 +169,7 @@ func onReady() {
 	go func() {
 		http.ListenAndServe("127.0.0.1:"+WAKEUP_PORT, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			isIconHidden = false
-			updateIconByState(StateDefault) // 重新赋予图标显示
+			updateIconByState(StateDefault)
 			fmt.Fprint(w, "ok")
 		}))
 	}()
@@ -179,9 +185,17 @@ func onReady() {
 		case <-mModeD.ClickedCh:
 			setMihomoMode("direct"); mModeR.Uncheck(); mModeG.Uncheck(); mModeD.Check()
 		case <-mTun.ClickedCh:
-			if mTun.Checked() { setTunMode(false); mTun.Uncheck() } else { setTunMode(true); mTun.Check() }
+			if mTun.Checked() { 
+				setTunMode(false); mTun.Uncheck() 
+			} else { 
+				setTunMode(true); mTun.Check() 
+			}
 		case <-mSystemProxy.ClickedCh:
-			if mSystemProxy.Checked() { setSystemProxy(false); mSystemProxy.Uncheck() } else { setSystemProxy(true); mSystemProxy.Check() }
+			if mSystemProxy.Checked() { 
+				setSystemProxy(false); mSystemProxy.Uncheck() 
+			} else { 
+				setSystemProxy(true); mSystemProxy.Check() 
+			}
 		case <-mAutoRun.ClickedCh:
 			toggleAutoRun()
 			if isAutoRunEnabled() { mAutoRun.Check() } else { mAutoRun.Uncheck() }
@@ -190,7 +204,6 @@ func onReady() {
 		case <-mRestart.ClickedCh:
 			restartKernel()
 		case <-mHide.ClickedCh:
-			// 稳健隐藏方案：清空图标字节，不退出程序
 			isIconHidden = true
 			systray.SetIcon([]byte{})
 		case <-mExit.ClickedCh:
@@ -217,7 +230,6 @@ func monitorKernelDaemon() {
 			}
 		}
 
-		// 仅在未隐藏图标时更新
 		if !isIconHidden && curr != lastState {
 			updateIconByState(curr)
 			lastState = curr
@@ -239,6 +251,7 @@ func openWebPanel() {
 }
 
 func setMihomoMode(mode string) {
+	saveIniConfig("mode", mode)
 	json := fmt.Sprintf(`{"mode": "%s"}`, mode)
 	req, _ := http.NewRequest("PATCH", API_URL+"/configs", bytes.NewBuffer([]byte(json)))
 	if resp, err := httpClient.Do(req); err == nil { resp.Body.Close() }
@@ -246,6 +259,7 @@ func setMihomoMode(mode string) {
 
 func setTunMode(enable bool) {
 	state := "false"; if enable { state = "true" }
+	saveIniConfig("tun", state)
 	json := fmt.Sprintf(`{"tun": {"enable": %s}}`, state)
 	req, _ := http.NewRequest("PATCH", API_URL+"/configs", bytes.NewBuffer([]byte(json)))
 	if resp, err := httpClient.Do(req); err == nil { resp.Body.Close() }
@@ -270,6 +284,8 @@ func restartKernel() {
 	_ = cmd.Run()
 }
 
+// --- 配置文件管理 ---
+
 func loadIniConfigAll() {
 	b, _ := os.ReadFile(filepath.Join(baseDir, CONFIG_FILE))
 	lines := strings.Split(string(b), "\n")
@@ -279,6 +295,25 @@ func loadIniConfigAll() {
 		parts := strings.SplitN(strings.TrimSpace(line), "=", 2)
 		if len(parts) == 2 { configData[parts[0]] = parts[1] }
 	}
+}
+
+func getIniConfig(key string) string {
+	configMu.RLock()
+	defer configMu.RUnlock()
+	return configData[key]
+}
+
+func saveIniConfig(key, val string) {
+	configMu.Lock()
+	configData[key] = val
+	var buf bytes.Buffer
+	for k, v := range configData {
+		if k != "" {
+			buf.WriteString(fmt.Sprintf("%s=%s\n", k, v))
+		}
+	}
+	configMu.Unlock()
+	_ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), buf.Bytes(), 0644)
 }
 
 func onExit() {
