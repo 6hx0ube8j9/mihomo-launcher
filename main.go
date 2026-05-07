@@ -24,26 +24,33 @@ import (
 var iconFs embed.FS
 
 const (
-	APP_MUTEX   = "Global\\MihomoLauncher_Unique_Mutex"
-	API_URL     = "http://127.0.0.1:9090"
-	CONFIG_FILE = "mihomo-launcher.ini"
-	REG_RUN     = `Software\Microsoft\Windows\CurrentVersion\Run`
-	REG_PROXY   = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
-	APP_NAME    = "MihomoLauncher"
+    APP_MUTEX   = "Global\\MihomoLauncher_Unique_Mutex"
+    API_URL     = "http://127.0.0.1:9090"
+    CONFIG_FILE = "mihomo-launcher.ini"
+    REG_RUN     = `Software\Microsoft\Windows\CurrentVersion\Run`
+    REG_PROXY   = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
+    APP_NAME    = "MihomoLauncher"
 
-	StateStop = 0; StateError = 1; StateTun = 2; StateProxy = 3; StateDefault = 4
+    // 状态定义
+    StateStop    = 0 // 红色：进程不存在 或 API无法连接
+    StateError   = 1 // 黄色：API正常 但 TUN模式开启失败（网卡缺失）
+    StateTun     = 2 // 绿色：TUN模式正常运行
+    StateProxy   = 3 // 蓝色：系统代理模式开启
+    StateDefault = 4 // 灰色：API就绪 但未开启任何功能
 )
 
 var (
-	isReallyExiting bool
-	hJob            windows.Handle
-	hMutex          windows.Handle
-	httpClient      = &http.Client{Timeout: 1 * time.Second}
-	exePath, _      = os.Executable()
-	baseDir         = filepath.Dir(exePath)
-	configData      = make(map[string]string)
-	configMu        sync.RWMutex
-	lastState       = -1
+    isReallyExiting bool
+    hJob            windows.Handle
+    hMutex          windows.Handle
+    httpClient      = &http.Client{Timeout: 1 * time.Second}
+    exePath, _      = os.Executable()
+    baseDir         = filepath.Dir(exePath)
+    configData      = make(map[string]string)
+    configMu        sync.RWMutex
+    lastState       = -1
+    tunErrorCounter = 0 
+    onceSync        sync.Once
 )
 
 // --- 基础工具函数 ---
@@ -111,114 +118,133 @@ func saveIniConfig(key, val string) {
 // --- 核心逻辑：自动同步 ---
 
 func syncConfigToKernel() {
-	api := API_URL + "/configs"
-	for i := 0; i < 100; i++ {
-		if isReallyExiting { return }
+    // 此时 checkSystemState 已经确认过 API 通了
+    configMu.RLock()
+    tun := configData["tun_enabled"] == "true"
+    mode := configData["mode"]
+    if mode == "" { mode = "rule" }
+    proxy := configData["system_proxy_enabled"] == "true"
+    configMu.RUnlock()
 
-		configMu.RLock()
-		tun := configData["tun_enabled"] == "true"
-		mode := configData["mode"]
-		if mode == "" { mode = "rule" }
-		proxy := configData["system_proxy_enabled"] == "true"
-		configMu.RUnlock()
+    payload := fmt.Sprintf(`{"mode": "%s", "tun": {"enable": %v}}`, mode, tun)
+    req, _ := http.NewRequest("PATCH", API_URL+"/configs", strings.NewReader(payload))
+    req.Header.Set("Content-Type", "application/json")
 
-		payload := fmt.Sprintf(`{"mode": "%s", "tun": {"enable": %v}}`, mode, tun)
-		req, _ := http.NewRequest("PATCH", api, strings.NewReader(payload))
-		req.Header.Set("Content-Type", "application/json")
-
-		resp, err := httpClient.Do(req)
-		if err == nil {
-			resp.Body.Close()
-			if resp.StatusCode == 204 || resp.StatusCode == 200 {
-				if proxy { setProxyRegistry(true) }
-				return 
-			}
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
+    resp, err := httpClient.Do(req)
+    if err == nil {
+        resp.Body.Close()
+        if (resp.StatusCode == 204 || resp.StatusCode == 200) && proxy {
+            setProxyRegistry(true)
+        }
+    }
 }
 
-// --- 修复点：管生死 ---
 func monitorKernelDaemon() {
-	target := filepath.Join(baseDir, "mihomo.exe")
-	for {
-		if isReallyExiting { return }
-		
-		if !isProcessRunning("mihomo.exe") {
-			cmd := exec.Command(target, "-d", baseDir)
-			cmd.SysProcAttr = &windows.SysProcAttr{
-				CreationFlags: windows.CREATE_NO_WINDOW | windows.CREATE_BREAKAWAY_FROM_JOB,
-			}
-			
-			if err := cmd.Start(); err == nil {
-				if hJob != 0 {
-					hp, _ := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
-					_ = windows.AssignProcessToJobObject(hJob, hp)
-					windows.CloseHandle(hp)
-				}
-				go syncConfigToKernel()
-				cmd.Wait() // 阻塞直到进程消失
-			}
-		}
-		time.Sleep(time.Second)
-	}
+    target := filepath.Join(baseDir, "mihomo.exe")
+    for {
+        if isReallyExiting { return }
+        
+        if !isProcessRunning("mihomo.exe") {
+            // 关键：内核进程没了，重置 Once，准备下一次 API 就绪时的同步
+            onceSync = sync.Once{} 
+
+            cmd := exec.Command(target, "-d", baseDir)
+            cmd.SysProcAttr = &windows.SysProcAttr{
+                CreationFlags: windows.CREATE_NO_WINDOW | windows.CREATE_BREAKAWAY_FROM_JOB,
+            }
+            
+            if err := cmd.Start(); err == nil {
+                if hJob != 0 {
+                    hp, _ := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
+                    _ = windows.AssignProcessToJobObject(hJob, hp)
+                    windows.CloseHandle(hp)
+                }
+                cmd.Wait() 
+            }
+        }
+        time.Sleep(time.Second)
+    }
 }
 
-// --- 修复点：管状态和图标 ---
 func monitorIconState() {
-	for {
-		if isReallyExiting { return }
+    for {
+        if isReallyExiting { return }
 
-		var curr int
-		if !isProcessRunning("mihomo.exe") {
-			curr = StateStop
-		} else {
-			curr = checkSystemState()
-		}
+        var curr int
+        // 第一级判定：进程存活检查
+        if !isProcessRunning("mihomo.exe") {
+            curr = StateStop // 进程不在 -> 红色
+        } else {
+            // 第二级判定：API连通性及功能细分
+            curr = checkSystemState()
+        }
 
-		if curr != lastState {
-			updateIconByState(curr)
-			lastState = curr
-		}
-		time.Sleep(time.Second)
-	}
+        // 仅在状态变化时更新图标，避免闪烁
+        if curr != lastState {
+            updateIconByState(curr)
+            lastState = curr
+        }
+        time.Sleep(1 * time.Second)
+    }
 }
 
 func checkSystemState() int {
-	_, err := httpClient.Get(API_URL)
-	if err != nil {
-		return StateError
-	}
+    // 1. API 连通性检测
+    resp, err := httpClient.Get(API_URL)
+    if err != nil {
+        tunErrorCounter = 0
+        return StateStop // API 不通，保持红色，不执行同步
+    }
+    resp.Body.Close()
 
-	configMu.RLock()
-	wantTun := configData["tun_enabled"] == "true"
-	configMu.RUnlock()
+    // 2. 核心逻辑：API 只要通了，立刻触发一次同步
+    // sync.Once 保证了只要不重启内核，这段逻辑只运行一次
+    onceSync.Do(func() {
+        go syncConfigToKernel()
+    })
 
-	hasTunInterface := false
-	ifaces, _ := net.Interfaces()
-	for _, i := range ifaces {
-		if strings.Contains(strings.ToLower(i.Name), "mihomo") {
-			hasTunInterface = true
-			break
-		}
-	}
+    // 3. 读取本地配置判定状态
+    configMu.RLock()
+    wantTun := configData["tun_enabled"] == "true"
+    configMu.RUnlock()
 
-	if wantTun && !hasTunInterface {
-		return StateError 
-	}
-	if hasTunInterface {
-		return StateTun
-	}
+    hasTunInterface := false
+    ifaces, _ := net.Interfaces()
+    for _, i := range ifaces {
+        name := strings.ToLower(i.Name)
+        if strings.Contains(name, "mihomo") || strings.Contains(name, "meta") || strings.Contains(name, "clash") {
+            hasTunInterface = true
+            break
+        }
+    }
 
-	key, _ := registry.OpenKey(registry.CURRENT_USER, REG_PROXY, registry.QUERY_VALUE)
-	val, _, _ := key.GetIntegerValue("ProxyEnable")
-	key.Close()
-	if val == 1 {
-		return StateProxy
-	}
+    // 4. 优先级判定 (带防抖)
+    if wantTun {
+        if hasTunInterface {
+            tunErrorCounter = 0
+            return StateTun // 绿色：TUN 已就绪
+        } else {
+            tunErrorCounter++
+            if tunErrorCounter > 5 { 
+                return StateError // 黄色：指令发了5秒网卡还没出来，报错
+            }
+            // 在 5 秒宽限期内返回灰色，代表“正在努力同步中”
+            return StateDefault 
+        }
+    }
 
-	return StateDefault
+    tunErrorCounter = 0
+    // 检查系统代理 (蓝色)
+    key, err := registry.OpenKey(registry.CURRENT_USER, REG_PROXY, registry.QUERY_VALUE)
+    if err == nil {
+        val, _, _ := key.GetIntegerValue("ProxyEnable")
+        key.Close()
+        if val == 1 { return StateProxy }
+    }
+
+    return StateDefault // 灰色
 }
+
 
 func isProcessRunning(name string) bool {
 	snapshot, _ := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
@@ -236,7 +262,7 @@ func isProcessRunning(name string) bool {
 
 func onReady() {
 	loadIniConfigAll()
-	updateIconByState(StateDefault)
+	updateIconByState(StateStop)
 
 	mWeb := systray.AddMenuItem("进入控制面板", "")
 	systray.AddSeparator()
