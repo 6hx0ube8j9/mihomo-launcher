@@ -53,8 +53,6 @@ var (
 	isSystemInitializing = true
 )
 
-// --- 基础工具函数 ---
-
 func isAdmin() bool {
 	var token windows.Token
 	err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token)
@@ -83,8 +81,6 @@ func initJobObject() {
 		hJob = h
 	}
 }
-
-// --- 配置管理 ---
 
 func loadIniConfigAll() {
 	b, _ := os.ReadFile(filepath.Join(baseDir, CONFIG_FILE))
@@ -146,16 +142,13 @@ func saveIniConfig(key, val string) {
 	_ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), content, 0644)
 }
 
-// --- 核心同步逻辑 (合并了重试机制) ---
-
 func syncConfigToKernel() {
 	go func() {
-		for i := 0; i < 15; i++ { // 重试15次，确保内核API就绪
+		for i := 0; i < 20; i++ {
 			configMu.RLock()
 			tun := configData["tun_enabled"] == "true"
 			mode := configData["mode"]
 			if mode == "" { mode = "rule" }
-			proxy := configData["system_proxy_enabled"] == "true"
 			configMu.RUnlock()
 
 			payload := map[string]interface{}{
@@ -171,8 +164,7 @@ func syncConfigToKernel() {
 				if err == nil {
 					defer resp.Body.Close()
 					if resp.StatusCode == 204 || resp.StatusCode == 200 {
-						if proxy { setProxyRegistry(true) }
-						return // 成功同步，退出重试
+						return 
 					}
 				}
 			}
@@ -204,33 +196,11 @@ func monitorKernelDaemon() {
 					_ = windows.AssignProcessToJobObject(hJob, hp)
 					windows.CloseHandle(hp)
 				}
-				
-				// 关键点：启动内核后立即触发重试同步
 				syncConfigToKernel()
-				
 				_ = cmd.Wait()
 			}
 		}
 		time.Sleep(2 * time.Second)
-	}
-}
-
-func syncInitialState() {
-	hasTun := false
-	ifaces, _ := net.Interfaces()
-	for _, i := range ifaces {
-		name := strings.ToLower(i.Name)
-		if strings.Contains(name, "mihomo") || strings.Contains(name, "meta") {
-			hasTun = true
-			break
-		}
-	}
-	if hasTun {
-		updateIconByState(StateTun)
-	} else if getIniConfig("system_proxy_enabled") == "true" {
-		updateIconByState(StateProxy)
-	} else {
-		updateIconByState(StateDefault)
 	}
 }
 
@@ -280,10 +250,9 @@ func onReady() {
 
 	mExit := systray.AddMenuItem("退出程序", "")
 
-	// 启动保护逻辑
 	go func() {
 		isSystemInitializing = true
-		syncConfigToKernel() // 首次尝试同步
+		syncConfigToKernel()
 		time.Sleep(15 * time.Second)
 		isSystemInitializing = false
 	}()
@@ -430,7 +399,7 @@ func watchTunState() {
 			}
 		}
 
-		if mTun != nil && hasTun != mTun.Checked() {
+		if mTun != nil {
 			if hasTun {
 				mTun.Check()
 				updateIconByState(StateTun)
