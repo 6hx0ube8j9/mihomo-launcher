@@ -1,42 +1,22 @@
-name: Build Launcher
-
-on:
-  push:
-    branches: [ "main" ]
-  workflow_dispatch:
+name: Get Mod Content
+on: workflow_dispatch 
 
 jobs:
-  build:
+  get-content:
     runs-on: windows-latest
-    env:
-      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
-
-      - name: Set up Go
-        uses: actions/setup-go@v5
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
         with:
           go-version: '1.22'
-          check-latest: true
-
-      - name: Init Repo
+      - name: Generate
         shell: pwsh
         run: |
-          if (Test-Path "go.mod") { Remove-Item "go.mod" }
           go mod init mihomo-launcher
-          go get github.com/getlantern/systray
-          go get golang.org/x/sys/windows
           go mod tidy
-
-      - name: Build EXE
-        shell: pwsh
-        run: |
-          $env:CGO_ENABLED="1"
-          go build -ldflags="-s -w -H windowsgui" -o mihomo-launcher.exe main.go
-
-      - name: Upload
-        uses: actions/upload-artifact@v4
-        with:
-          name: mihomo-launcher-stable
-          path: mihomo-launcher.exe
+          Write-Host "---------- COPY START: GO.MOD ----------"
+          Get-Content go.mod
+          Write-Host "---------- COPY END: GO.MOD ----------"
+          Write-Host "---------- COPY START: GO.SUM ----------"
+          Get-Content go.sum
+          Write-Host "---------- COPY END: GO.SUM ----------"
