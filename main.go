@@ -75,7 +75,7 @@ func initJobObject() {
 	}
 }
 
-// --- 配置管理 (来自第二份的强健解析) ---
+// --- 配置管理 ---
 
 func loadIniConfigAll() {
 	b, _ := os.ReadFile(filepath.Join(baseDir, CONFIG_FILE))
@@ -108,11 +108,10 @@ func saveIniConfig(key, val string) {
 	_ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), buf.Bytes(), 0644)
 }
 
-// --- 核心逻辑：自动同步 (来自第一份的优点) ---
+// --- 核心逻辑：自动同步 ---
 
 func syncConfigToKernel() {
 	api := API_URL + "/configs"
-	// 搬运守护版养分：100次尝试，每 500ms 一次，持续 50 秒，直到强行掰回 INI 记录的状态
 	for i := 0; i < 100; i++ {
 		if isReallyExiting { return }
 
@@ -123,7 +122,6 @@ func syncConfigToKernel() {
 		proxy := configData["system_proxy_enabled"] == "true"
 		configMu.RUnlock()
 
-		// 构造 PATCH 负载 (三位一体：模式和 TUN 一起发，解决 YAML 写死问题)
 		payload := fmt.Sprintf(`{"mode": "%s", "tun": {"enable": %v}}`, mode, tun)
 		req, _ := http.NewRequest("PATCH", api, strings.NewReader(payload))
 		req.Header.Set("Content-Type", "application/json")
@@ -132,27 +130,22 @@ func syncConfigToKernel() {
 		if err == nil {
 			resp.Body.Close()
 			if resp.StatusCode == 204 || resp.StatusCode == 200 {
-				// 内核配置成功“找回记忆”后，再开启系统代理
 				if proxy { setProxyRegistry(true) }
 				return 
 			}
 		}
-		// 内核 API 还没准备好，等 500ms 继续刷
 		time.Sleep(500 * time.Millisecond)
 	}
 }
 
-// --- 守护进程逻辑 ---
-
+// --- 修复点：管生死 ---
 func monitorKernelDaemon() {
 	target := filepath.Join(baseDir, "mihomo.exe")
 	for {
 		if isReallyExiting { return }
 		
 		if !isProcessRunning("mihomo.exe") {
-			// 内核未运行，准备拉起
 			cmd := exec.Command(target, "-d", baseDir)
-			// 搬运守护版养分：增加隐藏窗口 + 脱离 Job 限制标志
 			cmd.SysProcAttr = &windows.SysProcAttr{
 				CreationFlags: windows.CREATE_NO_WINDOW | windows.CREATE_BREAKAWAY_FROM_JOB,
 			}
@@ -163,64 +156,60 @@ func monitorKernelDaemon() {
 					_ = windows.AssignProcessToJobObject(hJob, hp)
 					windows.CloseHandle(hp)
 				}
-				
-				// 状态更新与图标重置
-				lastState = StateStop
-				updateIconByState(StateStop)
-
-				// 立即触发高频记忆同步
 				go syncConfigToKernel()
-				
-				// 搬运守护版养分：阻塞等待，内核崩掉时 Wait 会立即返回，进入下一轮循环拉起
-				cmd.Wait()
-			}
-		} else {
-			// 内核运行中，仅同步图标状态
-			curr := checkSystemState()
-			if curr != lastState {
-				updateIconByState(curr)
-				lastState = curr
+				cmd.Wait() // 阻塞直到进程消失
 			}
 		}
-		// 防止启动连续失败导致死循环，保留 1 秒安全缓冲
+		time.Sleep(time.Second)
+	}
+}
+
+// --- 修复点：管状态和图标 ---
+func monitorIconState() {
+	for {
+		if isReallyExiting { return }
+
+		var curr int
+		if !isProcessRunning("mihomo.exe") {
+			curr = StateStop
+		} else {
+			curr = checkSystemState()
+		}
+
+		if curr != lastState {
+			updateIconByState(curr)
+			lastState = curr
+		}
 		time.Sleep(time.Second)
 	}
 }
 
 func checkSystemState() int {
-	// 1. 先检查 API 是否响应
 	_, err := httpClient.Get(API_URL)
 	if err != nil {
-		return StateError // API 不通，判定为 Error
+		return StateError
 	}
 
-	// 2. 读取配置，看用户是否要求开启 TUN
 	configMu.RLock()
 	wantTun := configData["tun_enabled"] == "true"
 	configMu.RUnlock()
 
-	// 3. 检查系统物理网卡
 	hasTunInterface := false
 	ifaces, _ := net.Interfaces()
 	for _, i := range ifaces {
-		// 只要网卡名包含 mihomo，说明虚拟网卡创建成功
 		if strings.Contains(strings.ToLower(i.Name), "mihomo") {
 			hasTunInterface = true
 			break
 		}
 	}
 
-	// --- 核心逻辑：TUN 开启了但没网卡 = Error ---
 	if wantTun && !hasTunInterface {
 		return StateError 
 	}
-
-	// 4. 如果没有 TUN 错误，再看是否有网卡（正常运行中）
 	if hasTunInterface {
 		return StateTun
 	}
 
-	// 5. 最后检查系统代理状态
 	key, _ := registry.OpenKey(registry.CURRENT_USER, REG_PROXY, registry.QUERY_VALUE)
 	val, _, _ := key.GetIntegerValue("ProxyEnable")
 	key.Close()
@@ -243,7 +232,7 @@ func isProcessRunning(name string) bool {
 	return false
 }
 
-// --- UI 菜单逻辑 (精简版) ---
+// --- UI 菜单逻辑 ---
 
 func onReady() {
 	loadIniConfigAll()
@@ -344,10 +333,8 @@ func updateIconByState(state int) {
 // --- 程序入口 ---
 
 func main() {
-	// 1. 提权
 	if !isAdmin() { runAsAdmin(); os.Exit(0) }
 
-	// 2. 极速单实例判定 (静默退出)
 	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
 	h, _ := windows.CreateMutex(nil, false, mName)
 	if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
@@ -356,13 +343,12 @@ func main() {
 	}
 	hMutex = h
 
-	// 3. 基础资源初始化
 	os.Chdir(baseDir)
 	initJobObject()
 
-	// 4. 启动后台守护协程
+	// 同时启动保活与状态监控
 	go monitorKernelDaemon()
+	go monitorIconState()
 
-	// 5. 运行托盘 UI
 	systray.Run(onReady, onExit)
 }
