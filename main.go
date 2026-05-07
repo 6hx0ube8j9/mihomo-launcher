@@ -289,12 +289,10 @@ func checkSystemState() int {
 			val, _, _ := key.GetIntegerValue("ProxyEnable")
 			srv, _, _ := key.GetStringValue("ProxyServer")
 			key.Close()
-			// 如果配置要开且地址对，直接返回蓝色，省略中间态
 			if val == 1 && srv == DEFAULT_PROXY_ADDR {
 				return StateProxy
 			}
 		}
-		// 如果注册表还没写完，也直接报蓝色，不给它变灰色的机会
 		return StateProxy
 	}
 
@@ -364,8 +362,7 @@ func onReady() {
 	// 1. 初始化：加载配置文件并同步一次基础状态
 	loadIniConfigAll()
 
-	// --- 深度纠正逻辑：确保系统代理状态与配置文件/内核地址完全匹配 ---
-	var currentEnable uint32
+	var currentEnable uint64
 	var currentServer string
 	key, err := registry.OpenKey(registry.CURRENT_USER, REG_PROXY, registry.QUERY_VALUE)
 	if err == nil {
