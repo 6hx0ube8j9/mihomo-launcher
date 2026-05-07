@@ -111,22 +111,34 @@ func saveIniConfig(key, val string) {
 // --- 核心逻辑：自动同步 (来自第一份的优点) ---
 
 func syncConfigToKernel() {
-	// 给内核 10 秒启动宽限期，每秒尝试一次同步
-	for i := 0; i < 10; i++ {
-		_, err := httpClient.Get(API_URL)
-		if err == nil {
-			configMu.RLock()
-			tun := configData["tun_enabled"] == "true"
-			mode := configData["mode"]
-			proxy := configData["system_proxy_enabled"] == "true"
-			configMu.RUnlock()
+	api := API_URL + "/configs"
+	// 搬运守护版养分：100次尝试，每 500ms 一次，持续 50 秒，直到强行掰回 INI 记录的状态
+	for i := 0; i < 100; i++ {
+		if isReallyExiting { return }
 
-			if tun { setTunMode(true) }
-			if mode != "" { setMihomoMode(mode) }
-			if proxy { setProxyRegistry(true) }
-			return
+		configMu.RLock()
+		tun := configData["tun_enabled"] == "true"
+		mode := configData["mode"]
+		if mode == "" { mode = "rule" }
+		proxy := configData["system_proxy_enabled"] == "true"
+		configMu.RUnlock()
+
+		// 构造 PATCH 负载 (三位一体：模式和 TUN 一起发，解决 YAML 写死问题)
+		payload := fmt.Sprintf(`{"mode": "%s", "tun": {"enable": %v}}`, mode, tun)
+		req, _ := http.NewRequest("PATCH", api, strings.NewReader(payload))
+		req.Header.Set("Content-Type", "application/json")
+
+		resp, err := httpClient.Do(req)
+		if err == nil {
+			resp.Body.Close()
+			if resp.StatusCode == 204 || resp.StatusCode == 200 {
+				// 内核配置成功“找回记忆”后，再开启系统代理
+				if proxy { setProxyRegistry(true) }
+				return 
+			}
 		}
-		time.Sleep(time.Second)
+		// 内核 API 还没准备好，等 500ms 继续刷
+		time.Sleep(500 * time.Millisecond)
 	}
 }
 
@@ -138,44 +150,84 @@ func monitorKernelDaemon() {
 		if isReallyExiting { return }
 		
 		if !isProcessRunning("mihomo.exe") {
-			// 内核未运行，尝试拉起
+			// 内核未运行，准备拉起
 			cmd := exec.Command(target, "-d", baseDir)
-			cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-			if err := cmd.Start(); err == nil && hJob != 0 {
-				hp, _ := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
-				_ = windows.AssignProcessToJobObject(hJob, hp)
-				windows.CloseHandle(hp)
-				// 拉起后，立即触发异步配置同步
-				go syncConfigToKernel()
+			// 搬运守护版养分：增加隐藏窗口 + 脱离 Job 限制标志
+			cmd.SysProcAttr = &windows.SysProcAttr{
+				CreationFlags: windows.CREATE_NO_WINDOW | windows.CREATE_BREAKAWAY_FROM_JOB,
 			}
-			lastState = StateStop
-			updateIconByState(StateStop)
+			
+			if err := cmd.Start(); err == nil {
+				if hJob != 0 {
+					hp, _ := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
+					_ = windows.AssignProcessToJobObject(hJob, hp)
+					windows.CloseHandle(hp)
+				}
+				
+				// 状态更新与图标重置
+				lastState = StateStop
+				updateIconByState(StateStop)
+
+				// 立即触发高频记忆同步
+				go syncConfigToKernel()
+				
+				// 搬运守护版养分：阻塞等待，内核崩掉时 Wait 会立即返回，进入下一轮循环拉起
+				cmd.Wait()
+			}
 		} else {
-			// 内核运行中，更新状态图标
+			// 内核运行中，仅同步图标状态
 			curr := checkSystemState()
 			if curr != lastState {
 				updateIconByState(curr)
 				lastState = curr
 			}
 		}
-		time.Sleep(2 * time.Second)
+		// 防止启动连续失败导致死循环，保留 1 秒安全缓冲
+		time.Sleep(time.Second)
 	}
 }
 
 func checkSystemState() int {
+	// 1. 先检查 API 是否响应
 	_, err := httpClient.Get(API_URL)
-	if err != nil { return StateError }
-	
+	if err != nil {
+		return StateError // API 不通，判定为 Error
+	}
+
+	// 2. 读取配置，看用户是否要求开启 TUN
+	configMu.RLock()
+	wantTun := configData["tun_enabled"] == "true"
+	configMu.RUnlock()
+
+	// 3. 检查系统物理网卡
+	hasTunInterface := false
 	ifaces, _ := net.Interfaces()
 	for _, i := range ifaces {
-		if strings.Contains(strings.ToLower(i.Name), "mihomo") { return StateTun }
+		// 只要网卡名包含 mihomo，说明虚拟网卡创建成功
+		if strings.Contains(strings.ToLower(i.Name), "mihomo") {
+			hasTunInterface = true
+			break
+		}
 	}
-	
+
+	// --- 核心逻辑：TUN 开启了但没网卡 = Error ---
+	if wantTun && !hasTunInterface {
+		return StateError 
+	}
+
+	// 4. 如果没有 TUN 错误，再看是否有网卡（正常运行中）
+	if hasTunInterface {
+		return StateTun
+	}
+
+	// 5. 最后检查系统代理状态
 	key, _ := registry.OpenKey(registry.CURRENT_USER, REG_PROXY, registry.QUERY_VALUE)
 	val, _, _ := key.GetIntegerValue("ProxyEnable")
 	key.Close()
-	if val == 1 { return StateProxy }
-	
+	if val == 1 {
+		return StateProxy
+	}
+
 	return StateDefault
 }
 
