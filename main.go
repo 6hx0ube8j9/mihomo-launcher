@@ -52,6 +52,7 @@ var (
 	configMu        sync.RWMutex
 	mTun            *systray.MenuItem
 	onceSync        sync.Once
+	isSystemInitializing = true
 )
 
 // --- 基础工具函数 ---
@@ -263,10 +264,12 @@ func isProcessRunning(name string) bool {
 }
 
 func onReady() {
+	// 1. 加载基础配置与初始化
 	loadIniConfigAll()
 	setProxyRegistry(getIniConfig("system_proxy_enabled") == "true")
 	updateIconByState(StateStop)
 
+	// 2. 托盘菜单布局
 	mWeb := systray.AddMenuItem("进入 Web 面板", "")
 	mProxy := systray.AddMenuItemCheckbox("系统代理", "", getIniConfig("system_proxy_enabled") == "true")
 	mTun = systray.AddMenuItemCheckbox("TUN 模式", "", getIniConfig("tun_enabled") == "true")
@@ -287,9 +290,23 @@ func onReady() {
 
 	mExit := systray.AddMenuItem("退出程序", "")
 
-	// 启动后立即执行一次 API 同步
-	go syncConfigToKernel()
+	// 3. 【暴力初始化逻辑】
+	go func() {
+		// 锁定配置文件写入权限
+		isSystemInitializing = true
+		
+		// 严格按照 ini 配置下发指令给内核
+		syncConfigToKernel()
+		
+		// 暴力等待 15 秒，期间 watchTunState 只更新 UI，不准改 ini
+		// 即使内核拉起网卡慢，或者中间重启了，也不会覆盖原始配置
+		time.Sleep(15 * time.Second)
+		
+		// 解锁权限，恢复正常的双向同步
+		isSystemInitializing = false
+	}()
 
+	// 4. 托盘事件监听循环
 	for {
 		select {
 		case <-mWeb.ClickedCh:
@@ -306,9 +323,11 @@ func onReady() {
 			modeMenus["rule"].Uncheck(); modeMenus["global"].Uncheck(); modeMenus["direct"].Check()
 
 		case <-mTun.ClickedCh:
+			// 这里点击时，如果是初始化 15s 内，虽然 setTunMode 会发请求
+			// 但 watchTunState 的反写锁依然生效，保护了初始逻辑
 			next := !mTun.Checked()
 			setTunMode(next)
-			// 注意：这里不用手动 Check/Uncheck，watchTunState 会根据网卡自动同步 UI
+			// 注意：不用在这里手动 Check，由 watchTunState 统一负责 UI 表现
 
 		case <-mProxy.ClickedCh:
 			next := !mProxy.Checked()
@@ -331,6 +350,7 @@ func onReady() {
 		case <-mDir.ClickedCh:
 			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
 		case <-mRestart.ClickedCh:
+			// 重启内核前，如果有必要可以重新锁定（可选）
 			killCmd := exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe")
 			killCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 			_ = killCmd.Run()
@@ -342,7 +362,6 @@ func onReady() {
 		}
 	}
 }
-
 func onExit() {
 	if isReallyExiting {
 		setProxyRegistry(false)
@@ -431,43 +450,54 @@ func reloadConfigFile() {
 
 // watchTunState 核心监听：网卡变动立刻同步 UI
 func watchTunState() {
-	var (
-		modiphlpapi          = syscall.NewLazyDLL("iphlpapi.dll")
-		procNotifyAddrChange = modiphlpapi.NewProc("NotifyAddrChange")
-		handle               syscall.Handle
-		overlapped           syscall.Overlapped
-	)
+    var (
+        modiphlpapi          = syscall.NewLazyDLL("iphlpapi.dll")
+        procNotifyAddrChange = modiphlpapi.NewProc("NotifyAddrChange")
+        handle               syscall.Handle
+        overlapped           syscall.Overlapped
+    )
 
-	for {
-		procNotifyAddrChange.Call(uintptr(unsafe.Pointer(&handle)), uintptr(unsafe.Pointer(&overlapped)))
-		time.Sleep(500 * time.Millisecond)
+    for {
+        // 等待系统信号
+        procNotifyAddrChange.Call(uintptr(unsafe.Pointer(&handle)), uintptr(unsafe.Pointer(&overlapped)))
+        
+        // 收到信号后先等 500ms 让网卡状态稳定
+        time.Sleep(500 * time.Millisecond)
 
-		hasTun := false
-		ifaces, _ := net.Interfaces()
-		for _, i := range ifaces {
-			name := strings.ToLower(i.Name)
-			if strings.Contains(name, "mihomo") || strings.Contains(name, "meta") {
-				hasTun = true
-				break
-			}
-		}
+        // 检查网卡是否存在
+        hasTun := false
+        ifaces, _ := net.Interfaces()
+        for _, i := range ifaces {
+            name := strings.ToLower(i.Name)
+            if strings.Contains(name, "mihomo") || strings.Contains(name, "meta") {
+                hasTun = true
+                break
+            }
+        }
 
-		if mTun != nil && hasTun != mTun.Checked() {
-			if hasTun {
-				mTun.Check()
-				updateIconByState(StateTun)
-			} else {
-				mTun.Uncheck()
-				// 如果 TUN 关闭了，检查是否还有系统代理，决定切回什么图标
-				if getIniConfig("system_proxy_enabled") == "true" {
-					updateIconByState(StateProxy)
-				} else {
-					updateIconByState(StateDefault)
-				}
-			}
-			saveIniConfig("tun_enabled", fmt.Sprint(hasTun))
-		}
-	}
+        // 只有当“系统实际状态”与“菜单勾选状态”不一致时，才需要处理
+        if mTun != nil && hasTun != mTun.Checked() {
+            // A. 同步 UI：网卡在就打钩，不在就取消
+            if hasTun {
+                mTun.Check()
+                updateIconByState(StateTun)
+            } else {
+                mTun.Uncheck()
+                if getIniConfig("system_proxy_enabled") == "true" {
+                    updateIconByState(StateProxy)
+                } else {
+                    updateIconByState(StateDefault)
+                }
+            }
+
+            // B. 暴力权限检查：保护期内严禁反向修改配置文件
+            if !isSystemInitializing {
+                saveIniConfig("tun_enabled", fmt.Sprint(hasTun))
+            }
+            // 如果在 15s 内发生变化，上面这段代码会直接跳过写入，
+            // 从而保护了启动时 ini 里的原始 true 不被覆盖。
+        }
+    }
 }
 
 func main() {
