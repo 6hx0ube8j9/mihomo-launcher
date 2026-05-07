@@ -51,7 +51,7 @@ var (
 	configData      = make(map[string]string)
 	configMu        sync.RWMutex
 	mTun            *systray.MenuItem
-	isSystemInitializing = true
+	onceSync        sync.Once
 )
 
 // --- 基础工具函数 ---
@@ -106,8 +106,8 @@ func loadIniConfigAll() {
 	defaults := map[string]string{
 		"tun_enabled":          "false",
 		"system_proxy_enabled": "false",
-		"mode":                  "rule",
-		"auto_start":            "false",
+		"mode":                 "rule",
+		"auto_start":           "false",
 	}
 
 	needsSave := false
@@ -149,6 +149,36 @@ func saveIniConfig(key, val string) {
 
 // --- 核心逻辑 ---
 
+func syncConfigToKernel() {
+	configMu.RLock()
+	tun := configData["tun_enabled"] == "true"
+	mode := configData["mode"]
+	if mode == "" {
+		mode = "rule"
+	}
+	proxy := configData["system_proxy_enabled"] == "true"
+	configMu.RUnlock()
+
+	payload := map[string]interface{}{
+		"mode": mode,
+		"tun":  map[string]bool{"enable": tun},
+	}
+	jsonPayload, _ := json.Marshal(payload)
+
+	req, err := http.NewRequest("PATCH", API_URL+"/configs", bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient.Do(req)
+	if err == nil {
+		defer resp.Body.Close()
+		if (resp.StatusCode == 204 || resp.StatusCode == 200) && proxy {
+			setProxyRegistry(true)
+		}
+	}
+}
+
 func monitorKernelDaemon() {
 	target := filepath.Join(baseDir, "mihomo.exe")
 	for {
@@ -157,6 +187,7 @@ func monitorKernelDaemon() {
 		}
 
 		if !isProcessRunning("mihomo.exe") {
+			onceSync = sync.Once{}
 			killCmd := exec.Command("taskkill", "/F", "/IM", "mihomo.exe", "/T")
 			killCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 			_ = killCmd.Run()
@@ -174,8 +205,9 @@ func monitorKernelDaemon() {
 					_ = windows.AssignProcessToJobObject(hJob, hp)
 					windows.CloseHandle(hp)
 				}
-				// 启动后立即触发一次暴力同步
-				go syncInitialState()
+				// 启动后立即触发一次图标检查
+				time.Sleep(1 * time.Second)
+				syncInitialState()
 				_ = cmd.Wait()
 			}
 		}
@@ -183,44 +215,24 @@ func monitorKernelDaemon() {
 	}
 }
 
+// syncInitialState 用于启动时或内核重启后同步一次图标
 func syncInitialState() {
-	isSystemInitializing = true
-	fmt.Println("[Init] 进入启动保护期...")
-
-	apiReady := false
-	for i := 0; i < 20; i++ {
-		_, err := httpClient.Get(API_URL + "/version")
-		if err == nil {
-			apiReady = true
-			fmt.Printf("[Init] 第 %d 秒：内核 API 已就绪\n", i+1)
+	hasTun := false
+	ifaces, _ := net.Interfaces()
+	for _, i := range ifaces {
+		name := strings.ToLower(i.Name)
+		if strings.Contains(name, "mihomo") || strings.Contains(name, "meta") {
+			hasTun = true
 			break
 		}
-		time.Sleep(1 * time.Second)
 	}
-
-	if apiReady {
-		configMu.RLock()
-		tunWanted := configData["tun_enabled"] == "true"
-		modeWanted := configData["mode"]
-		if modeWanted == "" { modeWanted = "rule" }
-		configMu.RUnlock()
-
-		payload := map[string]interface{}{
-			"mode": modeWanted,
-			"tun":  map[string]bool{"enable": tunWanted},
-		}
-		jsonBytes, _ := json.Marshal(payload)
-		
-		req, _ := http.NewRequest("PATCH", API_URL+"/configs", bytes.NewBuffer(jsonBytes))
-		req.Header.Set("Content-Type", "application/json")
-		if resp, err := httpClient.Do(req); err == nil {
-			resp.Body.Close()
-		}
+	if hasTun {
+		updateIconByState(StateTun)
+	} else if getIniConfig("system_proxy_enabled") == "true" {
+		updateIconByState(StateProxy)
+	} else {
+		updateIconByState(StateDefault)
 	}
-
-	time.Sleep(12 * time.Second)
-	isSystemInitializing = false
-	fmt.Println("[Init] 启动保护期结束")
 }
 
 func isProcessRunning(name string) bool {
@@ -252,68 +264,81 @@ func isProcessRunning(name string) bool {
 
 func onReady() {
 	loadIniConfigAll()
-	systray.SetTooltip("Mihomo Launcher")
+	setProxyRegistry(getIniConfig("system_proxy_enabled") == "true")
+	updateIconByState(StateStop)
 
-	configMu.RLock()
-	initialTun := configData["tun_enabled"] == "true"
-	initialMode := configData["mode"]
-	if initialMode == "" { initialMode = "rule" }
-	configMu.RUnlock()
-
-	mWeb := systray.AddMenuItem("进入控制面板", "")
+	mWeb := systray.AddMenuItem("进入 Web 面板", "")
+	mProxy := systray.AddMenuItemCheckbox("系统代理", "", getIniConfig("system_proxy_enabled") == "true")
+	mTun = systray.AddMenuItemCheckbox("TUN 模式", "", getIniConfig("tun_enabled") == "true")
 	systray.AddSeparator()
 
-	mModeR := systray.AddMenuItemCheckbox("规则模式", "", initialMode == "rule")
-	mModeG := systray.AddMenuItemCheckbox("全局模式", "", initialMode == "global")
-	mModeD := systray.AddMenuItemCheckbox("直连模式", "", initialMode == "direct")
+	curMode := getIniConfig("mode")
+	modeMenus := make(map[string]*systray.MenuItem)
+	modeMenus["rule"] = systray.AddMenuItemCheckbox("规则模式", "", curMode == "rule" || curMode == "")
+	modeMenus["global"] = systray.AddMenuItemCheckbox("全局模式", "", curMode == "global")
+	modeMenus["direct"] = systray.AddMenuItemCheckbox("直连模式", "", curMode == "direct")
 	systray.AddSeparator()
 
-	// 全局变量赋值
-	mTun = systray.AddMenuItemCheckbox("TUN 模式", "", initialTun)
-	mSystemProxy := systray.AddMenuItemCheckbox("系统代理", "", isProxyEnabledInRegistry())
-	systray.AddSeparator()
-
-	mAutoRun := systray.AddMenuItemCheckbox("开机自启", "", isAutoRunEnabled())
-	mDir := systray.AddMenuItem("浏览本地文件", "")
+	mAuto := systray.AddMenuItemCheckbox("开机自动启动", "", getIniConfig("auto_start") == "true")
+	mDir := systray.AddMenuItem("打开程序目录", "")
+	mReloadYAML := systray.AddMenuItem("重载配置文件", "")
 	mRestart := systray.AddMenuItem("重启内核", "")
+	systray.AddSeparator()
+
 	mExit := systray.AddMenuItem("退出程序", "")
 
-	// 启动网卡监听
-	go watchTunState()
+	// 启动后立即执行一次 API 同步
+	go syncConfigToKernel()
 
-	// 事件循环
 	for {
 		select {
 		case <-mWeb.ClickedCh:
-			openWebPanel()
-		case <-mModeR.ClickedCh:
+			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(API_URL+"/ui"), nil, nil, windows.SW_SHOWNORMAL)
+
+		case <-modeMenus["rule"].ClickedCh:
 			setMihomoMode("rule")
-			mModeR.Check(); mModeG.Uncheck(); mModeD.Uncheck()
-		case <-mModeG.ClickedCh:
+			modeMenus["rule"].Check(); modeMenus["global"].Uncheck(); modeMenus["direct"].Uncheck()
+		case <-modeMenus["global"].ClickedCh:
 			setMihomoMode("global")
-			mModeR.Uncheck(); mModeG.Check(); mModeD.Uncheck()
-		case <-mModeD.ClickedCh:
+			modeMenus["rule"].Uncheck(); modeMenus["global"].Check(); modeMenus["direct"].Uncheck()
+		case <-modeMenus["direct"].ClickedCh:
 			setMihomoMode("direct")
-			mModeR.Uncheck(); mModeG.Uncheck(); mModeD.Check()
+			modeMenus["rule"].Uncheck(); modeMenus["global"].Uncheck(); modeMenus["direct"].Check()
+
 		case <-mTun.ClickedCh:
-			now := !mTun.Checked()
-			setTunMode(now)
-			if now { mTun.Check() } else { mTun.Uncheck() }
-		case <-mSystemProxy.ClickedCh:
-			now := !mSystemProxy.Checked()
-			setProxyRegistry(now)
-			if now { mSystemProxy.Check() } else { mSystemProxy.Uncheck() }
-		case <-mAutoRun.ClickedCh:
-			now := !mAutoRun.Checked()
-			toggleAutoStart(now)
-			if now { mAutoRun.Check() } else { mAutoRun.Uncheck() }
+			next := !mTun.Checked()
+			setTunMode(next)
+			// 注意：这里不用手动 Check/Uncheck，watchTunState 会根据网卡自动同步 UI
+
+		case <-mProxy.ClickedCh:
+			next := !mProxy.Checked()
+			saveIniConfig("system_proxy_enabled", fmt.Sprint(next))
+			setProxyRegistry(next)
+			if next {
+				mProxy.Check()
+				updateIconByState(StateProxy)
+			} else {
+				mProxy.Uncheck()
+				updateIconByState(StateDefault)
+			}
+
+		case <-mReloadYAML.ClickedCh:
+			go reloadConfigFile()
+		case <-mAuto.ClickedCh:
+			next := !mAuto.Checked()
+			toggleAutoStart(next)
+			if next { mAuto.Check() } else { mAuto.Uncheck() }
 		case <-mDir.ClickedCh:
 			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
 		case <-mRestart.ClickedCh:
-			restartKernel()
+			killCmd := exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe")
+			killCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+			_ = killCmd.Run()
+
 		case <-mExit.ClickedCh:
 			isReallyExiting = true
 			systray.Quit()
+			return
 		}
 	}
 }
@@ -321,8 +346,13 @@ func onReady() {
 func onExit() {
 	if isReallyExiting {
 		setProxyRegistry(false)
-		if hJob != 0 { windows.CloseHandle(hJob) }
-		if hMutex != 0 { windows.CloseHandle(hMutex) }
+		time.Sleep(50 * time.Millisecond)
+		if hJob != 0 {
+			windows.CloseHandle(hJob)
+		}
+		if hMutex != 0 {
+			windows.CloseHandle(hMutex)
+		}
 	}
 }
 
@@ -353,7 +383,9 @@ func setProxyRegistry(enable bool) {
 		saveIniConfig("system_proxy_enabled", fmt.Sprint(enable))
 	}
 	key, err := registry.OpenKey(registry.CURRENT_USER, REG_PROXY, registry.SET_VALUE)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer key.Close()
 
 	if enable {
@@ -362,22 +394,6 @@ func setProxyRegistry(enable bool) {
 	} else {
 		_ = key.SetDWordValue("ProxyEnable", 0)
 	}
-}
-
-func isProxyEnabledInRegistry() bool {
-	key, err := registry.OpenKey(registry.CURRENT_USER, REG_PROXY, registry.QUERY_VALUE)
-	if err != nil { return false }
-	defer key.Close()
-	val, _, err := key.GetIntegerValue("ProxyEnable")
-	return err == nil && val == 1
-}
-
-func isAutoRunEnabled() bool {
-	key, err := registry.OpenKey(registry.CURRENT_USER, REG_RUN, registry.QUERY_VALUE)
-	if err != nil { return false }
-	defer key.Close()
-	_, _, err = key.GetStringValue(APP_NAME)
-	return err == nil
 }
 
 func toggleAutoStart(enable bool) {
@@ -391,25 +407,29 @@ func toggleAutoStart(enable bool) {
 	}
 }
 
-func restartKernel() {
-	killCmd := exec.Command("taskkill", "/F", "/IM", "mihomo.exe", "/T")
-	killCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-	_ = killCmd.Run()
-}
-
-func openWebPanel() {
-	windows.ShellExecute(0, nil, windows.StringToUTF16Ptr("https://metacubex.github.io/metacubexd/"), nil, nil, windows.SW_SHOWNORMAL)
-}
-
 func updateIconByState(state int) {
 	files := []string{"stop.ico", "error.ico", "tun.ico", "proxy.ico", "default.ico"}
-	if state < 0 || state >= len(files) { return }
+	if state < 0 || state >= len(files) {
+		return
+	}
 	b, err := iconFs.ReadFile("icons/" + files[state])
 	if err == nil {
 		systray.SetIcon(b)
 	}
 }
 
+func reloadConfigFile() {
+	configPath := filepath.Join(baseDir, "config.yaml")
+	body := map[string]interface{}{"path": configPath}
+	jsonPayload, _ := json.Marshal(body)
+	req, _ := http.NewRequest("PUT", API_URL+"/configs?force=true", bytes.NewBuffer(jsonPayload))
+	req.Header.Set("Content-Type", "application/json")
+	if resp, err := httpClient.Do(req); err == nil {
+		resp.Body.Close()
+	}
+}
+
+// watchTunState 核心监听：网卡变动立刻同步 UI
 func watchTunState() {
 	var (
 		modiphlpapi          = syscall.NewLazyDLL("iphlpapi.dll")
@@ -418,34 +438,44 @@ func watchTunState() {
 		overlapped           syscall.Overlapped
 	)
 
+	startTime := time.Now()
+
 	for {
+		// 阻塞等待系统信号
 		procNotifyAddrChange.Call(uintptr(unsafe.Pointer(&handle)), uintptr(unsafe.Pointer(&overlapped)))
+		
+		// 1. 缓冲延迟
 		time.Sleep(500 * time.Millisecond)
 
+		// 2. 扫描网卡
 		hasTun := false
 		ifaces, _ := net.Interfaces()
 		for _, i := range ifaces {
 			name := strings.ToLower(i.Name)
-			if strings.Contains(name, "mihomo") || strings.Contains(name, "meta") || strings.Contains(name, "wintun") {
+			if strings.Contains(name, "mihomo") || strings.Contains(name, "meta") {
 				hasTun = true
 				break
 			}
 		}
 
+		// 3. 同步 UI（始终执行，保证图标准确）
 		if mTun != nil && hasTun != mTun.Checked() {
 			if hasTun {
 				mTun.Check()
 				updateIconByState(StateTun)
 			} else {
 				mTun.Uncheck()
-				if isProxyEnabledInRegistry() {
+				// 根据是否有代理决定图标
+				if getIniConfig("system_proxy_enabled") == "true" {
 					updateIconByState(StateProxy)
 				} else {
 					updateIconByState(StateDefault)
 				}
 			}
 
-			if !isSystemInitializing {
+			// 4. 【核心修复】：只有在启动 3 秒后，才允许根据网卡状态反写配置文件
+			// 这样就避免了启动瞬间因为内核还没拉起网卡，导致配置文件被误刷成 false 的问题
+			if time.Since(startTime) > 3*time.Second {
 				saveIniConfig("tun_enabled", fmt.Sprint(hasTun))
 			}
 		}
@@ -455,16 +485,23 @@ func watchTunState() {
 func main() {
 	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
 	h, err := windows.CreateMutex(nil, false, mName)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	event, _ := windows.WaitForSingleObject(h, 0)
 	if event == uint32(windows.WAIT_TIMEOUT) || event == uint32(windows.WAIT_FAILED) {
-		if h != 0 { windows.CloseHandle(h) }
+		if h != 0 {
+			windows.CloseHandle(h)
+		}
 		return
 	}
 	hMutex = h
 
 	if !isAdmin() {
-		if hMutex != 0 { windows.CloseHandle(hMutex) }
+		if hMutex != 0 {
+			windows.CloseHandle(hMutex)
+			hMutex = 0
+		}
 		runAsAdmin()
 		os.Exit(0)
 	}
@@ -473,5 +510,7 @@ func main() {
 	initJobObject()
 
 	go monitorKernelDaemon()
+	go watchTunState() // 替换了旧的轮询
+
 	systray.Run(onReady, onExit)
 }
