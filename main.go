@@ -236,68 +236,61 @@ func monitorIconState() {
 }
 
 func checkSystemState() int {
-	// 1. API 连通性检测
-	resp, err := httpClient.Get(API_URL)
-	if err != nil {
-		tunErrorCounter = 0
-		return StateStop // API 不通，维持红色
-	}
-	resp.Body.Close()
+    // 1. API 连通性检测：这是唯一的客观物理事实，不通则一切无从谈起
+    resp, err := httpClient.Get(API_URL)
+    if err != nil {
+        tunErrorCounter = 0
+        return StateStop // API 不通，内核可能崩溃或启动中，显示红色
+    }
+    resp.Body.Close()
 
-	// 2. 只要 API 通了，立即触发一次同步
-	onceSync.Do(func() {
-		go syncConfigToKernel()
-	})
+    // 2. 只要 API 通了，触发一次同步（利用 sync.Once 确保内核重启后只推一次）
+    onceSync.Do(func() {
+        go syncConfigToKernel()
+    })
 
-	// 3. 读取本地配置判定意图
-	configMu.RLock()
-	wantTun := configData["tun_enabled"] == "true"
-	wantProxy := configData["system_proxy_enabled"] == "true"
-	configMu.RUnlock()
+    // 3. 读取本地内存中的“真理”（.ini 的意志）
+    configMu.RLock()
+    wantTun := configData["tun_enabled"] == "true"
+    wantProxy := configData["system_proxy_enabled"] == "true"
+    configMu.RUnlock()
 
-	// 4. TUN 状态判定
-	hasTunInterface := false
-	ifaces, _ := net.Interfaces()
-	for _, i := range ifaces {
-		name := strings.ToLower(i.Name)
-		if strings.Contains(name, "mihomo") || strings.Contains(name, "meta") || strings.Contains(name, "clash") {
-			hasTunInterface = true
-			break
-		}
-	}
+    // 4. TUN 模式判定：因为涉及虚拟网卡硬件，需要物理检测
+    if wantTun {
+        hasTunInterface := false
+        ifaces, _ := net.Interfaces()
+        for _, i := range ifaces {
+            name := strings.ToLower(i.Name)
+            // 匹配常见的 TUN 网卡关键词
+            if strings.Contains(name, "mihomo") || strings.Contains(name, "meta") || strings.Contains(name, "clash") {
+                hasTunInterface = true
+                break
+            }
+        }
 
-	if wantTun {
-		if hasTunInterface {
-			tunErrorCounter = 0
-			return StateTun // 绿色：完全就绪
-		} else {
-			tunErrorCounter++
-			if tunErrorCounter > 5 {
-				return StateError // 黄色：超时报错
-			}
-			// 【关键改动】：如果配置文件要开 TUN，但网卡还没出来，
-			// 在这 5 秒内，直接返回 StateTun (绿色)，不再显示灰色。
-			return StateTun 
-		}
-	}
+        if hasTunInterface {
+            tunErrorCounter = 0
+            return StateTun // 绿色：网卡已就绪
+        } else {
+            tunErrorCounter++
+            if tunErrorCounter > 5 {
+                return StateError // 黄色：超过 5 秒网卡还没出来，报错
+            }
+            return StateTun // 宽容期内直接给绿色，避免图标闪烁，这叫“预判成功”
+        }
+    }
 
-	// 5. 系统代理状态判定
-	if wantProxy {
-		// 检查注册表地址和开关
-		key, err := registry.OpenKey(registry.CURRENT_USER, REG_PROXY, registry.QUERY_VALUE)
-		if err == nil {
-			val, _, _ := key.GetIntegerValue("ProxyEnable")
-			srv, _, _ := key.GetStringValue("ProxyServer")
-			key.Close()
-			if val == 1 && srv == DEFAULT_PROXY_ADDR {
-				return StateProxy
-			}
-		}
-		return StateProxy
-	}
+    // 5. 系统代理判定：暴力信任逻辑
+    // 不再去读注册表看地址对不对，直接相信启动时的 setProxyRegistry 已经扫平了障碍
+    if wantProxy {
+        tunErrorCounter = 0
+        return StateProxy // 蓝色：配置说开了，我们就认为它开了
+    }
 
-	tunErrorCounter = 0
-	return StateDefault // 只有真的什么都没开，才显示灰色
+    // 6. 兜底逻辑：啥也没开
+    // 只有当 API 通着，但 TUN 和 Proxy 都是 false 时，才会走到这里
+    tunErrorCounter = 0
+    return StateDefault // 灰色：待命状态
 }
 
 func reloadConfigFile() {
@@ -359,126 +352,100 @@ func isProcessRunning(name string) bool {
 }
 
 func onReady() {
-	// 1. 初始化：加载配置文件并同步一次基础状态
-	loadIniConfigAll()
+    // 1. 暴力初始化：不管现状，启动即校准
+    loadIniConfigAll()
+    setProxyRegistry(getIniConfig("system_proxy_enabled") == "true")
 
-	var currentEnable uint64
-	var currentServer string
-	key, err := registry.OpenKey(registry.CURRENT_USER, REG_PROXY, registry.QUERY_VALUE)
-	if err == nil {
-		currentEnable, _, _ = key.GetIntegerValue("ProxyEnable")
-		currentServer, _, _ = key.GetStringValue("ProxyServer")
-		key.Close()
-	}
+    // 2. 初始图标状态
+    updateIconByState(StateStop)
 
-	wantProxy := getIniConfig("system_proxy_enabled") == "true"
-	isMyAddr := (currentServer == DEFAULT_PROXY_ADDR)
+    // 3. 创建 UI 菜单
+    mWeb := systray.AddMenuItem("进入控制面板", "打开 Web UI 界面")
+    systray.AddSeparator()
 
-	if !isMyAddr {
-		// 如果系统代理被其他软件改了，或者为空
-		if wantProxy {
-			setProxyRegistry(true) // 强制拿回控制权
-		} else {
-			setProxyRegistry(false) // 确保彻底关闭
-		}
-	} else {
-		// 如果地址是我们的，检查开关是否同步
-		if currentEnable == 1 && !wantProxy {
-			saveIniConfig("system_proxy_enabled", "true")
-		} else if currentEnable == 0 && wantProxy {
-			setProxyRegistry(true)
-		}
-	}
-	// --- 纠正逻辑结束 ---
+    // 模式切换菜单：利用一个小 Map 简化排他逻辑
+    curMode := getIniConfig("mode")
+    modeMenus := make(map[string]*systray.MenuItem)
+    modeMenus["rule"] = systray.AddMenuItemCheckbox("规则模式", "", curMode == "rule" || curMode == "")
+    modeMenus["global"] = systray.AddMenuItemCheckbox("全局模式", "", curMode == "global")
+    modeMenus["direct"] = systray.AddMenuItemCheckbox("直连模式", "", curMode == "direct")
+    systray.AddSeparator()
 
-	// 2. 初始化图标状态（初始设为停止色）
-	updateIconByState(StateStop)
+    // 功能开关菜单
+    mTun := systray.AddMenuItemCheckbox("TUN 模式", "虚拟网卡接接管", getIniConfig("tun_enabled") == "true")
+    mProxy := systray.AddMenuItemCheckbox("系统代理", "修改注册表代理", getIniConfig("system_proxy_enabled") == "true")
+    systray.AddSeparator()
 
-	// 3. 创建 UI 菜单
-	mWeb := systray.AddMenuItem("进入控制面板", "打开 Web UI 界面")
-	systray.AddSeparator()
+    // 管理菜单
+    mReloadYAML := systray.AddMenuItem("更新 YAML 配置", "热重载 config.yaml")
+    mAuto := systray.AddMenuItemCheckbox("开机自启", "", getIniConfig("auto_start") == "true")
+    mDir := systray.AddMenuItem("浏览本地文件", "打开程序所在目录")
+    mRestart := systray.AddMenuItem("重启内核", "强制杀死并重启内核")
+    systray.AddSeparator()
+    
+    mExit := systray.AddMenuItem("退出程序", "")
 
-	// 模式切换菜单（单选逻辑）
-	curMode := getIniConfig("mode")
-	mModeR := systray.AddMenuItemCheckbox("规则模式", "", curMode == "rule" || curMode == "")
-	mModeG := systray.AddMenuItemCheckbox("全局模式", "", curMode == "global")
-	mModeD := systray.AddMenuItemCheckbox("直连模式", "", curMode == "direct")
-	systray.AddSeparator()
+    // 4. 暴力事件循环
+    for {
+        select {
+        case <-mWeb.ClickedCh:
+            windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(API_URL+"/ui"), nil, nil, windows.SW_SHOWNORMAL)
 
-	// 功能开关菜单
-	mTun := systray.AddMenuItemCheckbox("TUN 模式", "虚拟网卡接管全身流量", getIniConfig("tun_enabled") == "true")
-	mProxy := systray.AddMenuItemCheckbox("系统代理", "修改注册表代理设置", getIniConfig("system_proxy_enabled") == "true")
-	systray.AddSeparator()
+        // 模式切换的暴力排他：点哪个，哪个就 Check，其他的全部 Uncheck
+        case <-modeMenus["rule"].ClickedCh:
+            setMihomoMode("rule")
+            modeMenus["rule"].Check(); modeMenus["global"].Uncheck(); modeMenus["direct"].Uncheck()
+        case <-modeMenus["global"].ClickedCh:
+            setMihomoMode("global")
+            modeMenus["rule"].Uncheck(); modeMenus["global"].Check(); modeMenus["direct"].Uncheck()
+        case <-modeMenus["direct"].ClickedCh:
+            setMihomoMode("direct")
+            modeMenus["rule"].Uncheck(); modeMenus["global"].Uncheck(); modeMenus["direct"].Check()
 
-	// 配置与管理菜单
-	mReloadYAML := systray.AddMenuItem("更新 YAML 配置", "手动修改 YAML 后点击此处热重载")
-	mAuto := systray.AddMenuItemCheckbox("开机自启", "", getIniConfig("auto_start") == "true")
-	mDir := systray.AddMenuItem("浏览本地文件", "打开程序所在目录")
-	mRestart := systray.AddMenuItem("重启内核", "强制杀死并重启 mihomo.exe")
-	systray.AddSeparator()
-	
-	mExit := systray.AddMenuItem("退出程序", "")
+        case <-mTun.ClickedCh:
+            next := !mTun.Checked()
+            setTunMode(next) // 内部已包含 saveIniConfig 和 API 推送
+            if next { mTun.Check() } else { mTun.Uncheck() }
 
-	// 4. 事件循环：监听菜单点击
-	for {
-		select {
-		case <-mWeb.ClickedCh:
-			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(API_URL+"/ui"), nil, nil, windows.SW_SHOWNORMAL)
+        case <-mProxy.ClickedCh:
+            next := !mProxy.Checked()
+            // 暴力：先改真理，再改注册表
+            saveIniConfig("system_proxy_enabled", fmt.Sprint(next))
+            setProxyRegistry(next)
+            if next { mProxy.Check() } else { mProxy.Uncheck() }
 
-		case <-mModeR.ClickedCh:
-			setMihomoMode("rule")
-			mModeR.Check(); mModeG.Uncheck(); mModeD.Uncheck()
-		case <-mModeG.ClickedCh:
-			setMihomoMode("global")
-			mModeR.Uncheck(); mModeG.Check(); mModeD.Uncheck()
-		case <-mModeD.ClickedCh:
-			setMihomoMode("direct")
-			mModeR.Uncheck(); mModeG.Uncheck(); mModeD.Check()
+        case <-mReloadYAML.ClickedCh:
+            go reloadConfigFile()
 
-		case <-mTun.ClickedCh:
-			next := !mTun.Checked()
-			setTunMode(next)
-			if next { mTun.Check() } else { mTun.Uncheck() }
+        case <-mAuto.ClickedCh:
+            next := !mAuto.Checked()
+            toggleAutoStart(next)
+            if next { mAuto.Check() } else { mAuto.Uncheck() }
 
-		case <-mProxy.ClickedCh:
-			next := !mProxy.Checked()
-			setProxyRegistry(next)
-			if next { mProxy.Check() } else { mProxy.Uncheck() }
-
-		case <-mReloadYAML.ClickedCh:
-			// 执行热重载逻辑
-			go reloadConfigFile()
-
-		case <-mAuto.ClickedCh:
-			next := !mAuto.Checked()
-			toggleAutoStart(next)
-			if next { mAuto.Check() } else { mAuto.Uncheck() }
-
-		case <-mDir.ClickedCh:
-			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
+        case <-mDir.ClickedCh:
+            // 直接打开 baseDir，省去不必要的路径拼接
+            windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
 
         case <-mRestart.ClickedCh:
-            // 1. 异步执行，避免阻塞 UI
             go func() {
-                // 2. 这里的 killCmd 已经正确设置了隐藏窗口
-                killCmd := exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe")
+                // 1. 无差别屠杀旧内核
+                killCmd := exec.Command("cmd", "/c", "taskkill /F /T /IM mihomo.exe")
                 killCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
                 _ = killCmd.Run()
 
-                // 3. 关键：重置 onceSync，这样 monitor 重新拉起内核后，会触发一次配置同步
+                // 2. 关键：重置同步锁，让 monitor 拉起后能强制推送配置
                 configMu.Lock()
                 onceSync = sync.Once{}
                 configMu.Unlock()
-                
-                // 提示：monitorKernelDaemon 会在 2 秒内检测到进程消失并自动重启它
             }()
 
         case <-mExit.ClickedCh:
+            // 标记退出，触发 onExit 里的清理流程
             isReallyExiting = true
             systray.Quit()
-            return // 退出事件循环，结束协程			
-		}
-	}
+            return
+        }
+    }
 }
 func onExit() {
     if isReallyExiting {
@@ -519,7 +486,9 @@ func setTunMode(enable bool) {
 }
 
 func setProxyRegistry(enable bool) {
-    saveIniConfig("system_proxy_enabled", fmt.Sprint(enable))
+    if !isReallyExiting {
+        saveIniConfig("system_proxy_enabled", fmt.Sprint(enable))
+    }
     
     key, err := registry.OpenKey(registry.CURRENT_USER, REG_PROXY, registry.SET_VALUE)
     if err != nil {
@@ -528,14 +497,11 @@ func setProxyRegistry(enable bool) {
     defer key.Close()
 
     if enable {
-        // 开启代理：强制写入开关为 1，且地址必须是你的内核地址
         _ = key.SetDWordValue("ProxyEnable", 1)
         _ = key.SetStringValue("ProxyServer", DEFAULT_PROXY_ADDR)
     } else {
-        // 关闭代理：写入开关为 0
         _ = key.SetDWordValue("ProxyEnable", 0)
-        // 可选：清空地址以防干扰
-        _ = key.SetStringValue("ProxyServer", "")
+
     }
 }
 
