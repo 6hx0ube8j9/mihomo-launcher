@@ -42,16 +42,16 @@ const (
 
 var (
 	// --- 状态控制 ---
-	isReallyExiting      bool          // 是否正在执行彻底退出
-	isSystemInitializing = true          // 是否处于系统启动初始阶段
-	lastState            = -1          // 记录上一次的图标状态
-	tunErrorCounter      = 0           // TUN 模式异常计数器
+	isReallyExiting      bool
+	isSystemInitializing = true
+	lastState            = -1
+	tunErrorCounter      = 0
 
 	// --- 句柄与并发控制 ---
-	hJob     windows.Handle          // Windows Job Object 句柄
-	hMutex   windows.Handle          // 程序单实例互斥锁句柄
-	onceSync sync.Once               // 确保内核启动后只执行一次配置同步
-	configMu sync.RWMutex            // 保护 configData 的读写锁
+	hJob     windows.Handle
+	hMutex   windows.Handle
+	onceSync sync.Once
+	configMu sync.RWMutex
 
 	// --- 网络与路径 ---
 	httpClient = &http.Client{Timeout: 1 * time.Second}
@@ -63,8 +63,10 @@ var (
 
 	// --- UI 组件 ---
 	mTun        *systray.MenuItem
-	mReloadYAML *systray.MenuItem // 补全全局声明以支持 select 访问
+	mReloadYAML *systray.MenuItem
 )
+
+// --- 权限管理 ---
 
 func isAdmin() bool {
 	var token windows.Token
@@ -95,6 +97,8 @@ func initJobObject() {
 	}
 }
 
+// --- 配置文件管理 ---
+
 func loadIniConfigAll() {
 	b, _ := os.ReadFile(filepath.Join(baseDir, CONFIG_FILE))
 	configMu.Lock()
@@ -114,8 +118,8 @@ func loadIniConfigAll() {
 	defaults := map[string]string{
 		"tun_enabled":          "false",
 		"system_proxy_enabled": "false",
-		"mode":                  "rule",
-		"auto_start":            "false",
+		"mode":                 "rule",
+		"auto_start":           "false",
 	}
 
 	needsSave := false
@@ -127,11 +131,7 @@ func loadIniConfigAll() {
 	}
 
 	if needsSave {
-		var buf bytes.Buffer
-		for k, v := range configData {
-			buf.WriteString(fmt.Sprintf("%s = %s\n", k, v))
-		}
-		_ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), buf.Bytes(), 0644)
+		saveConfigNoLock()
 	}
 }
 
@@ -143,17 +143,22 @@ func getIniConfig(key string) string {
 
 func saveIniConfig(key, val string) {
 	configMu.Lock()
+	defer configMu.Unlock()
 	configData[key] = val
+	saveConfigNoLock()
+}
+
+func saveConfigNoLock() {
 	var buf bytes.Buffer
 	for k, v := range configData {
 		if k = strings.TrimSpace(k); k != "" {
 			buf.WriteString(fmt.Sprintf("%s = %s\n", k, v))
 		}
 	}
-	content := buf.Bytes()
-	configMu.Unlock()
-	_ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), content, 0644)
+	_ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), buf.Bytes(), 0644)
 }
+
+// --- 内核通讯与状态监测 ---
 
 func syncConfigToKernel() {
 	configMu.RLock()
@@ -341,6 +346,8 @@ func checkSystemState() int {
 	return StateDefault
 }
 
+// --- UI 与主循环 ---
+
 func onReady() {
 	loadIniConfigAll()
 	setProxyRegistry(getIniConfig("system_proxy_enabled") == "true")
@@ -360,7 +367,7 @@ func onReady() {
 
 	mAuto := systray.AddMenuItemCheckbox("开机自动启动", "", getIniConfig("auto_start") == "true")
 	mDir := systray.AddMenuItem("打开程序目录", "")
-	mReloadYAML = systray.AddMenuItem("重载配置文件", "") // 注意此处已改为全局变量引用
+	mReloadYAML = systray.AddMenuItem("重载配置文件", "")
 	mRestart := systray.AddMenuItem("重启内核", "")
 	systray.AddSeparator()
 
@@ -372,6 +379,9 @@ func onReady() {
 		time.Sleep(15 * time.Second)
 		isSystemInitializing = false
 	}()
+
+	// 启动 TUN 状态后台监听
+	go watchTunState()
 
 	for {
 		select {
@@ -390,12 +400,17 @@ func onReady() {
 
 		case <-mTun.ClickedCh:
 			next := !mTun.Checked()
+			// 手动切换时必须显式调用 UI 更新
+			if next {
+				mTun.Check()
+			} else {
+				mTun.Uncheck()
+			}
 			setTunMode(next)
 
 		case <-mProxy.ClickedCh:
 			next := !mProxy.Checked()
-			saveIniConfig("system_proxy_enabled", fmt.Sprint(next))
-			setProxyRegistry(next)
+			// 手动切换时必须显式调用 UI 更新
 			if next {
 				mProxy.Check()
 				updateIconByState(StateProxy)
@@ -403,15 +418,24 @@ func onReady() {
 				mProxy.Uncheck()
 				updateIconByState(StateDefault)
 			}
+			saveIniConfig("system_proxy_enabled", fmt.Sprint(next))
+			setProxyRegistry(next)
 
 		case <-mReloadYAML.ClickedCh:
 			go reloadConfigFile()
+
 		case <-mAuto.ClickedCh:
 			next := !mAuto.Checked()
 			toggleAutoStart(next)
-			if next { mAuto.Check() } else { mAuto.Uncheck() }
+			if next {
+				mAuto.Check()
+			} else {
+				mAuto.Uncheck()
+			}
+
 		case <-mDir.ClickedCh:
 			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
+
 		case <-mRestart.ClickedCh:
 			killCmd := exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe")
 			killCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
@@ -437,6 +461,8 @@ func onExit() {
 		}
 	}
 }
+
+// --- 功能实现细节 ---
 
 func setMihomoMode(mode string) {
 	saveIniConfig("mode", mode)
@@ -489,11 +515,11 @@ func toggleAutoStart(enable bool) {
 
 func updateIconByState(state int) {
 	files := []string{
-		"stop.ico",    // 0: StateStop
-		"error.ico",   // 1: StateError
-		"tun.ico",     // 2: StateTun
-		"proxy.ico",   // 3: StateProxy
-		"default.ico", // 4: StateDefault
+		"stop.ico",
+		"error.ico",
+		"tun.ico",
+		"proxy.ico",
+		"default.ico",
 	}
 
 	if state < 0 || state >= len(files) {
@@ -532,8 +558,9 @@ func watchTunState() {
 	)
 
 	for {
+		// 监听网络状态变化
 		procNotifyAddrChange.Call(uintptr(unsafe.Pointer(&handle)), uintptr(unsafe.Pointer(&overlapped)))
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(1 * time.Second) // 稍微放长一点避免高频刷新
 
 		hasTun := false
 		ifaces, _ := net.Interfaces()
@@ -545,20 +572,18 @@ func watchTunState() {
 			}
 		}
 
-		if mTun != nil && hasTun != mTun.Checked() {
-			if hasTun {
+		// 只有当实际网卡状态和 UI 勾选不一致时才强制刷新 UI
+		if mTun != nil {
+			if hasTun && !mTun.Checked() {
 				mTun.Check()
 				updateIconByState(StateTun)
-			} else {
+			} else if !hasTun && mTun.Checked() {
 				mTun.Uncheck()
 				if getIniConfig("system_proxy_enabled") == "true" {
 					updateIconByState(StateProxy)
 				} else {
 					updateIconByState(StateDefault)
 				}
-			}
-			if !isSystemInitializing {
-				saveIniConfig("tun_enabled", fmt.Sprint(hasTun))
 			}
 		}
 	}
@@ -593,7 +618,7 @@ func main() {
 	initJobObject()
 
 	go monitorKernelDaemon()
-	go monitorIconState() 
+	go monitorIconState()
 
 	systray.Run(onReady, onExit)
 }
