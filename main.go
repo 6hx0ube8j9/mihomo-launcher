@@ -41,16 +41,29 @@ const (
 )
 
 var (
-	isReallyExiting bool
-	hJob            windows.Handle
-	hMutex          windows.Handle
-	httpClient      = &http.Client{Timeout: 1 * time.Second}
-	exePath, _      = os.Executable()
-	baseDir         = filepath.Dir(exePath)
-	configData      = make(map[string]string)
-	configMu        sync.RWMutex
-	mTun            *systray.MenuItem
-	isSystemInitializing = true
+	// --- 状态控制 ---
+	isReallyExiting      bool          // 是否正在执行彻底退出
+	isSystemInitializing = true          // 是否处于系统启动初始阶段
+	lastState            = -1          // 记录上一次的图标状态
+	tunErrorCounter      = 0           // TUN 模式异常计数器
+
+	// --- 句柄与并发控制 ---
+	hJob     windows.Handle          // Windows Job Object 句柄
+	hMutex   windows.Handle          // 程序单实例互斥锁句柄
+	onceSync sync.Once               // 确保内核启动后只执行一次配置同步
+	configMu sync.RWMutex            // 保护 configData 的读写锁
+
+	// --- 网络与路径 ---
+	httpClient = &http.Client{Timeout: 1 * time.Second}
+	exePath, _ = os.Executable()
+	baseDir    = filepath.Dir(exePath)
+
+	// --- 配置存储 ---
+	configData = make(map[string]string)
+
+	// --- UI 组件 ---
+	mTun        *systray.MenuItem
+	mReloadYAML *systray.MenuItem // 补全全局声明以支持 select 访问
 )
 
 func isAdmin() bool {
@@ -143,42 +156,44 @@ func saveIniConfig(key, val string) {
 }
 
 func syncConfigToKernel() {
-	go func() {
-		for i := 0; i < 20; i++ {
-			configMu.RLock()
-			tun := configData["tun_enabled"] == "true"
-			mode := configData["mode"]
-			if mode == "" { mode = "rule" }
-			configMu.RUnlock()
+	configMu.RLock()
+	tun := configData["tun_enabled"] == "true"
+	mode := configData["mode"]
+	if mode == "" {
+		mode = "rule"
+	}
+	proxy := configData["system_proxy_enabled"] == "true"
+	configMu.RUnlock()
 
-			payload := map[string]interface{}{
-				"mode": mode,
-				"tun":  map[string]bool{"enable": tun},
-			}
-			jsonPayload, _ := json.Marshal(payload)
+	payload := map[string]interface{}{
+		"mode": mode,
+		"tun":  map[string]bool{"enable": tun},
+	}
+	jsonPayload, _ := json.Marshal(payload)
 
-			req, err := http.NewRequest("PATCH", API_URL+"/configs", bytes.NewBuffer(jsonPayload))
-			if err == nil {
-				req.Header.Set("Content-Type", "application/json")
-				resp, err := httpClient.Do(req)
-				if err == nil {
-					defer resp.Body.Close()
-					if resp.StatusCode == 204 || resp.StatusCode == 200 {
-						return 
-					}
-				}
-			}
-			time.Sleep(1 * time.Second)
+	req, err := http.NewRequest("PATCH", API_URL+"/configs", bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/json")
+	resp, err := httpClient.Do(req)
+	if err == nil {
+		defer resp.Body.Close()
+		if (resp.StatusCode == 204 || resp.StatusCode == 200) && proxy {
+			setProxyRegistry(true)
 		}
-	}()
+	}
 }
 
 func monitorKernelDaemon() {
 	target := filepath.Join(baseDir, "mihomo.exe")
 	for {
-		if isReallyExiting { return }
+		if isReallyExiting {
+			return
+		}
 
 		if !isProcessRunning("mihomo.exe") {
+			onceSync = sync.Once{}
 			killCmd := exec.Command("taskkill", "/F", "/IM", "mihomo.exe", "/T")
 			killCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 			_ = killCmd.Run()
@@ -196,7 +211,8 @@ func monitorKernelDaemon() {
 					_ = windows.AssignProcessToJobObject(hJob, hp)
 					windows.CloseHandle(hp)
 				}
-				syncConfigToKernel()
+				time.Sleep(1 * time.Second)
+				syncInitialState()
 				_ = cmd.Wait()
 			}
 		}
@@ -204,25 +220,125 @@ func monitorKernelDaemon() {
 	}
 }
 
+func syncInitialState() {
+	hasTun := false
+	ifaces, _ := net.Interfaces()
+	for _, i := range ifaces {
+		name := strings.ToLower(i.Name)
+		if strings.Contains(name, "mihomo") || strings.Contains(name, "meta") {
+			hasTun = true
+			break
+		}
+	}
+	if hasTun {
+		updateIconByState(StateTun)
+	} else if getIniConfig("system_proxy_enabled") == "true" {
+		updateIconByState(StateProxy)
+	} else {
+		updateIconByState(StateDefault)
+	}
+}
+
 func isProcessRunning(name string) bool {
 	h, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
-	if err != nil { return false }
+	if err != nil {
+		return false
+	}
 	defer windows.CloseHandle(h)
 
 	var pe windows.ProcessEntry32
 	pe.Size = uint32(unsafe.Sizeof(pe))
 	currPid := uint32(os.Getpid())
 
-	if err := windows.Process32First(h, &pe); err != nil { return false }
+	if err := windows.Process32First(h, &pe); err != nil {
+		return false
+	}
 	for {
 		pname := windows.UTF16ToString(pe.ExeFile[:])
 		if strings.EqualFold(pname, name) && pe.ProcessID != currPid {
 			return true
 		}
 		pe.Size = uint32(unsafe.Sizeof(pe))
-		if err := windows.Process32Next(h, &pe); err != nil { break }
+		if err := windows.Process32Next(h, &pe); err != nil {
+			break
+		}
 	}
 	return false
+}
+
+func monitorIconState() {
+	for {
+		if isReallyExiting {
+			return
+		}
+
+		var curr int
+		if !isProcessRunning("mihomo.exe") {
+			curr = StateStop
+		} else {
+			curr = checkSystemState()
+		}
+
+		if curr != lastState {
+			updateIconByState(curr)
+			lastState = curr
+		}
+		time.Sleep(1 * time.Second)
+	}
+}
+
+func checkSystemState() int {
+	if !isProcessRunning("mihomo.exe") {
+		tunErrorCounter = 0
+		return StateStop
+	}
+
+	resp, err := httpClient.Get(API_URL)
+	if err != nil {
+		tunErrorCounter = 0
+		return StateStop
+	}
+	resp.Body.Close()
+
+	onceSync.Do(func() {
+		go syncConfigToKernel()
+	})
+
+	configMu.RLock()
+	wantTun := configData["tun_enabled"] == "true"
+	wantProxy := configData["system_proxy_enabled"] == "true"
+	configMu.RUnlock()
+
+	if wantTun {
+		hasTun := false
+		ifaces, _ := net.Interfaces()
+		for _, i := range ifaces {
+			name := strings.ToLower(i.Name)
+			if strings.Contains(name, "mihomo") || strings.Contains(name, "meta") || strings.Contains(name, "clash") {
+				hasTun = true
+				break
+			}
+		}
+
+		if hasTun {
+			tunErrorCounter = 0
+			return StateTun
+		} else {
+			tunErrorCounter++
+			if tunErrorCounter > 5 {
+				return StateError
+			}
+			return StateStop
+		}
+	}
+
+	if wantProxy {
+		tunErrorCounter = 0
+		return StateProxy
+	}
+
+	tunErrorCounter = 0
+	return StateDefault
 }
 
 func onReady() {
@@ -244,7 +360,7 @@ func onReady() {
 
 	mAuto := systray.AddMenuItemCheckbox("开机自动启动", "", getIniConfig("auto_start") == "true")
 	mDir := systray.AddMenuItem("打开程序目录", "")
-	mReloadYAML := systray.AddMenuItem("重载配置文件", "")
+	mReloadYAML = systray.AddMenuItem("重载配置文件", "") // 注意此处已改为全局变量引用
 	mRestart := systray.AddMenuItem("重启内核", "")
 	systray.AddSeparator()
 
@@ -313,8 +429,12 @@ func onExit() {
 	if isReallyExiting {
 		setProxyRegistry(false)
 		time.Sleep(50 * time.Millisecond)
-		if hJob != 0 { windows.CloseHandle(hJob) }
-		if hMutex != 0 { windows.CloseHandle(hMutex) }
+		if hJob != 0 {
+			windows.CloseHandle(hJob)
+		}
+		if hMutex != 0 {
+			windows.CloseHandle(hMutex)
+		}
 	}
 }
 
@@ -323,7 +443,9 @@ func setMihomoMode(mode string) {
 	payload := map[string]string{"mode": mode}
 	jsonBody, _ := json.Marshal(payload)
 	req, _ := http.NewRequest("PATCH", API_URL+"/configs", bytes.NewBuffer(jsonBody))
-	if resp, err := httpClient.Do(req); err == nil { resp.Body.Close() }
+	if resp, err := httpClient.Do(req); err == nil {
+		resp.Body.Close()
+	}
 }
 
 func setTunMode(enable bool) {
@@ -331,7 +453,9 @@ func setTunMode(enable bool) {
 	payload := map[string]interface{}{"tun": map[string]bool{"enable": enable}}
 	jsonBody, _ := json.Marshal(payload)
 	req, _ := http.NewRequest("PATCH", API_URL+"/configs", bytes.NewBuffer(jsonBody))
-	if resp, err := httpClient.Do(req); err == nil { resp.Body.Close() }
+	if resp, err := httpClient.Do(req); err == nil {
+		resp.Body.Close()
+	}
 }
 
 func setProxyRegistry(enable bool) {
@@ -339,7 +463,9 @@ func setProxyRegistry(enable bool) {
 		saveIniConfig("system_proxy_enabled", fmt.Sprint(enable))
 	}
 	key, err := registry.OpenKey(registry.CURRENT_USER, REG_PROXY, registry.SET_VALUE)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer key.Close()
 
 	if enable {
@@ -362,19 +488,39 @@ func toggleAutoStart(enable bool) {
 }
 
 func updateIconByState(state int) {
-	files := []string{"stop.ico", "error.ico", "tun.ico", "proxy.ico", "default.ico"}
-	if state < 0 || state >= len(files) { return }
+	files := []string{
+		"stop.ico",    // 0: StateStop
+		"error.ico",   // 1: StateError
+		"tun.ico",     // 2: StateTun
+		"proxy.ico",   // 3: StateProxy
+		"default.ico", // 4: StateDefault
+	}
+
+	if state < 0 || state >= len(files) {
+		return
+	}
+
 	b, err := iconFs.ReadFile("icons/" + files[state])
-	if err == nil { systray.SetIcon(b) }
+	if err == nil {
+		systray.SetIcon(b)
+	}
 }
 
 func reloadConfigFile() {
 	configPath := filepath.Join(baseDir, "config.yaml")
-	body := map[string]interface{}{"path": configPath}
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		return
+	}
+	body := map[string]string{"path": configPath}
 	jsonPayload, _ := json.Marshal(body)
-	req, _ := http.NewRequest("PUT", API_URL+"/configs?force=true", bytes.NewBuffer(jsonPayload))
+	req, err := http.NewRequest("PATCH", API_URL+"/configs", bytes.NewBuffer(jsonPayload))
+	if err != nil {
+		return
+	}
 	req.Header.Set("Content-Type", "application/json")
-	if resp, err := httpClient.Do(req); err == nil { resp.Body.Close() }
+	if resp, err := httpClient.Do(req); err == nil {
+		defer resp.Body.Close()
+	}
 }
 
 func watchTunState() {
@@ -399,7 +545,7 @@ func watchTunState() {
 			}
 		}
 
-		if mTun != nil {
+		if mTun != nil && hasTun != mTun.Checked() {
 			if hasTun {
 				mTun.Check()
 				updateIconByState(StateTun)
@@ -411,7 +557,6 @@ func watchTunState() {
 					updateIconByState(StateDefault)
 				}
 			}
-
 			if !isSystemInitializing {
 				saveIniConfig("tun_enabled", fmt.Sprint(hasTun))
 			}
@@ -422,16 +567,24 @@ func watchTunState() {
 func main() {
 	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
 	h, err := windows.CreateMutex(nil, false, mName)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
+
 	event, _ := windows.WaitForSingleObject(h, 0)
 	if event == uint32(windows.WAIT_TIMEOUT) || event == uint32(windows.WAIT_FAILED) {
-		if h != 0 { windows.CloseHandle(h) }
+		if h != 0 {
+			windows.CloseHandle(h)
+		}
 		return
 	}
 	hMutex = h
 
 	if !isAdmin() {
-		if hMutex != 0 { windows.CloseHandle(hMutex); hMutex = 0 }
+		if hMutex != 0 {
+			windows.CloseHandle(hMutex)
+			hMutex = 0
+		}
 		runAsAdmin()
 		os.Exit(0)
 	}
@@ -440,7 +593,7 @@ func main() {
 	initJobObject()
 
 	go monitorKernelDaemon()
-	go watchTunState()
+	go monitorIconState() 
 
 	systray.Run(onReady, onExit)
 }
