@@ -217,23 +217,59 @@ func monitorKernelDaemon() {
 }
 
 // syncInitialState 用于启动时或内核重启后同步一次图标
+// 暴力同步函数：死磕内核 API 直到成功或超时
 func syncInitialState() {
-	hasTun := false
-	ifaces, _ := net.Interfaces()
-	for _, i := range ifaces {
-		name := strings.ToLower(i.Name)
-		if strings.Contains(name, "mihomo") || strings.Contains(name, "meta") {
-			hasTun = true
+	// 1. 启动即进入保护期，禁止 watchTunState 写入配置文件
+	isSystemInitializing = true
+	fmt.Println("[Init] 进入启动保护期，锁定配置文件写入权限")
+
+	// 2. 循环探测内核 API (最多尝试 20 次)
+	apiReady := false
+	for i := 0; i < 20; i++ {
+		// 尝试请求内核基础接口
+		_, err := httpClient.Get(API_URL)
+		if err == nil {
+			apiReady = true
+			fmt.Printf("[Init] 第 %d 秒：内核 API 已就绪\n", i+1)
 			break
 		}
+		fmt.Printf("[Init] 第 %d 秒：等待内核 API 启动...\n", i+1)
+		time.Sleep(1 * time.Second)
 	}
-	if hasTun {
-		updateIconByState(StateTun)
-	} else if getIniConfig("system_proxy_enabled") == "true" {
-		updateIconByState(StateProxy)
+
+	if apiReady {
+		// 3. 从配置文件读取用户想要的最终状态
+		configMu.RLock()
+		tunWanted := configData["tun_enabled"] == "true"
+		modeWanted := configData["mode"]
+		if modeWanted == "" { modeWanted = "rule" }
+		configMu.RUnlock()
+
+		// 4. 暴力下发指令（这里直接构造请求，不触发会写配置文件的逻辑）
+		payload := map[string]interface{}{
+			"mode": modeWanted,
+			"tun":  map[string]bool{"enable": tunWanted},
+		}
+		jsonBytes, _ := json.Marshal(payload)
+		
+		req, _ := http.NewRequest("PATCH", API_URL+"/configs", bytes.NewBuffer(jsonBytes))
+		req.Header.Set("Content-Type", "application/json")
+		
+		resp, err := httpClient.Do(req)
+		if err == nil {
+			resp.Body.Close()
+			fmt.Printf("[Init] 指令送达成功: TUN=%v, Mode=%s\n", tunWanted, modeWanted)
+		}
 	} else {
-		updateIconByState(StateDefault)
+		fmt.Println("[Init] 警告：内核 API 启动超时，放弃初始同步")
 	}
+
+	// 5. 关键：继续锁定一段时间，给虚拟网卡创建留出充足的“静默时间”
+	// 这样 watchTunState 即使被唤醒，也只能改 UI 图标，不能改配置文件
+	time.Sleep(12 * time.Second)
+	
+	isSystemInitializing = false
+	fmt.Println("[Init] 启动保护期结束，配置权限已放开")
 }
 
 func isProcessRunning(name string) bool {
@@ -264,101 +300,125 @@ func isProcessRunning(name string) bool {
 }
 
 func onReady() {
-	// 1. 加载基础配置与初始化
+	// 1. 初始化基础 UI 加载
 	loadIniConfigAll()
-	setProxyRegistry(getIniConfig("system_proxy_enabled") == "true")
-	updateIconByState(StateStop)
+	systray.SetTooltip("Mihomo Launcher")
 
-	// 2. 托盘菜单布局
-	mWeb := systray.AddMenuItem("进入 Web 面板", "")
-	mProxy := systray.AddMenuItemCheckbox("系统代理", "", getIniConfig("system_proxy_enabled") == "true")
-	mTun = systray.AddMenuItemCheckbox("TUN 模式", "", getIniConfig("tun_enabled") == "true")
+	// 2. 预设菜单状态（完全信任 INI 配置文件）
+	configMu.RLock()
+	initialTun := configData["tun_enabled"] == "true"
+	initialMode := configData["mode"]
+	if initialMode == "" {
+		initialMode = "rule"
+	}
+	configMu.RUnlock()
+
+	mWeb := systray.AddMenuItem("进入控制面板", "")
 	systray.AddSeparator()
 
-	curMode := getIniConfig("mode")
-	modeMenus := make(map[string]*systray.MenuItem)
-	modeMenus["rule"] = systray.AddMenuItemCheckbox("规则模式", "", curMode == "rule" || curMode == "")
-	modeMenus["global"] = systray.AddMenuItemCheckbox("全局模式", "", curMode == "global")
-	modeMenus["direct"] = systray.AddMenuItemCheckbox("直连模式", "", curMode == "direct")
+	// 模式选择菜单
+	mModeR := systray.AddMenuItemCheckbox("规则模式", "", initialMode == "rule")
+	mModeG := systray.AddMenuItemCheckbox("全局模式", "", initialMode == "global")
+	mModeD := systray.AddMenuItemCheckbox("直连模式", "", initialMode == "direct")
 	systray.AddSeparator()
 
-	mAuto := systray.AddMenuItemCheckbox("开机自动启动", "", getIniConfig("auto_start") == "true")
-	mDir := systray.AddMenuItem("打开程序目录", "")
-	mReloadYAML := systray.AddMenuItem("重载配置文件", "")
+	// 状态切换菜单
+	mTun = systray.AddMenuItemCheckbox("TUN 模式", "", initialTun)
+	// 系统代理实时读注册表，确保 UI 准确
+	mSystemProxy := systray.AddMenuItemCheckbox("系统代理", "", isProxyEnabledInRegistry())
+	systray.AddSeparator()
+
+	mAutoRun := systray.AddMenuItemCheckbox("开机自启", "", isAutoRunEnabled())
+	mDir := systray.AddMenuItem("浏览本地文件", "")
 	mRestart := systray.AddMenuItem("重启内核", "")
-	systray.AddSeparator()
-
 	mExit := systray.AddMenuItem("退出程序", "")
 
-	// 3. 【暴力初始化逻辑】
+	// --- 核心逻辑启动区 ---
+
+	// 3. 执行“暴力同步”协程：死磕内核直到配置下发成功
 	go func() {
-		// 锁定配置文件写入权限
-		isSystemInitializing = true
-		
-		// 严格按照 ini 配置下发指令给内核
-		syncConfigToKernel()
-		
-		// 暴力等待 15 秒，期间 watchTunState 只更新 UI，不准改 ini
-		// 即使内核拉起网卡慢，或者中间重启了，也不会覆盖原始配置
-		time.Sleep(15 * time.Second)
-		
-		// 解锁权限，恢复正常的双向同步
+		isSystemInitializing = true // 激活全局锁，禁止 watchTunState 修改 INI
+		fmt.Println("[Init] 启动保护激活，锁定配置文件...")
+
+		apiReady := false
+		for i := 0; i < 20; i++ {
+			_, err := httpClient.Get(API_URL + "/version") // 探测 API 是否存活
+			if err == nil {
+				apiReady = true
+				fmt.Printf("[Init] 第 %d 秒：内核 API 响应成功\n", i+1)
+				break
+			}
+			fmt.Printf("[Init] 第 %d 秒：内核 API 尚未就绪...\n", i+1)
+			time.Sleep(1 * time.Second)
+		}
+
+		if apiReady {
+			fmt.Printf("[Init] 正在同步预设状态: TUN=%v, Mode=%s\n", initialTun, initialMode)
+			
+			payload := map[string]interface{}{
+				"mode": initialMode,
+				"tun":  map[string]bool{"enable": initialTun},
+			}
+			jsonBytes, _ := json.Marshal(payload)
+			req, _ := http.NewRequest("PATCH", API_URL+"/configs", bytes.NewBuffer(jsonBytes))
+			req.Header.Set("Content-Type", "application/json")
+			if resp, err := httpClient.Do(req); err == nil {
+				resp.Body.Close()
+			}
+		}
+
+		// 关键：静默期，给 Windows 虚拟网卡创建留出时间
+		time.Sleep(12 * time.Second)
 		isSystemInitializing = false
+		fmt.Println("[Init] 启动保护结束，移交配置写入权")
 	}()
 
-	// 4. 托盘事件监听循环
+	// 4. 开启系统地址变动监听
+	go watchTunState()
+
+	// --- 事件循环 ---
 	for {
 		select {
 		case <-mWeb.ClickedCh:
-			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(API_URL+"/ui"), nil, nil, windows.SW_SHOWNORMAL)
+			openWebPanel()
 
-		case <-modeMenus["rule"].ClickedCh:
+		case <-mModeR.ClickedCh:
 			setMihomoMode("rule")
-			modeMenus["rule"].Check(); modeMenus["global"].Uncheck(); modeMenus["direct"].Uncheck()
-		case <-modeMenus["global"].ClickedCh:
+			mModeR.Check(); mModeG.Uncheck(); mModeD.Uncheck()
+
+		case <-mModeG.ClickedCh:
 			setMihomoMode("global")
-			modeMenus["rule"].Uncheck(); modeMenus["global"].Check(); modeMenus["direct"].Uncheck()
-		case <-modeMenus["direct"].ClickedCh:
+			mModeR.Uncheck(); mModeG.Check(); mModeD.Uncheck()
+
+		case <-mModeD.ClickedCh:
 			setMihomoMode("direct")
-			modeMenus["rule"].Uncheck(); modeMenus["global"].Uncheck(); modeMenus["direct"].Check()
+			mModeR.Uncheck(); mModeG.Uncheck(); mModeD.Check()
 
 		case <-mTun.ClickedCh:
-			// 这里点击时，如果是初始化 15s 内，虽然 setTunMode 会发请求
-			// 但 watchTunState 的反写锁依然生效，保护了初始逻辑
-			next := !mTun.Checked()
-			setTunMode(next)
-			// 注意：不用在这里手动 Check，由 watchTunState 统一负责 UI 表现
+			// 用户手动操作，不受 isSystemInitializing 限制
+			now := !mTun.Checked()
+			setTunMode(now)
+			if now { mTun.Check() } else { mTun.Uncheck() }
 
-		case <-mProxy.ClickedCh:
-			next := !mProxy.Checked()
-			saveIniConfig("system_proxy_enabled", fmt.Sprint(next))
-			setProxyRegistry(next)
-			if next {
-				mProxy.Check()
-				updateIconByState(StateProxy)
-			} else {
-				mProxy.Uncheck()
-				updateIconByState(StateDefault)
-			}
+		case <-mSystemProxy.ClickedCh:
+			enable := !mSystemProxy.Checked()
+			setProxyRegistry(enable) // 修正函数名引用
+			if enable { mSystemProxy.Check() } else { mSystemProxy.Uncheck() }
 
-		case <-mReloadYAML.ClickedCh:
-			go reloadConfigFile()
-		case <-mAuto.ClickedCh:
-			next := !mAuto.Checked()
-			toggleAutoStart(next)
-			if next { mAuto.Check() } else { mAuto.Uncheck() }
+		case <-mAutoRun.ClickedCh:
+			enable := !mAutoRun.Checked()
+			toggleAutoStart(enable) // 修正函数名引用
+			if enable { mAutoRun.Check() } else { mAutoRun.Uncheck() }
+
 		case <-mDir.ClickedCh:
 			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
+
 		case <-mRestart.ClickedCh:
-			// 重启内核前，如果有必要可以重新锁定（可选）
-			killCmd := exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe")
-			killCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-			_ = killCmd.Run()
+			restartKernel()
 
 		case <-mExit.ClickedCh:
 			isReallyExiting = true
 			systray.Quit()
-			return
 		}
 	}
 }
@@ -503,23 +563,16 @@ func watchTunState() {
 func main() {
 	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
 	h, err := windows.CreateMutex(nil, false, mName)
-	if err != nil {
-		return
-	}
+	if err != nil { return }
 	event, _ := windows.WaitForSingleObject(h, 0)
 	if event == uint32(windows.WAIT_TIMEOUT) || event == uint32(windows.WAIT_FAILED) {
-		if h != 0 {
-			windows.CloseHandle(h)
-		}
+		if h != 0 { windows.CloseHandle(h) }
 		return
 	}
 	hMutex = h
 
 	if !isAdmin() {
-		if hMutex != 0 {
-			windows.CloseHandle(hMutex)
-			hMutex = 0
-		}
+		if hMutex != 0 { windows.CloseHandle(hMutex) }
 		runAsAdmin()
 		os.Exit(0)
 	}
@@ -528,7 +581,5 @@ func main() {
 	initJobObject()
 
 	go monitorKernelDaemon()
-	go watchTunState() // 替换了旧的轮询
-
 	systray.Run(onReady, onExit)
 }
