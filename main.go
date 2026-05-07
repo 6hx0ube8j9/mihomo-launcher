@@ -282,33 +282,34 @@ func checkSystemState() int {
 }
 
 func reloadConfigFile() {
-	configPath := filepath.Join(baseDir, "config.yaml")
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		return
-	}
+    configPath := filepath.Join(baseDir, "config.yaml")
+    // 1. 检查文件是否存在，防止内核找不到文件报错
+    if _, err := os.Stat(configPath); os.IsNotExist(err) {
+        return
+    }
 
-	body := map[string]string{"path": configPath}
-	jsonPayload, _ := json.Marshal(body)
+    // 2. 构造标准 JSON 路径
+    body := map[string]string{"path": configPath}
+    jsonPayload, _ := json.Marshal(body)
 
-	url := API_URL + "/configs"
-	req, err := http.NewRequest("PUT", url, bytes.NewBuffer(jsonPayload))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
+    url := API_URL + "/configs"
+    // 3. 核心：使用 PATCH 模式实现“不重启网卡”的热重载
+    req, err := http.NewRequest("PATCH", url, bytes.NewBuffer(jsonPayload))
+    if err != nil {
+        return
+    }
+    req.Header.Set("Content-Type", "application/json")
 
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
+    // 4. 执行请求
+    resp, err := httpClient.Do(req)
+    if err != nil {
+        return
+    }
+    // 5. 必须关闭 Body 以释放连接句柄
+    defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
-		go func() {
-			time.Sleep(500 * time.Millisecond)
-			syncConfigToKernel()
-		}()
-	}
+    // 此时不需要再调用 syncConfigToKernel()
+    // 因为 PATCH 会让内核重读 config.yaml，并保持当前的 TUN 状态
 }
 
 func isProcessRunning(name string) bool {
@@ -343,9 +344,13 @@ func onReady() {
 	setProxyRegistry(getIniConfig("system_proxy_enabled") == "true")
 	updateIconByState(StateStop)
 
-	mWeb := systray.AddMenuItem("进入控制面板", "")
+	// --- 第一组：核心控制 ---
+	mWeb := systray.AddMenuItem("进入 Web 面板", "")
+	mProxy := systray.AddMenuItemCheckbox("系统代理", "", getIniConfig("system_proxy_enabled") == "true")
+	mTun := systray.AddMenuItemCheckbox("TUN 模式", "", getIniConfig("tun_enabled") == "true")
 	systray.AddSeparator()
 
+	// --- 第二组：内核模式 ---
 	curMode := getIniConfig("mode")
 	modeMenus := make(map[string]*systray.MenuItem)
 	modeMenus["rule"] = systray.AddMenuItemCheckbox("规则模式", "", curMode == "rule" || curMode == "")
@@ -353,21 +358,22 @@ func onReady() {
 	modeMenus["direct"] = systray.AddMenuItemCheckbox("直连模式", "", curMode == "direct")
 	systray.AddSeparator()
 
-	mTun := systray.AddMenuItemCheckbox("TUN 模式", "", getIniConfig("tun_enabled") == "true")
-	mProxy := systray.AddMenuItemCheckbox("系统代理", "", getIniConfig("system_proxy_enabled") == "true")
-	systray.AddSeparator()
-
-	mReloadYAML := systray.AddMenuItem("更新 YAML 配置", "")
-	mAuto := systray.AddMenuItemCheckbox("开开机自启", "", getIniConfig("auto_start") == "true")
-	mDir := systray.AddMenuItem("浏览本地文件", "")
+	// --- 第三组：系统与工具 ---
+	mAuto := systray.AddMenuItemCheckbox("开机自动启动", "", getIniConfig("auto_start") == "true")
+	mDir := systray.AddMenuItem("打开程序目录", "")
+	mReloadYAML := systray.AddMenuItem("重载配置文件", "")
 	mRestart := systray.AddMenuItem("重启内核", "")
 	systray.AddSeparator()
+
+	// --- 第四组：退出 ---
 	mExit := systray.AddMenuItem("退出程序", "")
 
 	for {
 		select {
 		case <-mWeb.ClickedCh:
 			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(API_URL+"/ui"), nil, nil, windows.SW_SHOWNORMAL)
+		
+		// 模式切换
 		case <-modeMenus["rule"].ClickedCh:
 			setMihomoMode("rule")
 			modeMenus["rule"].Check(); modeMenus["global"].Uncheck(); modeMenus["direct"].Uncheck()
@@ -377,6 +383,8 @@ func onReady() {
 		case <-modeMenus["direct"].ClickedCh:
 			setMihomoMode("direct")
 			modeMenus["rule"].Uncheck(); modeMenus["global"].Uncheck(); modeMenus["direct"].Check()
+		
+		// TUN 与 代理
 		case <-mTun.ClickedCh:
 			next := !mTun.Checked()
 			setTunMode(next)
@@ -386,6 +394,8 @@ func onReady() {
 			saveIniConfig("system_proxy_enabled", fmt.Sprint(next))
 			setProxyRegistry(next)
 			if next { mProxy.Check() } else { mProxy.Uncheck() }
+		
+		// 工具类
 		case <-mReloadYAML.ClickedCh:
 			go reloadConfigFile()
 		case <-mAuto.ClickedCh:
@@ -403,6 +413,8 @@ func onReady() {
 				onceSync = sync.Once{}
 				configMu.Unlock()
 			}()
+		
+		// 退出
 		case <-mExit.ClickedCh:
 			isReallyExiting = true
 			systray.Quit()
@@ -487,30 +499,58 @@ func updateIconByState(state int) {
 }
 
 func main() {
+	// 1. 尽早初始化 Mutex 名
 	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
+
+	// 2. 尝试创建 Mutex
+	// 注意：这里不要直接用 hMutex 赋值，先用局部变量处理
 	h, err := windows.CreateMutex(nil, false, mName)
-	if err != nil && err.(windows.Errno) == windows.ERROR_ALREADY_EXISTS {
+	if err != nil {
+		// 系统错误直接退出
+		return
+	}
+
+	// 3. 【核心加固】检查锁状态
+	// 如果 Mutex 已存在，CreateMutex 会返回 ERROR_ALREADY_EXISTS
+	// 但为了 100% 拦截极速双击，我们使用 WaitForSingleObject 探测锁的拥有权
+	event, _ := windows.WaitForSingleObject(h, 0)
+	if event == uint32(windows.WAIT_TIMEOUT) || event == uint32(windows.WAIT_FAILED) {
+		// 锁被占用，说明已有实例在运行，直接关闭句柄并退出
 		if h != 0 {
 			windows.CloseHandle(h)
 		}
 		return
 	}
+	
+	// 成功抢到锁，赋值给全局变量供后续管理
 	hMutex = h
 
+	// 4. 权限检查与提升
 	if !isAdmin() {
+		// 在启动管理员副本前，先释放当前的 Mutex 句柄
+		// 这样管理员权限的新进程才能顺利拿到锁
 		if hMutex != 0 {
 			windows.CloseHandle(hMutex)
 			hMutex = 0
 		}
+		
 		runAsAdmin()
+		
+		// 【关键】提权指令发出后，旧进程必须立即退出，不留任何重叠时间
 		os.Exit(0)
 	}
 
+	// 5. 进入正式运行环境
+	// 切换工作目录到 exe 所在目录，确保相对路径文件能被正确找到
 	os.Chdir(baseDir)
+	
+	// 初始化 JobObject，确保 Launcher 退出时内核跟着退出
 	initJobObject()
 
-	go monitorKernelDaemon()
-	go monitorIconState()
+	// 6. 启动后台守护协程
+	go monitorKernelDaemon() // 守护内核进程
+	go monitorIconState()    // 监控 API 状态并切换托盘图标
 
+	// 7. 启动托盘程序（此函数会阻塞，直到调用 systray.Quit）
 	systray.Run(onReady, onExit)
 }
