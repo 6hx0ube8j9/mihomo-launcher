@@ -1,22 +1,31 @@
-name: Get Mod Content
-on: workflow_dispatch 
+name: Build Launcher
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
 
 jobs:
-  get-content:
+  build:
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-go@v5
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
         with:
-          go-version: '1.22'
-      - name: Generate
+          go-version: '1.25' 
+          cache: true   
+
+      - name: Build EXE
         shell: pwsh
         run: |
-          go mod init mihomo-launcher
-          go mod tidy
-          Write-Host "---------- COPY START: GO.MOD ----------"
-          Get-Content go.mod
-          Write-Host "---------- COPY END: GO.MOD ----------"
-          Write-Host "---------- COPY START: GO.SUM ----------"
-          Get-Content go.sum
-          Write-Host "---------- COPY END: GO.SUM ----------"
+          $env:CGO_ENABLED="1"
+          go build -ldflags="-s -w -H windowsgui" -o mihomo-launcher.exe main.go
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: mihomo-launcher
+          path: mihomo-launcher.exe
