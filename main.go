@@ -29,16 +29,17 @@ const (
 	CONFIG_FILE = "mihomo-launcher.ini"
 	TASK_NAME   = "MihomoLauncherTask"
 
-	StateStop    = 0 // 红色：内核进程消失
-	StateError   = 1 // 黄色：TUN 开启但网卡缺失
-	StateTun     = 2 // 绿色：TUN 正常
-	StateProxy   = 3 // 蓝色：系统代理正常
-	StateDefault = 4 // 灰色：仅内核运行
+	StateStop    = 0 // 红色
+	StateError   = 1 // 黄色
+	StateTun     = 2 // 绿色
+	StateProxy   = 3 // 蓝色
+	StateDefault = 4 // 灰色
 )
 
 var (
 	isReallyExiting bool
 	silenceUntil    time.Time
+	errorStartTime  time.Time
 	onceSync        sync.Once
 	hJob, hMutex    windows.Handle
 	httpClient      = &http.Client{Timeout: 1 * time.Second}
@@ -85,13 +86,13 @@ func loadAndCleanConfig() {
 	configMu.Lock()
 	defer configMu.Unlock()
 	b, _ := os.ReadFile(filepath.Join(baseDir, CONFIG_FILE))
-	for _, line := range strings.Split(string(b), "\n") {
+	lines := strings.Split(string(b), "\n")
+	for _, line := range lines {
 		line = strings.TrimSpace(line)
 		if parts := strings.SplitN(line, "=", 2); len(parts) == 2 {
 			configData[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
 		}
 	}
-	// 默认值补充
 	defaults := map[string]string{
 		"mode": "rule", "tun_enabled": "false", "system_proxy_enabled": "false",
 		"proxy_address": "127.0.0.1:7890", "tun_device_name": "Mihomo",
@@ -108,7 +109,9 @@ func syncIniToDisk() {
 	order := []string{"mode", "tun_enabled", "system_proxy_enabled", "startup_enabled", "proxy_address", "tun_device_name", "external-controller", "secret"}
 	var buf bytes.Buffer
 	for _, k := range order {
-		if v, ok := configData[k]; ok { buf.WriteString(fmt.Sprintf("%s = %s\n", k, v)) }
+		if v, ok := configData[k]; ok {
+			buf.WriteString(fmt.Sprintf("%s = %s\n", k, v))
+		}
 	}
 	_ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), buf.Bytes(), 0644)
 }
@@ -127,14 +130,13 @@ func getConfig(k string) string {
 	return configData[k]
 }
 
-// --- 状态感知核心 ---
+// --- 状态感知核心 (含 Error 不插队逻辑) ---
 
 func isTunActive() bool {
 	target := strings.ToLower(getConfig("tun_device_name"))
 	ifaces, _ := net.Interfaces()
 	for _, i := range ifaces {
 		name := strings.ToLower(i.Name)
-		// 名字匹配且状态为 Up
 		if (strings.Contains(name, target) || strings.Contains(name, "wintun")) && (i.Flags&net.FlagUp) != 0 {
 			return true
 		}
@@ -159,18 +161,34 @@ func monitorLoop() {
 
 				wantTun := getConfig("tun_enabled") == "true"
 				wantProxy := getConfig("system_proxy_enabled") == "true"
-				
+				tunActive := isTunActive()
+
 				if wantTun {
-					if isTunActive() { curr = StateTun } else { curr = StateError }
+					if tunActive {
+						curr = StateTun
+						errorStartTime = time.Time{}
+					} else {
+						// Error 不插队逻辑：网卡缺失时进入观察期
+						if errorStartTime.IsZero() {
+							errorStartTime = time.Now()
+							curr = lastState // 保持上一次状态，不跳黄
+						} else if time.Since(errorStartTime) > 5*time.Second {
+							curr = StateError // 5秒后还没网卡，才报黄
+						} else {
+							curr = lastState // 观察期内，不准黄色插队
+						}
+					}
 				} else if wantProxy {
 					curr = StateProxy
+					errorStartTime = time.Time{}
 				} else {
 					curr = StateDefault
+					errorStartTime = time.Time{}
 				}
 			}
 		}
 
-		if curr != lastState {
+		if curr != lastState && curr != -1 {
 			updateIcon(curr)
 			lastState = curr
 		}
@@ -206,7 +224,7 @@ func updateIcon(state int) {
 	}
 }
 
-// --- 托盘事件 ---
+// --- 托盘主程序 ---
 
 func onReady() {
 	loadAndCleanConfig()
@@ -220,7 +238,7 @@ func onReady() {
 
 	modeItems := make(map[string]*systray.MenuItem)
 	for _, m := range []string{"rule", "global", "direct"} {
-		label := map[string]string{"rule":"规则模式","global":"全局模式","direct":"直连模式"}[m]
+		label := map[string]string{"rule": "规则模式", "global": "全局模式", "direct": "直连模式"}[m]
 		modeItems[m] = systray.AddMenuItemCheckbox(label, "", getConfig("mode") == m)
 	}
 	systray.AddSeparator()
@@ -241,24 +259,37 @@ func onReady() {
 		case <-mTun.ClickedCh:
 			next := !mTun.Checked()
 			silenceUntil = time.Now().Add(3 * time.Second)
+			errorStartTime = time.Time{} // 重置错误计时，给内核启动时间
 			setConfig("tun_enabled", fmt.Sprint(next))
 			syncParamsToKernel()
 			if next { mTun.Check() } else { mTun.Uncheck() }
 		case <-modeItems["rule"].ClickedCh:
 			for k, v := range modeItems { if k == "rule" { v.Check() } else { v.Uncheck() } }
 			setConfig("mode", "rule"); syncParamsToKernel()
+		case <-modeItems["global"].ClickedCh:
+			for k, v := range modeItems { if k == "global" { v.Check() } else { v.Uncheck() } }
+			setConfig("mode", "global"); syncParamsToKernel()
+		case <-modeItems["direct"].ClickedCh:
+			for k, v := range modeItems { if k == "direct" { v.Check() } else { v.Uncheck() } }
+			setConfig("mode", "direct"); syncParamsToKernel()
+		case <-mAuto.ClickedCh:
+			next := !mAuto.Checked()
+			toggleAutoStart(next)
+			if next { mAuto.Check() } else { mAuto.Uncheck() }
 		case <-mRestart.ClickedCh:
 			silenceUntil = time.Now().Add(4 * time.Second)
+			errorStartTime = time.Time{}
 			_ = exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe").Run()
 		case <-mExit.ClickedCh:
 			isReallyExiting = true
 			setProxyRegistry(false)
-			systray.Quit(); return
+			systray.Quit()
+			return
 		}
 	}
 }
 
-// --- 系统集成工具 ---
+// --- 系统工具 ---
 
 func setProxyRegistry(enable bool) {
 	key, _ := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.SET_VALUE)
@@ -267,6 +298,18 @@ func setProxyRegistry(enable bool) {
 		_ = key.SetDWordValue("ProxyEnable", 1)
 		_ = key.SetStringValue("ProxyServer", getConfig("proxy_address"))
 	} else { _ = key.SetDWordValue("ProxyEnable", 0) }
+}
+
+func toggleAutoStart(enable bool) {
+	if enable {
+		_ = exec.Command("schtasks", "/Create", "/TN", TASK_NAME, "/TR", "\""+exePath+"\"", "/SC", "ONLOGON", "/RL", "HIGHEST", "/F").Run()
+	} else {
+		_ = exec.Command("schtasks", "/Delete", "/TN", TASK_NAME, "/F").Run()
+	}
+}
+
+func checkAutoStart() bool {
+	return exec.Command("schtasks", "/Query", "/TN", TASK_NAME).Run() == nil
 }
 
 func isProcessRunning(name string) bool {
@@ -283,13 +326,24 @@ func isProcessRunning(name string) bool {
 func main() {
 	os.Chdir(baseDir)
 	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
-	h, _ := windows.CreateMutex(nil, false, mName)
-	if h != 0 {
-		if st, _ := windows.WaitForSingleObject(h, 0); st != uint32(windows.WAIT_OBJECT_0) { return }
-		hMutex = h
+	for i := 0; i < 3; i++ {
+		h, _ := windows.CreateMutex(nil, false, mName)
+		if h != 0 {
+			if st, _ := windows.WaitForSingleObject(h, 0); st == uint32(windows.WAIT_OBJECT_0) {
+				hMutex = h
+				break
+			}
+			windows.CloseHandle(h)
+		}
+		time.Sleep(100 * time.Millisecond)
 	}
+	if hMutex == 0 { return }
 
-	if !isAdmin() { runAsAdmin(); os.Exit(0) }
+	if !isAdmin() {
+		windows.CloseHandle(hMutex)
+		runAsAdmin()
+		os.Exit(0)
+	}
 
 	initJobObject()
 	go func() {
@@ -311,6 +365,3 @@ func main() {
 	go monitorLoop()
 	systray.Run(onReady, nil)
 }
-
-func toggleAutoStart(e bool) { /* schtasks 代码同上 */ }
-func checkAutoStart() bool { return exec.Command("schtasks", "/Query", "/TN", TASK_NAME).Run() == nil }
