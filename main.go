@@ -73,6 +73,25 @@ func runAsAdmin() {
 	windows.ShellExecute(0, verb, exe, nil, cwd, windows.SW_HIDE)
 }
 
+func isTunInterfaceMatch(ifaceName string) bool {
+	name := strings.ToLower(ifaceName)
+	
+	// 1. 优先匹配从 YAML 嗅探到的 device 名称
+	target := strings.ToLower(getIniConfig("tun_device_name"))
+	if target != "" && strings.Contains(name, target) {
+		return true
+	}
+
+	// 2. 保底匹配：涵盖常见内核默认名
+	keywords := []string{"mihomo", "meta", "clash", "sing-box", "wintun"}
+	for _, kw := range keywords {
+		if strings.Contains(name, kw) {
+			return true
+		}
+	}
+	return false
+}
+
 func initJobObject() {
 	h, _ := windows.CreateJobObject(nil, nil)
 	if h != 0 {
@@ -107,9 +126,10 @@ func ensureDefaultConfig() {
 	defaults := [][]string{
 		{"mode", "rule"},
 		{"tun_enabled", "false"},
-		{"system_proxy", "false"},
+		{"system_proxy_enabled", "false"},
 		{"startup_enabled", "false"},
 		{"proxy_address", "127.0.0.1:7890"},
+		{"tun_device_name", "Mihomo"},
 		{"external-controller", "http://127.0.0.1:9090"},
 		{"secret", ""},
 	}
@@ -137,35 +157,47 @@ func sniffAndSolidifyConfig() {
 	}
 
 	lines := strings.Split(string(data), "\n")
+	inTunSection := false // 状态机：标记是否在 tun 配置块内
+
 	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
 
-		// 嗅探 API 地址
-		if strings.HasPrefix(line, "external-controller:") {
-			addr := strings.Trim(strings.TrimPrefix(line, "external-controller:"), " \"'")
-			if strings.HasPrefix(addr, ":") {
-				addr = "127.0.0.1" + addr
-			}
-			if addr != "" {
-				saveIniConfig("external-controller", "http://"+addr)
+		// 识别进入 tun 块
+		if strings.HasPrefix(trimmed, "tun:") {
+			inTunSection = true
+			continue
+		}
+		// 如果遇到非缩进的顶层 key，说明退出了 tun 块
+		if inTunSection && !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") {
+			inTunSection = false
+		}
+
+		// 在 tun 块内寻找 device
+		if inTunSection && strings.Contains(trimmed, "device:") {
+			parts := strings.SplitN(trimmed, ":", 2)
+			if len(parts) == 2 {
+				devName := strings.Trim(parts[1], " \"'")
+				if devName != "" {
+					saveIniConfig("tun_device_name", devName)
+				}
 			}
 		}
 
-		// 嗅探 Secret
-		if strings.HasPrefix(line, "secret:") {
-			sec := strings.Trim(strings.TrimPrefix(line, "secret:"), " \"'")
-			saveIniConfig("secret", sec)
+		// 原有的 API 和端口嗅探逻辑
+		if strings.HasPrefix(trimmed, "external-controller:") {
+			addr := strings.Trim(strings.TrimPrefix(trimmed, "external-controller:"), " \"'")
+			if strings.HasPrefix(addr, ":") { addr = "127.0.0.1" + addr }
+			if addr != "" { saveIniConfig("external-controller", "http://"+addr) }
 		}
-
-		// 嗅探 代理端口 (mixed-port 优先级最高)
-		if strings.HasPrefix(line, "mixed-port:") || (strings.HasPrefix(line, "port:") && getIniConfig("proxy_address") == "127.0.0.1:7890") {
-			port := strings.Trim(strings.SplitN(line, ":", 2)[1], " \"'")
-			if port != "" {
-				saveIniConfig("proxy_address", "127.0.0.1:"+port)
-			}
+		if strings.HasPrefix(trimmed, "secret:") {
+			saveIniConfig("secret", strings.Trim(strings.TrimPrefix(trimmed, "secret:"), " \"'"))
+		}
+		if strings.HasPrefix(trimmed, "mixed-port:") || (strings.HasPrefix(trimmed, "port:") && getIniConfig("proxy_address") == "127.0.0.1:7890") {
+			port := strings.Trim(strings.SplitN(trimmed, ":", 2)[1], " \"'")
+			if port != "" { saveIniConfig("proxy_address", "127.0.0.1:"+port) }
 		}
 	}
 }
@@ -220,7 +252,7 @@ func doAPIRequest(method, path string, payload interface{}) (*http.Response, err
 func syncConfigToKernel() {
 	tun := getIniConfig("tun_enabled") == "true"
 	mode := getIniConfig("mode")
-	proxy := getIniConfig("system_proxy") == "true"
+	proxy := getIniConfig("system_proxy_enabled") == "true"
 
 	payload := map[string]interface{}{
 		"mode": mode,
@@ -285,6 +317,7 @@ func monitorIconState() {
 }
 
 func checkSystemState() int {
+	// 1. 尝试请求 API，如果连不上，说明内核没启动或崩溃了
 	resp, err := doAPIRequest("GET", "", nil)
 	if err != nil {
 		tunErrorCounter = 0
@@ -292,46 +325,57 @@ func checkSystemState() int {
 	}
 	defer resp.Body.Close()
 
+	// 如果 API 响应了，重置初始化状态
 	if isSystemInitializing {
 		isSystemInitializing = false
 	}
 
+	// 核心配置同步：确保内核运行后的配置与 Launcher 的 INI 一致
 	onceSync.Do(func() {
 		go syncConfigToKernel()
 	})
 
+	// 2. 获取用户期望的状态
 	wantTun := getIniConfig("tun_enabled") == "true"
-	wantProxy := getIniConfig("system_proxy") == "true"
+	wantProxy := getIniConfig("system_proxy_enabled") == "true"
 
+	// 3. 如果开启了 TUN 模式，进行网卡实测
 	if wantTun {
 		hasTunInterface := false
 		ifaces, err := net.Interfaces()
 		if err == nil {
 			for _, i := range ifaces {
-				name := strings.ToLower(i.Name)
-				if strings.Contains(name, "mihomo") || strings.Contains(name, "meta") ||
-					strings.Contains(name, "clash") || strings.Contains(name, "sing-box") {
+				// 调用你刚添加的动态匹配函数
+				if isTunInterfaceMatch(i.Name) {
 					hasTunInterface = true
 					break
 				}
 			}
 		}
+
 		if hasTunInterface {
 			tunErrorCounter = 0
 			return StateTun
 		} else {
+			// 容错处理：网卡可能还没来得及创建，连续 5 次检测不到才报 Error
 			tunErrorCounter++
 			if tunErrorCounter > 5 {
 				return StateError
 			}
-			return StateTun
+			return StateTun // 暂时维持 Tun 状态，等待重试
 		}
 	}
+
+	// 4. 如果没开 TUN 但开了系统代理
 	if wantProxy {
 		return StateProxy
 	}
+
+	// 5. 默认运行状态（普通模式）
 	return StateDefault
 }
+
+
 
 func watchTunState() {
 	var (
@@ -340,30 +384,44 @@ func watchTunState() {
 		handle               syscall.Handle
 		overlapped           syscall.Overlapped
 	)
+
 	for {
+		// 阻塞等待系统网络地址变化通知（例如网卡启动、禁用、IP变更）
 		procNotifyAddrChange.Call(uintptr(unsafe.Pointer(&handle)), uintptr(unsafe.Pointer(&overlapped)))
+		
+		// 适当缓冲，等待网卡层级完全就绪
 		time.Sleep(500 * time.Millisecond)
+
 		hasTun := false
 		ifaces, err := net.Interfaces()
 		if err == nil {
 			for _, i := range ifaces {
-				name := strings.ToLower(i.Name)
-				if strings.Contains(name, "mihomo") || strings.Contains(name, "meta") ||
-					strings.Contains(name, "clash") || strings.Contains(name, "sing-box") {
+				// 使用动态匹配函数，优先匹配 YAML 里的 device 名
+				if isTunInterfaceMatch(i.Name) {
 					hasTun = true
 					break
 				}
 			}
 		}
+
+		// 只有在非初始化阶段（即用户未点击切换开关的稳定期）才进行 UI 同步和配置持久化
 		if mTun != nil && !isSystemInitializing {
+			// 同步托盘菜单的勾选状态
 			if hasTun {
 				mTun.Check()
 			} else {
 				mTun.Uncheck()
 			}
-			saveIniConfig("tun_enabled", fmt.Sprint(hasTun))
+
+			// 获取当前 ini 记录的状态，只有不一致时才写入，减少磁盘损耗
+			currentConfig := getIniConfig("tun_enabled") == "true"
+			if hasTun != currentConfig {
+				saveIniConfig("tun_enabled", fmt.Sprint(hasTun))
+			}
 		}
-		time.Sleep(100 * time.Millisecond)
+
+		// 防止协程过快空转，降低 CPU 占用
+		time.Sleep(200 * time.Millisecond)
 	}
 }
 
@@ -398,11 +456,11 @@ func onReady() {
 	// 2. 尝试从 yaml 矫正
 	sniffAndSolidifyConfig()
 
-	setProxyRegistry(getIniConfig("system_proxy") == "true")
+	setProxyRegistry(getIniConfig("system_proxy_enabled") == "true")
 	updateIconByState(StateStop)
 
 	mWeb := systray.AddMenuItem("进入 Web 面板", "")
-	mProxy := systray.AddMenuItemCheckbox("系统代理", "", getIniConfig("system_proxy") == "true")
+	mProxy := systray.AddMenuItemCheckbox("系统代理", "", getIniConfig("system_proxy_enabled") == "true")
 	mTun = systray.AddMenuItemCheckbox("TUN 模式", "", getIniConfig("tun_enabled") == "true")
 	systray.AddSeparator()
 
@@ -448,7 +506,7 @@ func onReady() {
 			}
 		case <-mProxy.ClickedCh:
 			next := !mProxy.Checked()
-			saveIniConfig("system_proxy", fmt.Sprint(next))
+			saveIniConfig("system_proxy_enabled", fmt.Sprint(next))
 			setProxyRegistry(next)
 			if next {
 				mProxy.Check()
@@ -514,7 +572,7 @@ func setTunMode(enable bool) {
 
 func setProxyRegistry(enable bool) {
 	if !isReallyExiting {
-		saveIniConfig("system_proxy", fmt.Sprint(enable))
+		saveIniConfig("system_proxy_enabled", fmt.Sprint(enable))
 	}
 	key, err := registry.OpenKey(registry.CURRENT_USER, REG_PROXY, registry.SET_VALUE)
 	if err != nil {
