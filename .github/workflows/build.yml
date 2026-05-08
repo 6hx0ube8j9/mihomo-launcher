@@ -15,16 +15,21 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: '1.25' 
+          go-version: 'stable' 
           cache: true   
+
+      - name: Install dependencies
+        run: |
+          go mod init mihomo-launcher || true
+          go mod tidy
 
       - name: Build EXE
         shell: pwsh
         run: |
-          $env:CGO_ENABLED="1"
-          go build -ldflags="-s -w -H windowsgui" -o mihomo-launcher.exe main.go
+          $env:CGO_ENABLED="0"
+          go build -ldflags="-s -w -H windowsgui" -o mihomo-launcher.exe .
 
-      - name: Upload
+      - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
           name: mihomo-launcher
