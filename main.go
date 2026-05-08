@@ -260,35 +260,35 @@ func setProxyRegistry(enable bool) {
 	}
 }
 
-// reloadConfigFile 直接通过 API 通知内核重载磁盘上的 YAML
 func reloadConfigFile() {
     isSystemInitializing = true
 
-    // 获取绝对路径，内核对绝对路径的识别更稳定
     configPath, _ := filepath.Abs(filepath.Join(baseDir, "config.yaml"))
     
-    // 只提供 path，不提供 tun，不提供 mode
-    payload := map[string]string{
+    // 关键点：在 Payload 中同时带上当前的 mode 和 path
+    // 这样内核会知道：在不改变当前模式的情况下，重新读取这个路径的文件
+    payload := map[string]interface{}{
         "path": configPath,
+        "mode": getIniConfig("mode"), 
     }
 
-    // 使用 PATCH 而不是 PUT。PATCH 路径是 Mihomo 实现热重载的标准做法
-    resp, err := doAPIRequest("PATCH", "/configs", payload)
+    // 使用 PUT 方法，这是 Mihomo 触发完整 Realloc 逻辑的标准
+    // 参数 force=false 保证了如果配置没变，就不重启连接
+    resp, err := doAPIRequest("PUT", "/configs?force=false", payload)
     
     if err != nil {
+        fmt.Printf("重载失败: %v\n", err)
         isSystemInitializing = false
         return
     }
     defer resp.Body.Close()
 
-    // 如果成功，只做一个简单的静默等待，不要调用 syncConfigToKernel
     if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
-        fmt.Println("热重载指令已发送")
+        fmt.Println("内核已接收重载指令")
+        // 缩短锁定时间，给内核 500ms 足够解析文本了
         go func() {
-            // 给内核 1 秒钟时间静默解析 YAML 并切换分流树
-            time.Sleep(1 * time.Second)
+            time.Sleep(500 * time.Millisecond)
             isSystemInitializing = false
-            fmt.Println("热重载完成，无网卡重启")
         }()
     } else {
         isSystemInitializing = false
@@ -374,70 +374,81 @@ func monitorIconState() {
 }
 
 func checkSystemState() int {
-	resp, err := doAPIRequest("GET", "", nil)
-	if err != nil {
-		tunErrorCounter = 0
-		return StateStop
-	}
-	defer resp.Body.Close()
+    // 1. 尝试探测内核 API 活性
+    resp, err := doAPIRequest("GET", "", nil)
+    if err != nil {
+        // 如果 API 不通，说明内核可能正在启动、崩溃或被防火墙拦截
+        // 此时不应清空 tunErrorCounter，而是让它保持现状，直到确定内核已完全关闭
+        return StateStop
+    }
+    defer resp.Body.Close()
 
-	if isSystemInitializing { isSystemInitializing = false }
-	onceSync.Do(func() { go syncConfigToKernel() })
+    // --- 关键点：移除此处的 onceSync.Do ---
+    // 不要在每秒执行一次的监控函数里触发同步逻辑，这会导致逻辑死锁
+    // 同步逻辑应由 main 或 onReady 里的独立协程完成
 
-	if getIniConfig("tun_enabled") == "true" {
-		hasTun := false
-		ifaces, _ := net.Interfaces()
-		for _, i := range ifaces {
-			if isTunInterfaceMatch(i.Name) {
-				hasTun = true
-				break
-			}
-		}
-		if hasTun {
-			tunErrorCounter = 0
-			return StateTun
-		} else {
-			tunErrorCounter++
-			if tunErrorCounter > 8 { return StateError }
-			return StateStop
-		}
-	}
-	if getIniConfig("system_proxy_enabled") == "true" { return StateProxy }
-	return StateDefault
+    // 2. 检查 TUN 网卡状态
+    // 我们优先信任用户在 INI 里的选择，如果用户开启了 TUN，我们去系统里找网卡
+    if getIniConfig("tun_enabled") == "true" {
+        hasTun := false
+        ifaces, _ := net.Interfaces()
+        for _, i := range ifaces {
+            if isTunInterfaceMatch(i.Name) {
+                hasTun = true
+                break
+            }
+        }
+
+        if hasTun {
+            tunErrorCounter = 0 // 找到网卡，计数器归零
+            return StateTun
+        } else {
+            // 如果内核 API 通了，但找不到网卡，可能是内核正在创建网卡或创建失败
+            // 给予 8 秒左右的宽限期（配合 monitorIconState 的 1s 间隔）
+            tunErrorCounter++
+            if tunErrorCounter > 8 {
+                return StateError // 超过 8 秒还没网卡，显示感叹号图标
+            }
+            // 宽限期内暂时显示停止状态，避免图标闪烁
+            return StateStop
+        }
+    }
+
+    // 3. 检查系统代理状态
+    // 如果没有开启 TUN，检查 INI 是否开启了系统代理
+    if getIniConfig("system_proxy_enabled") == "true" {
+        return StateProxy
+    }
+
+    // 4. 默认状态（内核运行中，但未开启 TUN 或系统代理）
+    return StateDefault
 }
 
 func watchTunState() {
-	// 1. 初始化 Windows 网络变更监听
 	modiphlpapi := syscall.NewLazyDLL("iphlpapi.dll")
 	procNotifyAddrChange := modiphlpapi.NewProc("NotifyAddrChange")
 	var handle syscall.Handle
 	var overlapped syscall.Overlapped
 
 	for {
-		// 阻塞等待：直到 Windows 网络状态发生变化（如网卡启用/禁用、IP变化）
-		// 这比单纯的 time.Sleep 响应更及时，且不占 CPU
+		// 阻塞等待 Windows 网络事件
 		procNotifyAddrChange.Call(uintptr(unsafe.Pointer(&handle)), uintptr(unsafe.Pointer(&overlapped)))
-		
-		// 给系统一点微小的喘息时间，防止短时间内网卡频繁跳变导致逻辑抖动
-		time.Sleep(500 * time.Millisecond)
+		time.Sleep(800 * time.Millisecond) // 稍微等待网络协议栈稳定
 
-		// --- 手术重点 1：静默期保护 ---
-		// 如果内核正在重启、重载、或刚启动还没过“稳定期”，直接跳过
-		// 绝不准在这个阶段去读网卡或反写 INI
+		// 核心保护：如果系统正在同步或刚启动，跳过此次监听
 		if isSystemInitializing {
 			continue
 		}
 
-		// --- 手术重点 2：API 活性检查 ---
-		// 只有内核 API 能通，我们才去判断网卡状态。
-		// 如果 API 都不通，说明内核挂了，此时看到的网卡消失是“假象”，不能反写 INI
+		// 核心保护：只有内核 API 正常响应时，才认为当前网卡状态是“受控”的
 		resp, err := doAPIRequest("GET", "", nil)
 		if err != nil {
+			// API 不通，说明内核可能崩溃了，此时不要去反写 INI
 			continue
 		}
 		resp.Body.Close()
 
-		// 2. 检测物理网卡是否存在
+		// 检查 TUN 网卡是否存在
 		hasTun := false
 		ifaces, _ := net.Interfaces()
 		for _, i := range ifaces {
@@ -447,20 +458,16 @@ func watchTunState() {
 			}
 		}
 
-		// --- 手术重点 3：解耦同步逻辑 ---
+		// 同步逻辑：如果网卡实际状态与 INI 配置不一致，说明用户可能通过外部（如 Web UI）改了状态
 		if mTun != nil {
-			// 读取当前本地配置，判断是否真的需要更新
-			currentConfig := getIniConfig("tun_enabled") == "true"
-			
-			if hasTun != currentConfig {
-				// 只有在“非初始化状态”且“API正常”的前提下，
-				// 如果检测到的网卡状态和配置不符，才认为是用户在外部控制台修改了状态
+			currentIniConfig := getIniConfig("tun_enabled") == "true"
+			if hasTun != currentIniConfig {
+				fmt.Printf("[Monitor] 检测到外部状态变更: TUN -> %v. 同步至 INI。\n", hasTun)
 				
 				// 同步菜单 UI
 				if hasTun { mTun.Check() } else { mTun.Uncheck() }
 				
-				// 同步到本地配置文件
-				fmt.Printf("[Monitor] 检测到状态不一致，同步网卡状态 %v 到 INI\n", hasTun)
+				// 同步到 INI 文件
 				saveIniConfig("tun_enabled", fmt.Sprint(hasTun))
 			}
 		}
@@ -493,65 +500,93 @@ func updateIconByState(state int) {
 
 var syncMu sync.Mutex
 func syncConfigToKernel() {
-    // 1. 确保在同步期间，监听协程保持锁定状态
-    isSystemInitializing = true
+	syncMu.Lock()
+	defer syncMu.Unlock()
 
-    // 2. 从本地读取“真理” (INI 配置)
-    tun := getIniConfig("tun_enabled") == "true"
-    mode := getIniConfig("mode")
-    // --- 此处删除了 secret := getIniConfig("secret") ---
+	// 开启初始化锁，防止 watchTunState 在此期间反向干扰
+	isSystemInitializing = true
+	fmt.Println("[Sync] 正在将本地 INI 配置同步至内核...")
 
-    // 3. 构造推送负载
-    payload := map[string]interface{}{
-        "mode": mode,
-        "tun":  map[string]bool{"enable": tun},
-    }
+	// 1. 读取本地 INI 作为“最终真理”
+	tun := getIniConfig("tun_enabled") == "true"
+	mode := getIniConfig("mode")
 
-    // 4. 执行 Patch 请求
-    var err error
-    var resp *http.Response
-    
-    for i := 0; i < 3; i++ {
-        resp, err = doAPIRequest("PATCH", "/configs", payload)
-        if err == nil {
-            resp.Body.Close()
-            break
-        }
-        time.Sleep(500 * time.Millisecond)
-    }
+	// 2. 构造负载
+	payload := map[string]interface{}{
+		"mode": mode,
+		"tun":  map[string]bool{"enable": tun},
+	}
 
-    if err != nil {
-        fmt.Printf("同步配置到内核失败: %v\n", err)
-        return
-    }
+	// 3. 执行 Patch 请求 (带重试逻辑)
+	var err error
+	var resp *http.Response
+	for i := 0; i < 3; i++ {
+		resp, err = doAPIRequest("PATCH", "/configs", payload)
+		if err == nil {
+			resp.Body.Close()
+			break
+		}
+		time.Sleep(300 * time.Millisecond)
+	}
 
-    // 5. 进入稳定期
-    waitTime := 1 * time.Second
-    if tun {
-        waitTime = 3 * time.Second
-    }
-    
-    time.Sleep(waitTime)
+	if err != nil {
+		fmt.Printf("[Sync] 同步配置到内核失败: %v\n", err)
+		isSystemInitializing = false // 失败则立即解锁
+		return
+	}
 
-    // 6. 正式交权
-    isSystemInitializing = false
-    
-    if mTun != nil {
-        if tun { mTun.Check() } else { mTun.Uncheck() }
-    }
-    
-    fmt.Println("内核同步完成，保护锁已释放")
+	// 4. 异步处理稳定期与锁释放
+	go func() {
+		// 给内核留出创建网卡或切换模式的时间
+		if tun {
+			time.Sleep(2 * time.Second)
+		} else {
+			time.Sleep(500 * time.Millisecond)
+		}
+		
+		isSystemInitializing = false
+		lastState = -1 // 强制图标监控下次运行阶段立即刷新图标
+		fmt.Println("[Sync] 内核同步完成，保护锁已释放")
+	}()
+
+	// 5. 立即同步菜单 UI 的勾选状态，不需要等轮询
+	if mTun != nil {
+		if tun { mTun.Check() } else { mTun.Uncheck() }
+	}
 }
-
-// --- 程序主入口 ---
 
 func onReady() {
 	ensureDefaultConfig()
 	sniffAndSolidifyConfig()
 
+	// 根据配置初始化代理注册表
 	setProxyRegistry(getIniConfig("system_proxy_enabled") == "true")
 	updateIconByState(StateStop)
 
+	// 独立协程：监听内核就绪并触发初次同步
+	go func() {
+		fmt.Println("[Init] 正在等待内核 API 响应...")
+		success := false
+		for i := 0; i < 20; i++ {
+			resp, err := doAPIRequest("GET", "", nil)
+			if err == nil {
+				resp.Body.Close()
+				success = true
+				break
+			}
+			time.Sleep(500 * time.Millisecond)
+		}
+
+		if success {
+			fmt.Println("[Init] 内核 API 已就绪，触发自动激活同步")
+			syncConfigToKernel()
+		} else {
+			fmt.Println("[Init] 内核启动超时，释放初始化锁")
+			isSystemInitializing = false
+		}
+	}()
+
+	// --- 菜单项创建逻辑 ---
 	mWeb := systray.AddMenuItem("进入 Web 面板", "")
 	systray.AddSeparator()
 
@@ -568,15 +603,13 @@ func onReady() {
 
 	isAuto := checkAutoStartStatus()
 	mAuto := systray.AddMenuItemCheckbox("开机自启动", "", isAuto)
-	
-	// 【新增菜单项】
-	mReload := systray.AddMenuItem("重载配置文件", "手动通知内核读取 config.yaml") 
-	
+	mReload := systray.AddMenuItem("重载配置文件", "手动通知内核读取 config.yaml")
 	mDir := systray.AddMenuItem("打开程序目录", "")
 	mRestart := systray.AddMenuItem("重启内核", "")
 	systray.AddSeparator()
 	mExit := systray.AddMenuItem("关闭程序", "")
 
+	// 事件循环逻辑
 	for {
 		select {
 		case <-mWeb.ClickedCh:
@@ -589,12 +622,9 @@ func onReady() {
 			}
 			finalURL := fmt.Sprintf("%s/ui/?hostname=%s&port=%s&secret=%s#/proxies", apiAddr, host, port, secret)
 			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(finalURL), nil, nil, windows.SW_SHOWNORMAL)
-
 		case <-mReload.ClickedCh:
-			// 【响应重载点击】
-			sniffAndSolidifyConfig() // 先同步 YAML 中的 API 和 Secret 信息
-			reloadConfigFile()       // 发送重载 API
-
+			sniffAndSolidifyConfig()
+			reloadConfigFile()
 		case <-modeMenus["rule"].ClickedCh:
 			setMihomoMode("rule")
 			modeMenus["rule"].Check(); modeMenus["global"].Uncheck(); modeMenus["direct"].Uncheck()
@@ -605,7 +635,6 @@ func onReady() {
 			setMihomoMode("direct")
 			modeMenus["rule"].Uncheck(); modeMenus["global"].Uncheck(); modeMenus["direct"].Check()
 		case <-mTun.ClickedCh:
-		    isSystemInitializing = true
 			next := !mTun.Checked()
 			saveIniConfig("tun_enabled", fmt.Sprint(next))
 			go syncConfigToKernel()
@@ -621,8 +650,8 @@ func onReady() {
 		case <-mDir.ClickedCh:
 			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
 		case <-mRestart.ClickedCh:
-		    isSystemInitializing = true
-            onceSync = sync.Once{}			
+			isSystemInitializing = true
+			onceSync = sync.Once{}
 			go func() {
 				exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe").Run()
 			}()
