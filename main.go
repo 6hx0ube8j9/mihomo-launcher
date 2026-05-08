@@ -480,37 +480,42 @@ func isProcessRunning(name string) bool {
 }
 
 func onReady() {
-	// 1. 立即初始化保底配置
-	ensureDefaultConfig()
-	// 2. 尝试从 yaml 矫正
-	sniffAndSolidifyConfig()
+    // 1. 立即初始化保底配置
+    ensureDefaultConfig()
+    // 2. 尝试从 yaml 矫正
+    sniffAndSolidifyConfig()
 
-	setProxyRegistry(getIniConfig("system_proxy_enabled") == "true")
-	updateIconByState(StateStop)
+    setProxyRegistry(getIniConfig("system_proxy_enabled") == "true")
+    updateIconByState(StateStop)
 
+    // --- 第一组：Web 入口 (纯文本，无装饰) ---
+    mWeb := systray.AddMenuItem("进入 Web 面板", "") 
+    // 这道分隔线会将 Web 面板与下方的核心功能完全隔开
+    systray.AddSeparator()
 
-	mWeb := systray.AddMenuItem("进入 Web 面板", "") 
-	systray.AddSeparator()
+    // --- 第二组：功能开关 ---
+    mProxy := systray.AddMenuItemCheckbox("系统代理", "", getIniConfig("system_proxy_enabled") == "true")
+    mTun = systray.AddMenuItemCheckbox("TUN 模式", "", getIniConfig("tun_enabled") == "true")
+    systray.AddSeparator()
 
-	// --- 第二组：功能开关 ---
-	mProxy := systray.AddMenuItemCheckbox("系统代理", "", getIniConfig("system_proxy_enabled") == "true")
-	mTun = systray.AddMenuItemCheckbox("TUN 模式", "", getIniConfig("tun_enabled") == "true")
-	systray.AddSeparator()
+    // --- 第三组：运行模式 ---
+    curMode := getIniConfig("mode")
+    modeMenus := make(map[string]*systray.MenuItem)
+    modeMenus["rule"] = systray.AddMenuItemCheckbox("规则模式", "", curMode == "rule")
+    modeMenus["global"] = systray.AddMenuItemCheckbox("全局模式", "", curMode == "global")
+    modeMenus["direct"] = systray.AddMenuItemCheckbox("直连模式", "", curMode == "direct")
+    systray.AddSeparator()
 
-	// --- 第三组：运行模式 ---
-	curMode := getIniConfig("mode")
-	modeMenus := make(map[string]*systray.MenuItem)
-	modeMenus["rule"] = systray.AddMenuItemCheckbox("规则模式", "", curMode == "rule")
-	modeMenus["global"] = systray.AddMenuItemCheckbox("全局模式", "", curMode == "global")
-	modeMenus["direct"] = systray.AddMenuItemCheckbox("直连模式", "", curMode == "direct")
-	systray.AddSeparator()
-
-	// --- 第四组：系统项 ---
-	mAuto := systray.AddMenuItemCheckbox("开机自动启动", "", getIniConfig("startup_enabled") == "true")
-	mDir := systray.AddMenuItem("打开程序目录", "")
-	mRestart := systray.AddMenuItem("重启内核", "")
-	systray.AddSeparator()
-	mExit := systray.AddMenuItem("退出程序", "")
+    // --- 第四组：系统项 ---
+	isAuto := checkAutoStartStatus()
+    mAuto := systray.AddMenuItemCheckbox("开机自启动", "", isAuto)
+	if fmt.Sprint(isAuto) != getIniConfig("startup_enabled") {
+	    saveIniConfig("startup_enabled", fmt.Sprint(isAuto))
+	}	
+    mDir := systray.AddMenuItem("打开程序目录", "")
+    mRestart := systray.AddMenuItem("重启内核", "")
+    systray.AddSeparator()
+    mExit := systray.AddMenuItem("关闭程序", "")
 
 	for {
 		select {
@@ -618,17 +623,65 @@ func setProxyRegistry(enable bool) {
 	}
 }
 
+// toggleAutoStart 实现开机自启动逻辑：使用 Windows 计划任务取代注册表
 func toggleAutoStart(enable bool) {
-	saveIniConfig("startup_enabled", fmt.Sprint(enable))
-	key, _ := registry.OpenKey(registry.CURRENT_USER, REG_RUN, registry.SET_VALUE)
-	defer key.Close()
-	if enable {
-		_ = key.SetStringValue(APP_NAME, exePath)
-	} else {
-		_ = key.DeleteValue(APP_NAME)
-	}
+    if key, err := registry.OpenKey(registry.CURRENT_USER, REG_RUN, registry.SET_VALUE); err == nil {
+	    _ = key.DeleteValue(APP_NAME)
+		key.Close()
+	}	
+    saveIniConfig("startup_enabled", fmt.Sprint(enable))
+
+    const taskName = "MihomoLauncherTask"
+
+    if enable {
+        // --- 对应你脚本里的 :ADD 逻辑 ---
+        // /Create: 创建任务
+        // /TN: 任务名
+        // /TR: 执行路径（使用引号包裹 exePath 以处理路径中的空格）
+        // /SC ONLOGON: 当用户登录时触发启动
+        // /RL HIGHEST: 以最高权限运行（跳过开机 UAC 弹窗的关键）
+        // /F: 强制覆盖已有同名任务
+        cmd := exec.Command("schtasks", "/Create",
+            "/TN", taskName,
+            "/TR", "\""+exePath+"\"",
+            "/SC", "ONLOGON",
+            "/RL", "HIGHEST",
+            "/F")
+
+        // 隐藏控制台窗口执行
+        cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+        if err := cmd.Run(); err != nil {
+            fmt.Printf("创建自启任务失败: %v\n", err)
+        }
+    } else {
+        // --- 对应你脚本里的 :DEL 逻辑 ---
+        // /Delete: 删除任务
+        // /TN: 指定任务名（精准删除，不会影响其他任务）
+        // /F: 强制删除，无需用户手动输入 Y 确认
+        cmd := exec.Command("schtasks", "/Delete",
+            "/TN", taskName,
+            "/F")
+
+        cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+        if err := cmd.Run(); err != nil {
+            // 如果任务本来就不存在，这里会返回错误，直接忽略即可
+            fmt.Printf("删除自启任务跳过（可能任务不存在）: %v\n", err)
+        }
+    }
 }
 
+// checkAutoStartStatus 实时检测系统计划任务列表中是否存在该自启项
+func checkAutoStartStatus() bool {
+    const taskName = "MihomoLauncherTask"
+    
+    // 通过 /Query 命令查询指定名称的任务
+    cmd := exec.Command("schtasks", "/Query", "/TN", taskName)
+    cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+    
+    // 如果任务存在，schtasks 返回码为 0，err 则为 nil
+    err := cmd.Run()
+    return err == nil
+}
 func updateIconByState(state int) {
 	files := []string{"stop.ico", "error.ico", "tun.ico", "proxy.ico", "default.ico"}
 	if state < 0 || state >= len(files) {
