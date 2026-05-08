@@ -107,8 +107,8 @@ func ensureDefaultConfig() {
 	defaults := [][]string{
 		{"mode", "rule"},
 		{"tun_enabled", "false"},
-		{"system_proxy_enabled", "false"},
-		{"auto_start", "false"},
+		{"system_proxy", "false"},
+		{"startup_enabled", "false"},
 		{"proxy_address", "127.0.0.1:7890"},
 		{"external-controller", "http://127.0.0.1:9090"},
 		{"secret", ""},
@@ -220,7 +220,7 @@ func doAPIRequest(method, path string, payload interface{}) (*http.Response, err
 func syncConfigToKernel() {
 	tun := getIniConfig("tun_enabled") == "true"
 	mode := getIniConfig("mode")
-	proxy := getIniConfig("system_proxy_enabled") == "true"
+	proxy := getIniConfig("system_proxy") == "true"
 
 	payload := map[string]interface{}{
 		"mode": mode,
@@ -301,7 +301,7 @@ func checkSystemState() int {
 	})
 
 	wantTun := getIniConfig("tun_enabled") == "true"
-	wantProxy := getIniConfig("system_proxy_enabled") == "true"
+	wantProxy := getIniConfig("system_proxy") == "true"
 
 	if wantTun {
 		hasTunInterface := false
@@ -398,11 +398,11 @@ func onReady() {
 	// 2. 尝试从 yaml 矫正
 	sniffAndSolidifyConfig()
 
-	setProxyRegistry(getIniConfig("system_proxy_enabled") == "true")
+	setProxyRegistry(getIniConfig("system_proxy") == "true")
 	updateIconByState(StateStop)
 
 	mWeb := systray.AddMenuItem("进入 Web 面板", "")
-	mProxy := systray.AddMenuItemCheckbox("系统代理", "", getIniConfig("system_proxy_enabled") == "true")
+	mProxy := systray.AddMenuItemCheckbox("系统代理", "", getIniConfig("system_proxy") == "true")
 	mTun = systray.AddMenuItemCheckbox("TUN 模式", "", getIniConfig("tun_enabled") == "true")
 	systray.AddSeparator()
 
@@ -413,7 +413,7 @@ func onReady() {
 	modeMenus["direct"] = systray.AddMenuItemCheckbox("直连模式", "", curMode == "direct")
 	systray.AddSeparator()
 
-	mAuto := systray.AddMenuItemCheckbox("开机自动启动", "", getIniConfig("auto_start") == "true")
+	mAuto := systray.AddMenuItemCheckbox("开机自动启动", "", getIniConfig("startup_enabled") == "true")
 	mDir := systray.AddMenuItem("打开程序目录", "")
 	mRestart := systray.AddMenuItem("重启内核", "")
 	systray.AddSeparator()
@@ -448,7 +448,7 @@ func onReady() {
 			}
 		case <-mProxy.ClickedCh:
 			next := !mProxy.Checked()
-			saveIniConfig("system_proxy_enabled", fmt.Sprint(next))
+			saveIniConfig("system_proxy", fmt.Sprint(next))
 			setProxyRegistry(next)
 			if next {
 				mProxy.Check()
@@ -514,7 +514,7 @@ func setTunMode(enable bool) {
 
 func setProxyRegistry(enable bool) {
 	if !isReallyExiting {
-		saveIniConfig("system_proxy_enabled", fmt.Sprint(enable))
+		saveIniConfig("system_proxy", fmt.Sprint(enable))
 	}
 	key, err := registry.OpenKey(registry.CURRENT_USER, REG_PROXY, registry.SET_VALUE)
 	if err != nil {
@@ -530,7 +530,7 @@ func setProxyRegistry(enable bool) {
 }
 
 func toggleAutoStart(enable bool) {
-	saveIniConfig("auto_start", fmt.Sprint(enable))
+	saveIniConfig("startup_enabled", fmt.Sprint(enable))
 	key, _ := registry.OpenKey(registry.CURRENT_USER, REG_RUN, registry.SET_VALUE)
 	defer key.Close()
 	if enable {
