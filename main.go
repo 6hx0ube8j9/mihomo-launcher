@@ -245,20 +245,20 @@ func setMihomoMode(mode string) {
 }
 
 func setTunMode(enable bool) {
-	isSystemInitializing = true
-	saveIniConfig("tun_enabled", fmt.Sprint(enable))
-	
-	if enable {
-		// 立即切红，重置计数器，防止 checkSystemState 跳回灰色或默认色
-		tunErrorCounter = 0
-		updateIconByState(StateError)
-		lastState = StateError
-	}
-
-	payload := map[string]interface{}{"tun": map[string]bool{"enable": enable}}
-	_, _ = doAPIRequest("PATCH", "/configs", payload)
+    isSystemInitializing = true
+    saveIniConfig("tun_enabled", fmt.Sprint(enable))
     
-    // 这里不再需要 sleep，因为 checkSystemState 的“自动解锁逻辑”会通过 API 响应自动处理
+    if enable {
+        // 1. 点击后：立即切为红色 (StateError)，重置计数器
+        tunErrorCounter = 0
+        updateIconByState(StateError) 
+        lastState = StateError
+    } else {
+        // 关闭时：逻辑交给 checkSystemState 自动处理图标
+    }
+
+    payload := map[string]interface{}{"tun": map[string]bool{"enable": enable}}
+    _, _ = doAPIRequest("PATCH", "/configs", payload)
 }
 
 func setProxyRegistry(enable bool) {
@@ -383,77 +383,60 @@ func monitorIconState() {
 }
 
 func checkSystemState() int {
-	// 1. 发起 API 请求探测内核灵魂
-	resp, err := doAPIRequest("GET", "", nil)
-
-	// 2. 异常处理：内核没气了
-	if err != nil {
-		// 如果 TUN 开着且还在“启动保护期”，报 Error (黄色图标)
-		if getIniConfig("tun_enabled") == "true" && isSystemInitializing {
-			return StateError
-		}
-		// 否则报 Stop (灰色图标)
+	// 1. 进程级检查：内核进程不存在，直接红色
+	if !isProcessRunning("mihomo.exe") {
 		tunErrorCounter = 0
-		return StateStop
+		return StateStop // Index 0: 红色
 	}
 
-	// 3. 判空保护
-	if resp == nil {
-		return StateStop
+	// 2. 通信级检查：探测 API 是否在线
+	resp, err := doAPIRequest("GET", "", nil)
+	if err != nil {
+		// API 不通视为未就绪，显示红色
+		return StateStop // Index 0: 红色
 	}
-	if resp.Body != nil {
+	if resp != nil && resp.Body != nil {
 		defer resp.Body.Close()
 	}
 
-	// 4. 内核响应 200 OK，灵魂在线
-	if resp.StatusCode == http.StatusOK {
-		// 自动解锁逻辑：API 通了说明内核初始化完成
-		if isSystemInitializing {
-			isSystemInitializing = false
-			// 确保同步逻辑只执行一次（利用 main 中定义的 onceSync）
-			onceSync.Do(func() {
-				go syncConfigToKernel()
-			})
-		}
+	// 3. 功能状态判定
+	isTunWant := getIniConfig("tun_enabled") == "true"
+	isProxyWant := getIniConfig("system_proxy_enabled") == "true"
 
-		// 5. 细分运行状态 (Running)
-		
-		// 情况 A: TUN 模式
-		if getIniConfig("tun_enabled") == "true" {
-			hasTun := false
-			ifaces, _ := net.Interfaces()
-			for _, i := range ifaces {
-				if isTunInterfaceMatch(i.Name) {
-					hasTun = true
-					break
-				}
-			}
-
-			if hasTun {
-				tunErrorCounter = 0
-				return StateTun // 对应 tun.ico (索引 2)
-			} else {
-				// API 通了但网卡还没出来，进入缓冲计数
-				tunErrorCounter++
-				if tunErrorCounter > 6 {
-					return StateError // 缓冲结束，报 Error (索引 1)
-				}
-				return StateTun // 缓冲期内继续假装是 StateTun，避免闪烁
+	// --- 场景 A: 开启了 TUN 模式 ---
+	if isTunWant {
+		hasTun := false
+		ifaces, _ := net.Interfaces()
+		for _, i := range ifaces {
+			if isTunInterfaceMatch(i.Name) {
+				hasTun = true
+				break
 			}
 		}
 
-		// 情况 B: 系统代理模式
-		if getIniConfig("system_proxy_enabled") == "true" {
+		if hasTun {
 			tunErrorCounter = 0
-			return StateProxy // 对应 proxy.ico (索引 3)
+			return StateTun // Index 2: 绿色 (正常运行)
+		} else {
+			// 网卡尚未就绪
+			tunErrorCounter++
+			if tunErrorCounter > 5 {
+				return StateError // Index 1: 黄色 (超过5秒报警)
+			}
+			// 5秒内的检测期，显示红色 (符合：红 -> 绿 变化逻辑)
+			return StateStop // Index 0: 红色
 		}
-
-		// 情况 C: 默认运行模式 (规则/全局/直连)
-		tunErrorCounter = 0
-		return StateDefault // 对应 default.ico (索引 4)
 	}
 
-	return StateStop
+	// --- 场景 B: 未开 TUN，但开启了系统代理 ---
+	if isProxyWant {
+		tunErrorCounter = 0
+		return StateProxy // Index 3: 蓝色
+	}
+
+	// --- 场景 C: 默认状态 (内核活着的，啥也没开) ---
+	tunErrorCounter = 0
+	return StateDefault // Index 4: 常规色
 }
 
 func watchTunState() {
@@ -613,16 +596,17 @@ func onReady() {
         
         case <-mTun.ClickedCh:
             next := !mTun.Checked()
-            // 统一调用 setTunMode，它会处理：
-            // 1. 设置 isSystemInitializing = true
-            // 2. 保存 ini 
-            // 3. 立即切红图标 (StateError)
-            // 4. 发起 PATCH API 请求
+			tunErrorCounter = 0
+			isSystemInitializing = true
             setTunMode(next)
             
-            // 更新菜单勾选状态
-            if next { mTun.Check() } else { mTun.Uncheck() }
-            
+            if next {
+               mTun.Check()
+			   updateIconByState(StateStop)
+			   lastState = StateStop
+            } else {
+			   mTun.Uncheck()
+			}   
         case <-mProxy.ClickedCh:
             next := !mProxy.Checked()
             setProxyRegistry(next) // 内部会处理 ini 保存和注册表修改
@@ -665,28 +649,38 @@ func onExit() {
 }
 
 func main() {
+	// 1. 权限校验：无权限则提权并立即退出
+	if !isAdmin() {
+		runAsAdmin()
+		return // 极其关键：提权跳转必须直接返回，不创建 Mutex
+	}
+
+	// 2. 单例检查：确保管理员权限下只有一个实例
 	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
 	h, err := windows.CreateMutex(nil, false, mName)
-	if err != nil { return }
-	event, _ := windows.WaitForSingleObject(h, 0)
-	if event == uint32(windows.WAIT_TIMEOUT) || event == uint32(windows.WAIT_FAILED) {
-		if h != 0 { windows.CloseHandle(h) }
+	if err != nil {
 		return
 	}
-	hMutex = h
-
-	if !isAdmin() {
-		if hMutex != 0 { windows.CloseHandle(hMutex); hMutex = 0 }
-		runAsAdmin()
-		os.Exit(0)
+	
+	// 尝试持有锁
+	event, _ := windows.WaitForSingleObject(h, 0)
+	if event == uint32(windows.WAIT_TIMEOUT) || event == uint32(windows.WAIT_FAILED) {
+		if h != 0 {
+			windows.CloseHandle(h)
+		}
+		return
 	}
+	hMutex = h // 成功持有互斥锁
 
+	// 3. 环境初始化
 	os.Chdir(baseDir)
 	initJobObject()
 
+	// 4. 启动并发监控任务
 	go monitorKernelDaemon()
 	go monitorIconState()
 	go watchTunState()
 
+	// 5. 启动系统托盘（阻塞运行）
 	systray.Run(onReady, onExit)
 }
