@@ -570,7 +570,7 @@ func onReady() {
     
     mMoreRoot := systray.AddMenuItem("更多", "")
     isAuto := checkAutoStartStatus()
-    mAuto := mMoreRoot.AddSubMenuItemCheckbox("开机自启动", "", isAuto)
+    mAuto := mMoreRoot.AddSubMenuItemCheckbox("开机自动启动", "", isAuto)
     mRestart := mMoreRoot.AddSubMenuItem("重启内核", "")
     mReload := mMoreRoot.AddSubMenuItem("重载配置文件", "手动通知内核读取 config.yaml")
     systray.AddSeparator()
@@ -630,16 +630,18 @@ func onReady() {
             isSystemInitializing = true
             onceSync = sync.Once{}            
             go func() {
-                // 这里建议使用我之前提到的 killProcessByName 避免黑框
-                killProcessByName("mihomo.exe")
-            }()
-            
-        case <-mExit.ClickedCh:
-            isReallyExiting = true
-            systray.Quit()
-            return
-        }
-    }
+				cmd := exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe")
+				cmd.SysProcAttr = &windows.SysProcAttr{
+				    CreationFlags: windows.CREATE_NO_WINDOW,
+				}
+				_ = cmd.Run()
+			}()
+		case <-mExit.ClickedCh:
+			isReallyExiting = true
+			systray.Quit()
+			return
+		}
+	}
 }
 
 func onExit() {
