@@ -53,12 +53,11 @@ var (
 	onceSync             sync.Once
 	isSystemInitializing = true
 
-	// UI 菜单引用
-	mTun   *systray.MenuItem
-	mProxy *systray.MenuItem
+	// UI 全局引用
+	mTun *systray.MenuItem
 )
 
-// --- 系统工具 ---
+// --- 权限管理 ---
 
 func isAdmin() bool {
 	var token windows.Token
@@ -75,6 +74,8 @@ func runAsAdmin() {
 	windows.ShellExecute(0, verb, exe, nil, cwd, windows.SW_HIDE)
 }
 
+// --- 核心初始化：Job Object (确保内核不残留) ---
+
 func initJobObject() {
 	h, _ := windows.CreateJobObject(nil, nil)
 	if h != 0 {
@@ -87,7 +88,7 @@ func initJobObject() {
 	}
 }
 
-// --- 配置动态嗅探 (来自第二份的精华) ---
+// --- 配置管理核心 (INI持久化 + YAML嗅探) ---
 
 func sniffAndSolidifyConfig() {
 	yamlPath := filepath.Join(baseDir, "config.yaml")
@@ -122,17 +123,68 @@ func sniffAndSolidifyConfig() {
 	configMu.Unlock()
 }
 
-// --- 进程管理 (合入第一份的 /T 压制性优点) ---
+func loadIniConfigAll() {
+	b, _ := os.ReadFile(filepath.Join(baseDir, CONFIG_FILE))
+	configMu.Lock()
+	defer configMu.Unlock()
+	lines := strings.Split(string(b), "\n")
+	for _, line := range lines {
+		if parts := strings.SplitN(strings.TrimSpace(line), "=", 2); len(parts) == 2 {
+			configData[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+		}
+	}
+	// 补全默认字段
+	defaults := map[string]string{"tun_enabled": "false", "system_proxy_enabled": "false", "mode": "rule", "auto_start": "false"}
+	for k, v := range defaults {
+		if _, ok := configData[k]; !ok { configData[k] = v }
+	}
+}
+
+func getIniConfig(key string) string {
+	configMu.RLock()
+	defer configMu.RUnlock()
+	return configData[key]
+}
+
+func saveIniConfig(key, val string) {
+	configMu.Lock()
+	configData[key] = val
+	var buf bytes.Buffer
+	for k, v := range configData {
+		if k != "" { buf.WriteString(fmt.Sprintf("%s = %s\n", k, v)) }
+	}
+	content := buf.Bytes()
+	configMu.Unlock()
+	_ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), content, 0644)
+}
+
+// --- 进程管理 (合入第一份代码的 /T 强力清理) ---
 
 func killMihomo() {
-	// 强制结束进程树，防止插件或子进程残留
+	// 使用 /T 彻底杀灭 mihomo 及其产生的任何子进程树
 	killCmd := exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe")
 	killCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 	_ = killCmd.Run()
 	
 	configMu.Lock()
-	onceSync = sync.Once{} // 内核重启后允许重新同步配置
+	onceSync = sync.Once{} // 内核重启，允许重新同步配置
 	configMu.Unlock()
+}
+
+func isProcessRunning(name string) bool {
+	h, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil { return false }
+	defer windows.CloseHandle(h)
+	var pe windows.ProcessEntry32
+	pe.Size = uint32(unsafe.Sizeof(pe))
+	if err := windows.Process32First(h, &pe); err != nil { return false }
+	for {
+		if strings.EqualFold(windows.UTF16ToString(pe.ExeFile[:]), name) && pe.ProcessID != uint32(os.Getpid()) {
+			return true
+		}
+		if err := windows.Process32Next(h, &pe); err != nil { break }
+	}
+	return false
 }
 
 func monitorKernelDaemon() {
@@ -159,7 +211,7 @@ func monitorKernelDaemon() {
 	}
 }
 
-// --- 网络状态监听 (保持第二份的严谨性) ---
+// --- 状态监听 (NotifyAddrChange 底层监听) ---
 
 func checkSystemState() int {
 	configMu.RLock()
@@ -191,12 +243,14 @@ func checkSystemState() int {
 			tunErrorCounter = 0
 			return StateTun
 		} else {
+			// 缓冲计数逻辑（第二份代码精华）
 			tunErrorCounter++
 			if tunErrorCounter > 5 { return StateError }
 			return StateTun
 		}
 	}
-	return map[bool]int{true: StateProxy, false: StateDefault}[wantProxy]
+	if wantProxy { return StateProxy }
+	return StateDefault
 }
 
 func watchTunState() {
@@ -206,8 +260,9 @@ func watchTunState() {
 	var overlapped syscall.Overlapped
 
 	for {
+		// 阻塞等待系统网卡事件
 		procNotifyAddrChange.Call(uintptr(unsafe.Pointer(&handle)), uintptr(unsafe.Pointer(&overlapped)))
-		time.Sleep(800 * time.Millisecond) // 等待系统网络堆栈稳定
+		time.Sleep(800 * time.Millisecond) 
 
 		hasTun := false
 		configMu.RLock()
@@ -222,16 +277,17 @@ func watchTunState() {
 			}
 		}
 
-		if mTun != nil {
+		if mTun != nil && !isSystemInitializing {
 			if hasTun { mTun.Check() } else { mTun.Uncheck() }
-			if !isSystemInitializing {
+			currentConfig := getIniConfig("tun_enabled") == "true"
+			if hasTun != currentConfig {
 				saveIniConfig("tun_enabled", fmt.Sprint(hasTun))
 			}
 		}
 	}
 }
 
-// --- UI 与 事件循环 ---
+// --- UI 与 事件 (合入瞬间勾选反馈优点) ---
 
 func onReady() {
 	sniffAndSolidifyConfig()
@@ -239,7 +295,7 @@ func onReady() {
 	setProxyRegistry(getIniConfig("system_proxy_enabled") == "true")
 
 	mWeb := systray.AddMenuItem("进入 Web 面板", "")
-	mProxy = systray.AddMenuItemCheckbox("系统代理", "", getIniConfig("system_proxy_enabled") == "true")
+	mProxy := systray.AddMenuItemCheckbox("系统代理", "", getIniConfig("system_proxy_enabled") == "true")
 	mTun = systray.AddMenuItemCheckbox("TUN 模式", "", getIniConfig("tun_enabled") == "true")
 	systray.AddSeparator()
 
@@ -263,19 +319,17 @@ func onReady() {
 	for {
 		select {
 		case <-mWeb.ClickedCh:
-			configMu.RLock()
-			url := configData["api_url"] + "/ui"
-			configMu.RUnlock()
-			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(url), nil, nil, windows.SW_SHOWNORMAL)
+			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(getIniConfig("api_url")+"/ui"), nil, nil, windows.SW_SHOWNORMAL)
 
 		case <-mTun.ClickedCh:
 			next := !mTun.Checked()
-			if next { mTun.Check() } else { mTun.Uncheck() } // 瞬间反馈
+			// 移植优点：瞬间切换UI勾选状态，不等待API响应
+			if next { mTun.Check() } else { mTun.Uncheck() }
 			setTunMode(next)
 
 		case <-mProxy.ClickedCh:
 			next := !mProxy.Checked()
-			if next { mProxy.Check() } else { mProxy.Uncheck() } // 瞬间反馈
+			if next { mProxy.Check() } else { mProxy.Uncheck() }
 			setProxyRegistry(next)
 
 		case <-mRule.ClickedCh:
@@ -305,7 +359,7 @@ func onReady() {
 	}
 }
 
-// --- 基础逻辑支持 ---
+// --- 系统与API操作 ---
 
 func setMihomoMode(mode string) {
 	saveIniConfig("mode", mode)
@@ -318,6 +372,7 @@ func setMihomoMode(mode string) {
 }
 
 func setTunMode(enable bool) {
+	isSystemInitializing = true
 	saveIniConfig("tun_enabled", fmt.Sprint(enable))
 	configMu.RLock()
 	url := configData["api_url"] + "/configs"
@@ -325,6 +380,7 @@ func setTunMode(enable bool) {
 	body, _ := json.Marshal(map[string]interface{}{"tun": map[string]bool{"enable": enable}})
 	req, _ := http.NewRequest("PATCH", url, bytes.NewBuffer(body))
 	if resp, err := httpClient.Do(req); err == nil { resp.Body.Close() }
+	go func() { time.Sleep(3 * time.Second); isSystemInitializing = false }()
 }
 
 func setProxyRegistry(enable bool) {
@@ -356,61 +412,6 @@ func syncConfigToKernel() {
 	if resp, err := httpClient.Do(req); err == nil { resp.Body.Close() }
 }
 
-func isProcessRunning(name string) bool {
-	h, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
-	if err != nil { return false }
-	defer windows.CloseHandle(h)
-	var pe windows.ProcessEntry32
-	pe.Size = uint32(unsafe.Sizeof(pe))
-	if err := windows.Process32First(h, &pe); err != nil { return false }
-	for {
-		if strings.EqualFold(windows.UTF16ToString(pe.ExeFile[:]), name) && pe.ProcessID != uint32(os.Getpid()) {
-			return true
-		}
-		if err := windows.Process32Next(h, &pe); err != nil { break }
-	}
-	return false
-}
-
-func loadIniConfigAll() {
-	b, _ := os.ReadFile(filepath.Join(baseDir, CONFIG_FILE))
-	configMu.Lock()
-	defer configMu.Unlock()
-	for _, line := range strings.Split(string(b), "\n") {
-		if parts := strings.SplitN(strings.TrimSpace(line), "=", 2); len(parts) == 2 {
-			configData[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
-		}
-	}
-	defaults := map[string]string{"tun_enabled": "false", "system_proxy_enabled": "false", "mode": "rule", "auto_start": "false"}
-	changed := false
-	for k, v := range defaults {
-		if _, ok := configData[k]; !ok { configData[k] = v; changed = true }
-	}
-	if changed {
-		var buf bytes.Buffer
-		for k, v := range configData { buf.WriteString(fmt.Sprintf("%s = %s\n", k, v)) }
-		_ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), buf.Bytes(), 0644)
-	}
-}
-
-func getIniConfig(key string) string {
-	configMu.RLock()
-	defer configMu.RUnlock()
-	return configData[key]
-}
-
-func saveIniConfig(key, val string) {
-	configMu.Lock()
-	configData[key] = val
-	var buf bytes.Buffer
-	for k, v := range configData {
-		if k = strings.TrimSpace(k); k != "" { buf.WriteString(fmt.Sprintf("%s = %s\n", k, v)) }
-	}
-	content := buf.Bytes()
-	configMu.Unlock()
-	_ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), content, 0644)
-}
-
 func toggleAutoStart(enable bool) {
 	saveIniConfig("auto_start", fmt.Sprint(enable))
 	key, _ := registry.OpenKey(registry.CURRENT_USER, REG_RUN, registry.SET_VALUE)
@@ -430,7 +431,7 @@ func monitorIconState() {
 			}
 			lastState = curr
 		}
-		time.Sleep(time.Second)
+		time.Sleep(1 * time.Second)
 	}
 }
 
@@ -448,7 +449,11 @@ func main() {
 	if err != nil || windows.WaitForSingleObject(h, 0) == windows.WAIT_TIMEOUT { return }
 	hMutex = h
 
-	if !isAdmin() { runAsAdmin(); return }
+	if !isAdmin() {
+		windows.CloseHandle(hMutex)
+		runAsAdmin()
+		return
+	}
 
 	os.Chdir(baseDir)
 	initJobObject()
