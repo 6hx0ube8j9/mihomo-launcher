@@ -379,6 +379,7 @@ func checkSystemState() int {
 
 func watchTunState() {
 	var (
+		// 动态加载 iphlpapi.dll，这是监听 Windows 网络层变更最优雅的方式
 		modiphlpapi          = syscall.NewLazyDLL("iphlpapi.dll")
 		procNotifyAddrChange = modiphlpapi.NewProc("NotifyAddrChange")
 		handle               syscall.Handle
@@ -386,17 +387,19 @@ func watchTunState() {
 	)
 
 	for {
-		// 阻塞等待系统网络地址变化通知（例如网卡启动、禁用、IP变更）
+		// 1. 阻塞等待：只有当系统网卡状态发生变化（如拨号、网卡启用/禁用）时才会被唤醒
+		// 相比于 time.Sleep 轮询，这种方式几乎不占 CPU
 		procNotifyAddrChange.Call(uintptr(unsafe.Pointer(&handle)), uintptr(unsafe.Pointer(&overlapped)))
 		
-		// 适当缓冲，等待网卡层级完全就绪
+		// 2. 缓冲等待：网卡从“出现”到“分配 IP 完毕”需要一点时间
 		time.Sleep(500 * time.Millisecond)
 
+		// 3. 检测是否存在匹配的 TUN 网卡
 		hasTun := false
 		ifaces, err := net.Interfaces()
 		if err == nil {
 			for _, i := range ifaces {
-				// 使用动态匹配函数，优先匹配 YAML 里的 device 名
+				// 关键点：调用你代码中通过 YAML 动态嗅探名字的匹配函数
 				if isTunInterfaceMatch(i.Name) {
 					hasTun = true
 					break
@@ -404,23 +407,26 @@ func watchTunState() {
 			}
 		}
 
-		// 只有在非初始化阶段（即用户未点击切换开关的稳定期）才进行 UI 同步和配置持久化
+		// 4. 状态同步逻辑
+		// 仅在非初始化阶段处理（防止 setTunMode 切换时产生竞态冲突）
 		if mTun != nil && !isSystemInitializing {
-			// 同步托盘菜单的勾选状态
+			
+			// A. 更新 UI 勾选状态
 			if hasTun {
 				mTun.Check()
 			} else {
 				mTun.Uncheck()
 			}
 
-			// 获取当前 ini 记录的状态，只有不一致时才写入，减少磁盘损耗
+			// B. 同步持久化配置
+			// 获取当前 ini 记录的值，只有当网卡实体状态与配置不符时才写入磁盘
 			currentConfig := getIniConfig("tun_enabled") == "true"
 			if hasTun != currentConfig {
 				saveIniConfig("tun_enabled", fmt.Sprint(hasTun))
 			}
 		}
 
-		// 防止协程过快空转，降低 CPU 占用
+		// 5. 兜底延迟，防止极端情况下（如 API 异常）产生高频死循环
 		time.Sleep(200 * time.Millisecond)
 	}
 }
@@ -610,35 +616,42 @@ func updateIconByState(state int) {
 }
 
 func main() {
-	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
-	h, err := windows.CreateMutex(nil, false, mName)
-	if err != nil {
-		return
-	}
-	event, _ := windows.WaitForSingleObject(h, 0)
-	if event == uint32(windows.WAIT_TIMEOUT) || event == uint32(windows.WAIT_FAILED) {
-		if h != 0 {
-			windows.CloseHandle(h)
-		}
-		return
-	}
-	hMutex = h
+    // 1. 单实例互斥锁检查
+    mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
+    h, err := windows.CreateMutex(nil, false, mName)
+    if err != nil {
+        return
+    }
+    event, _ := windows.WaitForSingleObject(h, 0)
+    if event == uint32(windows.WAIT_TIMEOUT) || event == uint32(windows.WAIT_FAILED) {
+        if h != 0 {
+            windows.CloseHandle(h)
+        }
+        return
+    }
+    hMutex = h
 
-	if !isAdmin() {
-		if hMutex != 0 {
-			windows.CloseHandle(hMutex)
-			hMutex = 0
-		}
-		runAsAdmin()
-		os.Exit(0)
-	}
+    // 2. 管理员权限检查与提权
+    if !isAdmin() {
+        // 提权前必须释放当前进程的互斥锁，否则新启动的管理员进程会因为检测到锁而直接退出
+        if hMutex != 0 {
+            windows.CloseHandle(hMutex)
+            hMutex = 0
+        }
+        runAsAdmin()
+        os.Exit(0)
+    }
 
-	os.Chdir(baseDir)
-	initJobObject()
+    // 3. 环境初始化
+    os.Chdir(baseDir)
+    initJobObject()
 
-	go monitorKernelDaemon()
-	go monitorIconState()
-	go watchTunState()
+    // 4. 启动后台监控协程 (必须在 systray.Run 之前)
+    go monitorKernelDaemon() // 守护 mihomo.exe
+    go monitorIconState()   // 刷新托盘图标
+    go watchTunState()      // 监听网络状态变更
 
-	systray.Run(onReady, onExit)
+    // 5. 启动托盘运行循环
+    // onReady 内部会执行 ensureDefaultConfig 和 sniffAndSolidifyConfig
+    systray.Run(onReady, onExit)
 }
