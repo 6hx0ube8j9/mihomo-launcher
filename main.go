@@ -262,32 +262,35 @@ func setProxyRegistry(enable bool) {
 
 // reloadConfigFile 直接通过 API 通知内核重载磁盘上的 YAML
 func reloadConfigFile() {
-    // 1. 开启保护锁，防止重载期间的逻辑抖动
     isSystemInitializing = true
 
-    configPath := filepath.Join(baseDir, "config.yaml")
+    // 获取绝对路径，内核对绝对路径的识别更稳定
+    configPath, _ := filepath.Abs(filepath.Join(baseDir, "config.yaml"))
+    
+    // 只提供 path，不提供 tun，不提供 mode
     payload := map[string]string{
         "path": configPath,
     }
 
-    // 2. 调用 API 进行热重载
-    // 注意：这里我们不需要在 reloadConfigFile 里再次声明 secret，
-    // 因为 doAPIRequest 函数内部已经自动处理了从 INI 读取 secret 并加入 Header 的逻辑。
-    resp, err := doAPIRequest("PUT", "/configs?force=false", payload)
+    // 使用 PATCH 而不是 PUT。PATCH 路径是 Mihomo 实现热重载的标准做法
+    resp, err := doAPIRequest("PATCH", "/configs", payload)
     
     if err != nil {
-        // 请求失败（内核未启动或网络错误），立即解锁，否则 watchTunState 会永久卡死
         isSystemInitializing = false
         return
     }
     defer resp.Body.Close()
 
-    // 3. 只有成功响应时，才交给 syncConfigToKernel 执行后续的“稳定期”同步
+    // 如果成功，只做一个简单的静默等待，不要调用 syncConfigToKernel
     if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
-        // syncConfigToKernel 会处理：PATCH 配置 -> 等待 3 秒 -> 解锁 isSystemInitializing
-        go syncConfigToKernel()
+        fmt.Println("热重载指令已发送")
+        go func() {
+            // 给内核 1 秒钟时间静默解析 YAML 并切换分流树
+            time.Sleep(1 * time.Second)
+            isSystemInitializing = false
+            fmt.Println("热重载完成，无网卡重启")
+        }()
     } else {
-        // 如果内核返回错误（如 400 路径错误），说明没重载成功，直接解锁
         isSystemInitializing = false
     }
 }
