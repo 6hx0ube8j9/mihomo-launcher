@@ -25,12 +25,11 @@ import (
 var iconFs embed.FS
 
 const (
-	APP_MUTEX          = "Global\\MihomoLauncher_Unique_Mutex"
-	CONFIG_FILE        = "mihomo-launcher.ini"
-	REG_RUN            = `Software\Microsoft\Windows\CurrentVersion\Run`
-	REG_PROXY          = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
-	APP_NAME           = "MihomoLauncher"
-	DEFAULT_PROXY_ADDR = "127.0.0.1:7890"
+	APP_MUTEX   = "Global\\MihomoLauncher_Unique_Mutex"
+	CONFIG_FILE = "mihomo-launcher.ini"
+	REG_RUN     = `Software\Microsoft\Windows\CurrentVersion\Run`
+	REG_PROXY   = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
+	APP_NAME    = "MihomoLauncher"
 
 	StateStop    = 0
 	StateError   = 1
@@ -52,9 +51,7 @@ var (
 	tunErrorCounter      = 0
 	onceSync             sync.Once
 	mTun                 *systray.MenuItem
-	isSystemInitializing = true 
-	// API_URL 现在是变量，默认值会被 sniff 覆盖
-	API_URL = "http://127.0.0.1:9090" 
+	isSystemInitializing = true
 )
 
 // --- 基础工具函数 ---
@@ -88,48 +85,14 @@ func initJobObject() {
 	}
 }
 
-// --- 配置管理核心 (引入 INI 逻辑) ---
+// --- 配置管理核心 (INI 保底 + YAML 矫正) ---
 
-// sniffAndSolidifyConfig 负责从 yaml 提取配置并存入 INI，解决你说的“不写文件”问题
-func sniffAndSolidifyConfig() {
-	configPath := filepath.Join(baseDir, "config.yaml")
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return
-	}
-
-	var controllerAddr string
-	lines := strings.Split(string(data), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		// 寻找 external-controller 字段
-		if strings.HasPrefix(line, "external-controller:") {
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) == 2 {
-				controllerAddr = strings.TrimSpace(parts[1])
-				controllerAddr = strings.Trim(controllerAddr, "\"'")
-			}
-			break
-		}
-	}
-
-	if controllerAddr != "" {
-		if strings.HasPrefix(controllerAddr, ":") {
-			controllerAddr = "127.0.0.1" + controllerAddr
-		}
-		newAPI := "http://" + controllerAddr
-		API_URL = newAPI
-		// 关键：嗅探到后立即落盘持久化
-		saveIniConfig("external-controller", newAPI)
-	}
-}
-
-func loadIniConfigAll() {
-	b, _ := os.ReadFile(filepath.Join(baseDir, CONFIG_FILE))
+func ensureDefaultConfig() {
 	configMu.Lock()
 	defer configMu.Unlock()
 
-	configData = make(map[string]string)
+	// 1. 读取现有文件
+	b, _ := os.ReadFile(filepath.Join(baseDir, CONFIG_FILE))
 	for _, line := range strings.Split(string(b), "\n") {
 		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") {
@@ -140,30 +103,70 @@ func loadIniConfigAll() {
 		}
 	}
 
-	// 尝试恢复 API_URL
-	if addr, ok := configData["external-controller"]; ok && addr != "" {
-		API_URL = addr
+	// 2. 强行检查 7 个保底字段，缺失或为空则填入初始化标准值
+	defaults := [][]string{
+		{"mode", "rule"},
+		{"tun_enabled", "false"},
+		{"system_proxy_enabled", "false"},
+		{"auto_start", "false"},
+		{"proxy_address", "127.0.0.1:7890"},
+		{"external-controller", "http://127.0.0.1:9090"},
+		{"secret", ""},
 	}
 
-	defaults := map[string]string{
-		"tun_enabled":          "false",
-		"system_proxy_enabled": "false",
-		"mode":                 "rule",
-		"auto_start":           "false",
-	}
-
-	needsSave := false
-	for k, v := range defaults {
-		if _, exists := configData[k]; !exists {
-			configData[k] = v
-			needsSave = true
+	changed := false
+	for _, pair := range defaults {
+		if val, exists := configData[pair[0]]; !exists || val == "" {
+			configData[pair[0]] = pair[1]
+			changed = true
 		}
 	}
 
-	if needsSave {
+	if changed {
 		configMu.Unlock()
-		saveIniConfig("", "") // 触发一次全量保存
+		saveIniConfig("", "") // 立即写入文件
 		configMu.Lock()
+	}
+}
+
+func sniffAndSolidifyConfig() {
+	configPath := filepath.Join(baseDir, "config.yaml")
+	data, err := os.ReadFile(configPath)
+	if err != nil {
+		return
+	}
+
+	lines := strings.Split(string(data), "\n")
+	for _, line := range lines {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+
+		// 嗅探 API 地址
+		if strings.HasPrefix(line, "external-controller:") {
+			addr := strings.Trim(strings.TrimPrefix(line, "external-controller:"), " \"'")
+			if strings.HasPrefix(addr, ":") {
+				addr = "127.0.0.1" + addr
+			}
+			if addr != "" {
+				saveIniConfig("external-controller", "http://"+addr)
+			}
+		}
+
+		// 嗅探 Secret
+		if strings.HasPrefix(line, "secret:") {
+			sec := strings.Trim(strings.TrimPrefix(line, "secret:"), " \"'")
+			saveIniConfig("secret", sec)
+		}
+
+		// 嗅探 代理端口 (mixed-port 优先级最高)
+		if strings.HasPrefix(line, "mixed-port:") || (strings.HasPrefix(line, "port:") && getIniConfig("proxy_address") == "127.0.0.1:7890") {
+			port := strings.Trim(strings.SplitN(line, ":", 2)[1], " \"'")
+			if port != "" {
+				saveIniConfig("proxy_address", "127.0.0.1:"+port)
+			}
+		}
 	}
 }
 
@@ -188,35 +191,42 @@ func saveIniConfig(key, val string) {
 	configMu.Unlock()
 
 	configPath := filepath.Join(baseDir, CONFIG_FILE)
-	tmpPath := configPath + ".tmp"
-	if err := os.WriteFile(tmpPath, content, 0644); err == nil {
-		os.Remove(configPath)
-		if err := os.Rename(tmpPath, configPath); err != nil {
-			os.Rename(tmpPath, configPath)
-		}
+	_ = os.WriteFile(configPath, content, 0644)
+}
+
+// 统一请求包装，处理 Secret
+func doAPIRequest(method, path string, payload interface{}) (*http.Response, error) {
+	url := getIniConfig("external-controller") + path
+	var body []byte
+	if payload != nil {
+		body, _ = json.Marshal(payload)
 	}
+
+	req, err := http.NewRequest(method, url, bytes.NewBuffer(body))
+	if err != nil {
+		return nil, err
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+	if secret := getIniConfig("secret"); secret != "" {
+		req.Header.Set("Authorization", "Bearer "+secret)
+	}
+
+	return httpClient.Do(req)
 }
 
 // --- 核心逻辑 ---
 
 func syncConfigToKernel() {
-	configMu.RLock()
-	tun := configData["tun_enabled"] == "true"
-	mode := configData["mode"]
-	if mode == "" { mode = "rule" }
-	proxy := configData["system_proxy_enabled"] == "true"
-	configMu.RUnlock()
+	tun := getIniConfig("tun_enabled") == "true"
+	mode := getIniConfig("mode")
+	proxy := getIniConfig("system_proxy_enabled") == "true"
 
 	payload := map[string]interface{}{
 		"mode": mode,
 		"tun":  map[string]bool{"enable": tun},
 	}
-	jsonPayload, _ := json.Marshal(payload)
-
-	req, err := http.NewRequest("PATCH", API_URL+"/configs", bytes.NewBuffer(jsonPayload))
-	if err != nil { return }
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := httpClient.Do(req)
+	resp, err := doAPIRequest("PATCH", "/configs", payload)
 	if err == nil {
 		defer resp.Body.Close()
 		if (resp.StatusCode == 204 || resp.StatusCode == 200) && proxy {
@@ -228,7 +238,9 @@ func syncConfigToKernel() {
 func monitorKernelDaemon() {
 	target := filepath.Join(baseDir, "mihomo.exe")
 	for {
-		if isReallyExiting { return }
+		if isReallyExiting {
+			return
+		}
 		if !isProcessRunning("mihomo.exe") {
 			onceSync = sync.Once{}
 			killCmd := exec.Command("taskkill", "/F", "/IM", "mihomo.exe", "/T")
@@ -255,7 +267,9 @@ func monitorKernelDaemon() {
 
 func monitorIconState() {
 	for {
-		if isReallyExiting { return }
+		if isReallyExiting {
+			return
+		}
 		var curr int
 		if !isProcessRunning("mihomo.exe") {
 			curr = StateStop
@@ -271,7 +285,7 @@ func monitorIconState() {
 }
 
 func checkSystemState() int {
-	resp, err := httpClient.Get(API_URL)
+	resp, err := doAPIRequest("GET", "", nil)
 	if err != nil {
 		tunErrorCounter = 0
 		return StateStop
@@ -286,10 +300,8 @@ func checkSystemState() int {
 		go syncConfigToKernel()
 	})
 
-	configMu.RLock()
-	wantTun := configData["tun_enabled"] == "true"
-	wantProxy := configData["system_proxy_enabled"] == "true"
-	configMu.RUnlock()
+	wantTun := getIniConfig("tun_enabled") == "true"
+	wantProxy := getIniConfig("system_proxy_enabled") == "true"
 
 	if wantTun {
 		hasTunInterface := false
@@ -297,8 +309,8 @@ func checkSystemState() int {
 		if err == nil {
 			for _, i := range ifaces {
 				name := strings.ToLower(i.Name)
-				if strings.Contains(name, "mihomo") || strings.Contains(name, "meta") || 
-				   strings.Contains(name, "clash") || strings.Contains(name, "sing-box") {
+				if strings.Contains(name, "mihomo") || strings.Contains(name, "meta") ||
+					strings.Contains(name, "clash") || strings.Contains(name, "sing-box") {
 					hasTunInterface = true
 					break
 				}
@@ -309,11 +321,15 @@ func checkSystemState() int {
 			return StateTun
 		} else {
 			tunErrorCounter++
-			if tunErrorCounter > 5 { return StateError }
+			if tunErrorCounter > 5 {
+				return StateError
+			}
 			return StateTun
 		}
 	}
-	if wantProxy { return StateProxy }
+	if wantProxy {
+		return StateProxy
+	}
 	return StateDefault
 }
 
@@ -332,55 +348,56 @@ func watchTunState() {
 		if err == nil {
 			for _, i := range ifaces {
 				name := strings.ToLower(i.Name)
-				if strings.Contains(name, "mihomo") || strings.Contains(name, "meta") || 
-				   strings.Contains(name, "clash") || strings.Contains(name, "sing-box") {
+				if strings.Contains(name, "mihomo") || strings.Contains(name, "meta") ||
+					strings.Contains(name, "clash") || strings.Contains(name, "sing-box") {
 					hasTun = true
 					break
 				}
 			}
 		}
 		if mTun != nil && !isSystemInitializing {
-			if hasTun { mTun.Check() } else { mTun.Uncheck() }
+			if hasTun {
+				mTun.Check()
+			} else {
+				mTun.Uncheck()
+			}
 			saveIniConfig("tun_enabled", fmt.Sprint(hasTun))
 		}
 		time.Sleep(100 * time.Millisecond)
 	}
 }
 
-func reloadConfigFile() {
-	configPath := filepath.Join(baseDir, "config.yaml")
-	if _, err := os.Stat(configPath); os.IsNotExist(err) { return }
-	body := map[string]string{"path": configPath}
-	jsonPayload, _ := json.Marshal(body)
-	req, _ := http.NewRequest("PATCH", API_URL+"/configs", bytes.NewBuffer(jsonPayload))
-	req.Header.Set("Content-Type", "application/json")
-	if resp, err := httpClient.Do(req); err == nil {
-		resp.Body.Close()
-	}
-}
-
 func isProcessRunning(name string) bool {
 	h, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
-	if err != nil { return false }
+	if err != nil {
+		return false
+	}
 	defer windows.CloseHandle(h)
 	var pe windows.ProcessEntry32
 	pe.Size = uint32(unsafe.Sizeof(pe))
 	currPid := uint32(os.Getpid())
-	if err := windows.Process32First(h, &pe); err != nil { return false }
+	if err := windows.Process32First(h, &pe); err != nil {
+		return false
+	}
 	for {
 		pname := windows.UTF16ToString(pe.ExeFile[:])
-		if strings.EqualFold(pname, name) && pe.ProcessID != currPid { return true }
+		if strings.EqualFold(pname, name) && pe.ProcessID != currPid {
+			return true
+		}
 		pe.Size = uint32(unsafe.Sizeof(pe))
-		if err := windows.Process32Next(h, &pe); err != nil { break }
+		if err := windows.Process32Next(h, &pe); err != nil {
+			break
+		}
 	}
 	return false
 }
 
 func onReady() {
-	// --- 新增引入 ---
-	sniffAndSolidifyConfig() // 1. 先探测 yaml 并写入 INI
-	loadIniConfigAll()       // 2. 加载全量配置（含刚才嗅探到的 API 地址）
-	
+	// 1. 立即初始化保底配置
+	ensureDefaultConfig()
+	// 2. 尝试从 yaml 矫正
+	sniffAndSolidifyConfig()
+
 	setProxyRegistry(getIniConfig("system_proxy_enabled") == "true")
 	updateIconByState(StateStop)
 
@@ -391,14 +408,13 @@ func onReady() {
 
 	curMode := getIniConfig("mode")
 	modeMenus := make(map[string]*systray.MenuItem)
-	modeMenus["rule"] = systray.AddMenuItemCheckbox("规则模式", "", curMode == "rule" || curMode == "")
+	modeMenus["rule"] = systray.AddMenuItemCheckbox("规则模式", "", curMode == "rule")
 	modeMenus["global"] = systray.AddMenuItemCheckbox("全局模式", "", curMode == "global")
 	modeMenus["direct"] = systray.AddMenuItemCheckbox("直连模式", "", curMode == "direct")
 	systray.AddSeparator()
 
 	mAuto := systray.AddMenuItemCheckbox("开机自动启动", "", getIniConfig("auto_start") == "true")
 	mDir := systray.AddMenuItem("打开程序目录", "")
-	mReloadYAML := systray.AddMenuItem("重载配置文件", "")
 	mRestart := systray.AddMenuItem("重启内核", "")
 	systray.AddSeparator()
 	mExit := systray.AddMenuItem("退出程序", "")
@@ -406,31 +422,47 @@ func onReady() {
 	for {
 		select {
 		case <-mWeb.ClickedCh:
-			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(API_URL+"/ui"), nil, nil, windows.SW_SHOWNORMAL)
+			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(getIniConfig("external-controller")+"/ui"), nil, nil, windows.SW_SHOWNORMAL)
 		case <-modeMenus["rule"].ClickedCh:
 			setMihomoMode("rule")
-			modeMenus["rule"].Check(); modeMenus["global"].Uncheck(); modeMenus["direct"].Uncheck()
+			modeMenus["rule"].Check()
+			modeMenus["global"].Uncheck()
+			modeMenus["direct"].Uncheck()
 		case <-modeMenus["global"].ClickedCh:
 			setMihomoMode("global")
-			modeMenus["rule"].Uncheck(); modeMenus["global"].Check(); modeMenus["direct"].Uncheck()
+			modeMenus["rule"].Uncheck()
+			modeMenus["global"].Check()
+			modeMenus["direct"].Uncheck()
 		case <-modeMenus["direct"].ClickedCh:
 			setMihomoMode("direct")
-			modeMenus["rule"].Uncheck(); modeMenus["global"].Uncheck(); modeMenus["direct"].Check()
+			modeMenus["rule"].Uncheck()
+			modeMenus["global"].Uncheck()
+			modeMenus["direct"].Check()
 		case <-mTun.ClickedCh:
 			next := !mTun.Checked()
 			setTunMode(next)
-			if next { mTun.Check() } else { mTun.Uncheck() }
+			if next {
+				mTun.Check()
+			} else {
+				mTun.Uncheck()
+			}
 		case <-mProxy.ClickedCh:
 			next := !mProxy.Checked()
 			saveIniConfig("system_proxy_enabled", fmt.Sprint(next))
 			setProxyRegistry(next)
-			if next { mProxy.Check() } else { mProxy.Uncheck() }
-		case <-mReloadYAML.ClickedCh:
-			go reloadConfigFile()
+			if next {
+				mProxy.Check()
+			} else {
+				mProxy.Uncheck()
+			}
 		case <-mAuto.ClickedCh:
 			next := !mAuto.Checked()
 			toggleAutoStart(next)
-			if next { mAuto.Check() } else { mAuto.Uncheck() }
+			if next {
+				mAuto.Check()
+			} else {
+				mAuto.Uncheck()
+			}
 		case <-mDir.ClickedCh:
 			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
 		case <-mRestart.ClickedCh:
@@ -438,9 +470,7 @@ func onReady() {
 				killCmd := exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe")
 				killCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 				_ = killCmd.Run()
-				configMu.Lock()
 				onceSync = sync.Once{}
-				configMu.Unlock()
 			}()
 		case <-mExit.ClickedCh:
 			isReallyExiting = true
@@ -454,8 +484,12 @@ func onExit() {
 	if isReallyExiting {
 		setProxyRegistry(false)
 		time.Sleep(50 * time.Millisecond)
-		if hJob != 0 { windows.CloseHandle(hJob) }
-		if hMutex != 0 { windows.CloseHandle(hMutex) }
+		if hJob != 0 {
+			windows.CloseHandle(hJob)
+		}
+		if hMutex != 0 {
+			windows.CloseHandle(hMutex)
+		}
 	}
 }
 
@@ -464,21 +498,14 @@ func onExit() {
 func setMihomoMode(mode string) {
 	saveIniConfig("mode", mode)
 	payload := map[string]string{"mode": mode}
-	jsonBody, _ := json.Marshal(payload)
-	req, _ := http.NewRequest("PATCH", API_URL+"/configs", bytes.NewBuffer(jsonBody))
-	if resp, err := httpClient.Do(req); err == nil { resp.Body.Close() }
+	_, _ = doAPIRequest("PATCH", "/configs", payload)
 }
 
 func setTunMode(enable bool) {
-	isSystemInitializing = true 
+	isSystemInitializing = true
 	saveIniConfig("tun_enabled", fmt.Sprint(enable))
 	payload := map[string]interface{}{"tun": map[string]bool{"enable": enable}}
-	jsonBody, _ := json.Marshal(payload)
-	req, err := http.NewRequest("PATCH", API_URL+"/configs", bytes.NewBuffer(jsonBody))
-	if err == nil {
-		req.Header.Set("Content-Type", "application/json")
-		if resp, err := httpClient.Do(req); err == nil { resp.Body.Close() }
-	}
+	_, _ = doAPIRequest("PATCH", "/configs", payload)
 	go func() {
 		time.Sleep(3 * time.Second)
 		isSystemInitializing = false
@@ -490,11 +517,13 @@ func setProxyRegistry(enable bool) {
 		saveIniConfig("system_proxy_enabled", fmt.Sprint(enable))
 	}
 	key, err := registry.OpenKey(registry.CURRENT_USER, REG_PROXY, registry.SET_VALUE)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	defer key.Close()
 	if enable {
 		_ = key.SetDWordValue("ProxyEnable", 1)
-		_ = key.SetStringValue("ProxyServer", DEFAULT_PROXY_ADDR)
+		_ = key.SetStringValue("ProxyServer", getIniConfig("proxy_address"))
 	} else {
 		_ = key.SetDWordValue("ProxyEnable", 0)
 	}
@@ -513,18 +542,26 @@ func toggleAutoStart(enable bool) {
 
 func updateIconByState(state int) {
 	files := []string{"stop.ico", "error.ico", "tun.ico", "proxy.ico", "default.ico"}
-	if state < 0 || state >= len(files) { return }
+	if state < 0 || state >= len(files) {
+		return
+	}
 	b, err := iconFs.ReadFile("icons/" + files[state])
-	if err == nil { systray.SetIcon(b) }
+	if err == nil {
+		systray.SetIcon(b)
+	}
 }
 
 func main() {
 	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
 	h, err := windows.CreateMutex(nil, false, mName)
-	if err != nil { return }
+	if err != nil {
+		return
+	}
 	event, _ := windows.WaitForSingleObject(h, 0)
 	if event == uint32(windows.WAIT_TIMEOUT) || event == uint32(windows.WAIT_FAILED) {
-		if h != 0 { windows.CloseHandle(h) }
+		if h != 0 {
+			windows.CloseHandle(h)
+		}
 		return
 	}
 	hMutex = h
