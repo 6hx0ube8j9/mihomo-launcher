@@ -27,7 +27,7 @@ import (
 var iconFs embed.FS
 
 const (
-	APP_MUTEX = "Global\\MihomoLauncher_Unique_Mutex"
+	APP_MUTEX   = "Global\\MihomoLauncher_Unique_Mutex"
 	CONFIG_FILE = "mihomo-launcher.ini"
 	REG_RUN     = `Software\Microsoft\Windows\CurrentVersion\Run`
 	REG_PROXY   = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
@@ -48,7 +48,6 @@ var (
 
 	// --- 状态控制 ---
 	isReallyExiting      bool
-	isSystemInitializing = true
 	hJob                 windows.Handle
 	hMutex               windows.Handle
 	httpClient           = &http.Client{Timeout: 1 * time.Second}
@@ -60,6 +59,7 @@ var (
 	tunErrorCounter      = 0
 	onceSync             sync.Once
 	mTun                 *systray.MenuItem
+	isSystemInitializing = true // 蓝本核心：启动锁
 )
 
 // --- 基础工具函数 ---
@@ -93,14 +93,13 @@ func initJobObject() {
 	}
 }
 
-// --- 配置管理（手术区） ---
+// --- 配置管理（手术区：严格遵循蓝本原子写入，仅修改字段名） ---
 
 func sniffAndSolidifyConfig() {
 	configPath := filepath.Join(baseDir, "config.yaml")
 	file, err := os.Open(configPath)
 	
-	// 默认兜底
-	yamlController := "127.0.0.1:9090"
+	yamlController := "http://127.0.0.1:9090"
 	yamlSecret := ""
 	yamlPort := "7890"
 
@@ -115,9 +114,9 @@ func sniffAndSolidifyConfig() {
 		for scanner.Scan() {
 			line := scanner.Text()
 			if m := reController.FindStringSubmatch(line); len(m) > 1 {
-				yamlController = strings.TrimSpace(m[1])
+				yamlController = m[1]
 			} else if m := reSecret.FindStringSubmatch(line); len(m) > 1 {
-				yamlSecret = strings.TrimSpace(m[1])
+				yamlSecret = m[1]
 			} else if m := reMixed.FindStringSubmatch(line); len(m) > 1 {
 				yamlPort = m[1]
 			} else if m := rePort.FindStringSubmatch(line); len(m) > 1 && yamlPort == "7890" {
@@ -126,43 +125,57 @@ func sniffAndSolidifyConfig() {
 		}
 	}
 
-	// 变量固化逻辑
-	MixedPort = "127.0.0.1:" + yamlPort
 	if !strings.HasPrefix(yamlController, "http") {
 		yamlController = "http://" + yamlController
 	}
 	ExternalController = strings.TrimSuffix(yamlController, "/")
 	Secret = yamlSecret
+	MixedPort = "127.0.0.1:" + yamlPort
 
-	// 同步到内存 map，确保后续 saveIniConfig 有数据可用
 	configMu.Lock()
 	configData["proxy_address"] = MixedPort
 	configData["external-controller"] = ExternalController
 	configData["secret"] = Secret
-	// 基础开关默认值
-	if _, ok := configData["mode"]; !ok { configData["mode"] = "rule" }
-	if _, ok := configData["tun"]; !ok { configData["tun"] = "false" }
-	if _, ok := configData["system_proxy"]; !ok { configData["system_proxy"] = "false" }
-	if _, ok := configData["startup_enabled"]; !ok { configData["startup_enabled"] = "false" }
 	configMu.Unlock()
-
-	saveIniConfig("", "") // 触发一次全量写入
+	
+	// 初始化完成后立即保存一次全量 INI
+	saveIniConfig("", "") 
 }
 
 func loadIniConfigAll() {
-	b, err := os.ReadFile(filepath.Join(baseDir, CONFIG_FILE))
-	if err != nil { return }
-
+	b, _ := os.ReadFile(filepath.Join(baseDir, CONFIG_FILE))
 	configMu.Lock()
 	defer configMu.Unlock()
+
 	configData = make(map[string]string)
-	scanner := bufio.NewScanner(bytes.NewReader(b))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
+	for _, line := range strings.Split(string(b), "\n") {
+		line = strings.TrimSpace(line)
 		if line == "" || strings.HasPrefix(line, "#") { continue }
 		if parts := strings.SplitN(line, "=", 2); len(parts) == 2 {
 			configData[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
 		}
+	}
+
+	// 使用你要求的 INI 字段名
+	defaults := map[string]string{
+		"mode":            "rule",
+		"tun":             "false",
+		"system_proxy":    "false",
+		"startup_enabled": "false",
+	}
+
+	needsSave := false
+	for k, v := range defaults {
+		if _, exists := configData[k]; !exists {
+			configData[k] = v
+			needsSave = true
+		}
+	}
+
+	if needsSave {
+		configMu.Unlock() // 解锁去执行保存，保存函数内部有自己的锁
+		saveIniConfig("", "")
+		configMu.Lock() 
 	}
 }
 
@@ -172,11 +185,12 @@ func getIniConfig(key string) string {
 	return configData[key]
 }
 
+// 蓝本原装：原子性保存逻辑 (无损移植)
 func saveIniConfig(key, val string) {
 	configMu.Lock()
 	if key != "" { configData[key] = val }
 	
-	// 按指定顺序输出，保持 INI 美观
+	// 按照美观顺序排列
 	order := []string{"mode", "tun", "system_proxy", "startup_enabled", "proxy_address", "external-controller", "secret"}
 	var buf bytes.Buffer
 	for _, k := range order {
@@ -188,10 +202,16 @@ func saveIniConfig(key, val string) {
 	configMu.Unlock()
 
 	configPath := filepath.Join(baseDir, CONFIG_FILE)
-	_ = os.WriteFile(configPath, content, 0644)
+	tmpPath := configPath + ".tmp"
+
+	if err := os.WriteFile(tmpPath, content, 0644); err != nil { return }
+	os.Remove(configPath)
+	if err := os.Rename(tmpPath, configPath); err != nil {
+		_ = os.Rename(tmpPath, configPath)
+	}
 }
 
-// --- 核心逻辑 ---
+// --- 核心逻辑 (基于蓝本，注入 Secret 和动态 API) ---
 
 func sendAPIRequest(method, path string, payload interface{}) {
 	jsonBody, _ := json.Marshal(payload)
@@ -214,6 +234,7 @@ func syncConfigToKernel() {
 	tun := configData["tun"] == "true"
 	mode := configData["mode"]
 	if mode == "" { mode = "rule" }
+	proxy := configData["system_proxy"] == "true"
 	configMu.RUnlock()
 
 	payload := map[string]interface{}{
@@ -221,6 +242,8 @@ func syncConfigToKernel() {
 		"tun":  map[string]bool{"enable": tun},
 	}
 	sendAPIRequest("PATCH", "/configs", payload)
+	
+	if proxy { setProxyRegistry(true) }
 }
 
 func monitorKernelDaemon() {
@@ -269,7 +292,7 @@ func monitorIconState() {
 }
 
 func checkSystemState() int {
-	// 使用固化后的变量探测
+	// 1. 探测 API 状态（注入 Secret）
 	req, _ := http.NewRequest("GET", ExternalController+"/version", nil)
 	if Secret != "" { req.Header.Set("Authorization", "Bearer "+Secret) }
 	
@@ -280,8 +303,10 @@ func checkSystemState() int {
 	}
 	resp.Body.Close()
 
+	// 2. 蓝本原装解锁逻辑
 	if isSystemInitializing { isSystemInitializing = false }
 
+	// 3. 确保启动后只执行一次配置对齐
 	onceSync.Do(func() { go syncConfigToKernel() })
 
 	configMu.RLock()
@@ -312,6 +337,7 @@ func checkSystemState() int {
 	return StateDefault
 }
 
+// 蓝本原装：系统信号级网卡监听 (无损移植)
 func watchTunState() {
 	var (
 		modiphlpapi          = syscall.NewLazyDLL("iphlpapi.dll")
@@ -358,12 +384,11 @@ func isProcessRunning(name string) bool {
 }
 
 func onReady() {
-	// 加载并初始化
 	loadIniConfigAll()
+	// 如果配置中还没有动态变量，则嗅探一次
 	if getIniConfig("external-controller") == "" {
 		sniffAndSolidifyConfig()
 	} else {
-		// 从 INI 恢复变量
 		ExternalController = getIniConfig("external-controller")
 		Secret = getIniConfig("secret")
 		MixedPort = getIniConfig("proxy_address")
@@ -409,6 +434,7 @@ func onReady() {
 			if next { mTun.Check() } else { mTun.Uncheck() }
 		case <-mProxy.ClickedCh:
 			next := !mProxy.Checked()
+			saveIniConfig("system_proxy", fmt.Sprint(next))
 			setProxyRegistry(next)
 			if next { mProxy.Check() } else { mProxy.Uncheck() }
 		case <-mAuto.ClickedCh:
@@ -436,6 +462,8 @@ func onExit() {
 	}
 }
 
+// --- 系统操作 ---
+
 func setMihomoMode(mode string) {
 	saveIniConfig("mode", mode)
 	sendAPIRequest("PATCH", "/configs", map[string]string{"mode": mode})
@@ -445,11 +473,13 @@ func setTunMode(enable bool) {
 	isSystemInitializing = true
 	saveIniConfig("tun", fmt.Sprint(enable))
 	sendAPIRequest("PATCH", "/configs", map[string]interface{}{"tun": map[string]bool{"enable": enable}})
-	go func() { time.Sleep(3 * time.Second); isSystemInitializing = false }()
+	go func() { 
+		time.Sleep(3 * time.Second) 
+		isSystemInitializing = false 
+	}()
 }
 
 func setProxyRegistry(enable bool) {
-	saveIniConfig("system_proxy", fmt.Sprint(enable))
 	key, err := registry.OpenKey(registry.CURRENT_USER, REG_PROXY, registry.SET_VALUE)
 	if err != nil { return }
 	defer key.Close()
