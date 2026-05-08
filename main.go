@@ -526,7 +526,6 @@ func updateIconByState(state int) {
 func syncConfigToKernel() {
 	tun := getIniConfig("tun_enabled") == "true"
 	mode := getIniConfig("mode")
-	proxy := getIniConfig("system_proxy_enabled") == "true"
 
 	payload := map[string]interface{}{
 		"mode": mode,
