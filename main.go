@@ -1,6 +1,8 @@
 package main
 
 import (
+    "bufio"
+	"regexp"
 	"bytes"
 	"embed"
 	"encoding/json"
@@ -41,19 +43,25 @@ const (
 )
 
 var (
-	isReallyExiting      bool
-	hJob                 windows.Handle
-	hMutex               windows.Handle
-	httpClient           = &http.Client{Timeout: 1 * time.Second}
-	exePath, _           = os.Executable()
-	baseDir              = filepath.Dir(exePath)
-	configData           = make(map[string]string)
-	configMu             sync.RWMutex
-	lastState            = -1
-	tunErrorCounter      = 0
+    // 降维后的成品变量（直接给程序执行用，不含逻辑拼接）
+    ExternalController string // 样例: http://127.0.0.1:9090
+    Secret             string // 样例: your_password
+    MixedPort          string // 样例: 127.0.0.1:7890
+
+    // 状态控制
+    isReallyExiting bool
+	isSystemInitializing bool
+	tunErrorCounter      int
 	onceSync             sync.Once
-	mTun                 *systray.MenuItem // 提升为全局变量，供监听函数操作
-	isSystemInitializing = true            // 启动锁，防止启动时网络抖动误写配置
+	mTun                 *systray.MenuItem
+    hJob            windows.Handle
+    hMutex          windows.Handle
+    httpClient      = &http.Client{Timeout: 1 * time.Second}
+    exePath, _      = os.Executable()
+    baseDir         = filepath.Dir(exePath)
+    configData      = make(map[string]string)
+    configMu        sync.RWMutex
+    lastState       = -1
 )
 
 // --- 基础工具函数 ---
@@ -170,30 +178,15 @@ func syncConfigToKernel() {
 	configMu.RLock()
 	tun := configData["tun_enabled"] == "true"
 	mode := configData["mode"]
-	if mode == "" {
-		mode = "rule"
-	}
-	proxy := configData["system_proxy_enabled"] == "true"
+	if mode == "" { mode = "rule" }
 	configMu.RUnlock()
 
+	// 保持原有核心逻辑：一次性对齐所有内核参数
 	payload := map[string]interface{}{
 		"mode": mode,
 		"tun":  map[string]bool{"enable": tun},
 	}
-	jsonPayload, _ := json.Marshal(payload)
-
-	req, err := http.NewRequest("PATCH", API_URL+"/configs", bytes.NewBuffer(jsonPayload))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-	resp, err := httpClient.Do(req)
-	if err == nil {
-		defer resp.Body.Close()
-		if (resp.StatusCode == 204 || resp.StatusCode == 200) && proxy {
-			setProxyRegistry(true)
-		}
-	}
+	sendAPIRequest("PATCH", "/configs", payload)
 }
 
 func monitorKernelDaemon() {
@@ -251,23 +244,23 @@ func monitorIconState() {
 }
 
 func checkSystemState() int {
-	// 1. 探测 API 状态
-	resp, err := httpClient.Get(API_URL)
+	// 手术点：探测使用 ExternalController
+	req, _ := http.NewRequest("GET", ExternalController, nil)
+	if Secret != "" {
+		req.Header.Set("Authorization", "Bearer "+Secret)
+	}
+	
+	resp, err := httpClient.Do(req)
 	if err != nil {
-		// API 不通，重置错误计数，图标变红
 		tunErrorCounter = 0
 		return StateStop
 	}
-	// 必须关闭 Body 以释放连接句柄
 	defer resp.Body.Close()
 
-	// 2. 【核心优化】主动解除启动锁
-	// 只要探测到 API 正常，说明内核已就绪，立即释放锁定，允许 UI 同步
 	if isSystemInitializing {
 		isSystemInitializing = false
 	}
 
-	// 3. 确保启动后只执行一次配置对齐
 	onceSync.Do(func() {
 		go syncConfigToKernel()
 	})
@@ -277,18 +270,14 @@ func checkSystemState() int {
 	wantProxy := configData["system_proxy_enabled"] == "true"
 	configMu.RUnlock()
 
-	// 4. TUN 模式状态检测
 	if wantTun {
 		hasTunInterface := false
 		ifaces, err := net.Interfaces()
 		if err == nil {
 			for _, i := range ifaces {
 				name := strings.ToLower(i.Name)
-				// 匹配常见的虚拟网卡特征
-				if strings.Contains(name, "mihomo") || 
-				   strings.Contains(name, "meta") || 
-				   strings.Contains(name, "clash") || 
-				   strings.Contains(name, "sing-box") {
+				if strings.Contains(name, "mihomo") || strings.Contains(name, "meta") || 
+				   strings.Contains(name, "clash") || strings.Contains(name, "sing-box") {
 					hasTunInterface = true
 					break
 				}
@@ -297,23 +286,20 @@ func checkSystemState() int {
 
 		if hasTunInterface {
 			tunErrorCounter = 0
-			return StateTun // 绿色
+			return StateTun
 		} else {
-			// 5. 【黄色 Error 逻辑】网卡未发现，累加错误计数
+			// 保持原有逻辑：连续 5 秒没找到网卡才变黄
 			tunErrorCounter++
 			if tunErrorCounter > 5 {
-				return StateError // 连续 5 秒没找到网卡，变黄
+				return StateError
 			}
-			return StateTun // 5 秒内依然显示绿色，防止图标频繁跳动
+			return StateTun
 		}
 	}
 
-	// 6. 系统代理模式
 	if wantProxy {
-		return StateProxy // 蓝色
+		return StateProxy
 	}
-
-	// 7. 正常运行（白图标）
 	return StateDefault
 }
 
@@ -370,26 +356,12 @@ func watchTunState() {
 }
 
 func reloadConfigFile() {
-	configPath := filepath.Join(baseDir, "config.yaml")
-	if _, err := os.Stat(configPath); os.IsNotExist(err) {
-		return
-	}
-
-	body := map[string]string{"path": configPath}
-	jsonPayload, _ := json.Marshal(body)
-
-	url := API_URL + "/configs"
-	req, err := http.NewRequest("PATCH", url, bytes.NewBuffer(jsonPayload))
-	if err != nil {
-		return
-	}
-	req.Header.Set("Content-Type", "application/json")
-
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return
-	}
-	defer resp.Body.Close()
+    // 自愈联动：先重新扫一次 YAML 到 INI
+    sniffAndSolidifyConfig() 
+    
+    configPath := filepath.Join(baseDir, "config.yaml")
+    body := map[string]string{"path": configPath}
+    sendAPIRequest("PATCH", "/configs", body)
 }
 
 func isProcessRunning(name string) bool {
@@ -450,7 +422,7 @@ func onReady() {
     for {
         select {
         case <-mWeb.ClickedCh:
-            windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(API_URL+"/ui"), nil, nil, windows.SW_SHOWNORMAL)
+			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(ExternalController+"/ui"), nil, nil, windows.SW_SHOWNORMAL)
 
         case <-modeMenus["rule"].ClickedCh:
             setMihomoMode("rule")
@@ -519,6 +491,77 @@ func onReady() {
     }
 }
 
+func sniffAndSolidifyConfig() {
+    configPath := filepath.Join(baseDir, "config.yaml")
+    file, err := os.Open(configPath)
+    if err != nil {
+        // 如果连 yaml 都没有，给一组默认成品，防止程序崩溃
+        ExternalController = "http://127.0.0.1:9090"
+        MixedPort = "127.0.0.1:7890"
+        return
+    }
+    defer file.Close()
+
+    // 预设“脏活”处理中转站
+    tempPort := "7890" 
+    rawController := "127.0.0.1:9090"
+    rawSecret := ""
+
+    // 预编译正则：只扫非注释行，精准抓取
+    reController := regexp.MustCompile(`^external-controller:\s*['"]?([^'"]+?)['"]?`)
+    reSecret     := regexp.MustCompile(`^secret:\s*['"]?([^'"]+?)['"]?`)
+    reMixed      := regexp.MustCompile(`^mixed-port:\s*(\d+)`)
+    rePort       := regexp.MustCompile(`^port:\s*(\d+)`)
+
+    scanner := bufio.NewScanner(file)
+    for scanner.Scan() {
+        line := strings.TrimSpace(scanner.Text())
+        // 跳过空行和注释，这是最基本的性能尊重
+        if line == "" || strings.HasPrefix(line, "#") {
+            continue
+        }
+
+        if m := reController.FindStringSubmatch(line); len(m) > 1 {
+            rawController = m[1]
+        } else if m := reSecret.FindStringSubmatch(line); len(m) > 1 {
+            rawSecret = m[1]
+        } else if m := reMixed.FindStringSubmatch(line); len(m) > 1 {
+            tempPort = m[1]
+        } else if m := rePort.FindStringSubmatch(line); len(m) > 1 {
+            // 只有在没扫到 mixed-port 的情况下，才把普通 port 作为备选
+            if tempPort == "7890" { tempPort = m[1] }
+        }
+    }
+
+    // --- 开始“洗数据”：脏活一次干完 ---
+    
+    // 1. 处理 ExternalController：补全 IP 和协议头
+    if strings.HasPrefix(rawController, ":") {
+        rawController = "127.0.0.1" + rawController
+    }
+    if !strings.HasPrefix(rawController, "http") {
+        rawController = "http://" + rawController
+    }
+    ExternalController = rawController
+
+    // 2. 处理 Secret
+    Secret = rawSecret
+
+    // 3. 处理 MixedPort：直接拼接成品，程序以后拿来就用
+    MixedPort = "127.0.0.1:" + tempPort
+
+    // --- 固化阶段：写入 INI 快照 ---
+    // 这样下次启动，程序直接走“最短路径”读这三个成品
+    saveIniConfig("external-controller", ExternalController)
+    saveIniConfig("secret", Secret)
+    saveIniConfig("mixed-port", MixedPort)
+    
+    // 初始化时，如果 INI 是空的，默认给个 false 开关
+    if getIniConfig("system_proxy_enabled") == "" {
+        saveIniConfig("system_proxy_enabled", "false")
+    }
+}
+
 func onExit() {
 	if isReallyExiting {
 		setProxyRegistry(false)
@@ -536,32 +579,18 @@ func onExit() {
 
 func setMihomoMode(mode string) {
 	saveIniConfig("mode", mode)
-	payload := map[string]string{"mode": mode}
-	jsonBody, _ := json.Marshal(payload)
-	req, _ := http.NewRequest("PATCH", API_URL+"/configs", bytes.NewBuffer(jsonBody))
-	if resp, err := httpClient.Do(req); err == nil {
-		resp.Body.Close()
-	}
+	sendAPIRequest("PATCH", "/configs", map[string]string{"mode": mode})
 }
 
 func setTunMode(enable bool) {
-	// 1. 进入缓冲锁定：禁止 watchTunState 在网卡创建期间反向修改 UI
+	// 保持原有核心逻辑：3 秒锁定保护
 	isSystemInitializing = true 
-
 	saveIniConfig("tun_enabled", fmt.Sprint(enable))
 	
-	payload := map[string]interface{}{"tun": map[string]bool{"enable": enable}}
-	jsonBody, _ := json.Marshal(payload)
-	
-	req, err := http.NewRequest("PATCH", API_URL+"/configs", bytes.NewBuffer(jsonBody))
-	if err == nil {
-		req.Header.Set("Content-Type", "application/json")
-		if resp, err := httpClient.Do(req); err == nil {
-			resp.Body.Close()
-		}
-	}
+	sendAPIRequest("PATCH", "/configs", map[string]interface{}{
+		"tun": map[string]bool{"enable": enable},
+	})
 
-	// 2. 异步延时释放锁：给系统适配器和内核 3 秒的稳定缓冲时间
 	go func() {
 		time.Sleep(3 * time.Second)
 		isSystemInitializing = false
@@ -573,16 +602,35 @@ func setProxyRegistry(enable bool) {
 		saveIniConfig("system_proxy_enabled", fmt.Sprint(enable))
 	}
 	key, err := registry.OpenKey(registry.CURRENT_USER, REG_PROXY, registry.SET_VALUE)
-	if err != nil {
-		return
-	}
+	if err != nil { return }
 	defer key.Close()
 
 	if enable {
 		_ = key.SetDWordValue("ProxyEnable", 1)
-		_ = key.SetStringValue("ProxyServer", DEFAULT_PROXY_ADDR)
+		// 手术点：MixedPort 已经是成品 "127.0.0.1:XXXX"，直接写入
+		_ = key.SetStringValue("ProxyServer", MixedPort) 
 	} else {
 		_ = key.SetDWordValue("ProxyEnable", 0)
+	}
+}
+
+func sendAPIRequest(method, path string, payload interface{}) {
+	jsonBody, _ := json.Marshal(payload)
+	// 手术点：使用解析好的 ExternalController 替代写死的 API_URL
+	req, err := http.NewRequest(method, ExternalController+path, bytes.NewBuffer(jsonBody))
+	if err != nil {
+		return
+	}
+
+	// 手术点：自动注入从 YAML 扫出来的 Secret
+	if Secret != "" {
+		req.Header.Set("Authorization", "Bearer "+Secret)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := httpClient.Do(req)
+	if err == nil {
+		resp.Body.Close()
 	}
 }
 
@@ -609,36 +657,63 @@ func updateIconByState(state int) {
 }
 
 func main() {
-	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
-	h, err := windows.CreateMutex(nil, false, mName)
-	if err != nil {
-		return
-	}
+    // 1. 基础环境检查：权限提升
+    // 必须首先确保以管理员身份运行，否则后续创建网卡、修改注册表、写入文件都可能静默失败
+    if !isAdmin() {
+        runAsAdmin()
+        return
+    }
 
-	event, _ := windows.WaitForSingleObject(h, 0)
-	if event == uint32(windows.WAIT_TIMEOUT) || event == uint32(windows.WAIT_FAILED) {
-		if h != 0 {
-			windows.CloseHandle(h)
-		}
-		return
-	}
-	hMutex = h
+    // 2. 单实例锁：防止多个启动器互相抢占内核控制权
+    // 使用全局 Mutex，确保即使在不同 Session 下也只能运行一个 Launcher
+    hMutex, _ = windows.CreateMutex(nil, false, windows.StringToUTF16Ptr(APP_MUTEX))
+    if windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
+        os.Exit(0)
+    }
+    defer windows.CloseHandle(hMutex)
 
-	if !isAdmin() {
-		if hMutex != 0 {
-			windows.CloseHandle(hMutex)
-			hMutex = 0
-		}
-		runAsAdmin()
-		os.Exit(0)
-	}
+    // 3. 切换工作目录：环境锚定
+    // 无论从哪里启动（命令行、快捷方式、注册表），都强制将工作目录设为程序所在目录
+    // 这保证了 ./mihomo.exe 和 ./config.yaml 始终能被正确找到
+    os.Chdir(baseDir)
+    iniPath := filepath.Join(baseDir, CONFIG_FILE)
 
-	os.Chdir(baseDir)
-	initJobObject()
+    // 4. 配置加载与变量固化 (核心手术点)
+    // 逻辑：INI 存在则读快照（秒开）；不存在则扫 YAML 并生成快照（发现模式）
+    if _, err := os.Stat(iniPath); os.IsNotExist(err) {
+        // 进入自愈模式：扫描 YAML，提取外部控制地址、Secret 和端口
+        sniffAndSolidifyConfig() 
+    } else {
+        // 进入高效模式：直接从 INI 填充成品变量
+        loadIniConfigAll()
+        ExternalController = getIniConfig("external-controller")
+        Secret             = getIniConfig("secret")
+        MixedPort          = getIniConfig("mixed-port")
+    }
 
-	go monitorKernelDaemon()
-	go monitorIconState()
-	go watchTunState() // 启动系统推送监听
+    // 5. 变量二次兜底：安全网逻辑
+    // 防止 INI 文件损坏或 YAML 扫描失败导致的空变量
+    if ExternalController == "" { ExternalController = "http://127.0.0.1:9090" }
+    if MixedPort == "" { MixedPort = "127.0.0.1:7890" }
 
-	systray.Run(onReady, onExit)
+    // 6. 物理状态对齐：注册表同步
+    // 在内核启动前，先把 Windows 代理指向 MixedPort。
+    // 这确保了即便内核启动慢，用户的代理设置也是准确的。
+    isProxyEnabled := getIniConfig("system_proxy_enabled") == "true"
+    setProxyRegistry(isProxyEnabled)
+
+    // 7. 进程树生命周期管理
+    // 初始化 JobObject，将 Launcher 和 内核（mihomo.exe）绑定
+    // 这样当 Launcher 被结束或崩溃时，Windows 会自动清理掉内核进程，防止孤儿进程占用端口
+    initJobObject()
+
+    // 8. 启动异步监控流水线
+    // 这些协程现在消费的都是上面固化好的 ExternalController 和 Secret
+    go monitorKernelDaemon() // 负责内核的保活与重启
+    go monitorIconState()    // 负责根据 API 返回值切换托盘图标颜色
+    go watchTunState()       // 负责实时监听系统网卡变动并同步给 UI
+
+    // 9. UI 渲染与事件循环
+    // 正式进入系统托盘模式，接管用户交互
+    systray.Run(onReady, onExit)
 }
