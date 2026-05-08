@@ -262,25 +262,35 @@ func setProxyRegistry(enable bool) {
 
 // reloadConfigFile 直接通过 API 通知内核重载磁盘上的 YAML
 func reloadConfigFile() {
+    // 1. 开启保护锁，防止重载期间的逻辑抖动
     isSystemInitializing = true
-	configPath := filepath.Join(baseDir, "config.yaml")
-	payload := map[string]string{
-		"path": configPath,
-	}
-	// PUT /configs?force=false 实现平滑热重载
-	resp, err := doAPIRequest("PUT", "/configs?force=false", payload)
-	if err != nil {
-		fmt.Printf("[重载] 失败: %v\n", err)
-		return
-	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
-		fmt.Println("[重载] 配置文件已成功热重载")
-	}
-	go syncConfigToKernel()
+    configPath := filepath.Join(baseDir, "config.yaml")
+    payload := map[string]string{
+        "path": configPath,
+    }
+
+    // 2. 调用 API 进行热重载
+    // 注意：这里我们不需要在 reloadConfigFile 里再次声明 secret，
+    // 因为 doAPIRequest 函数内部已经自动处理了从 INI 读取 secret 并加入 Header 的逻辑。
+    resp, err := doAPIRequest("PUT", "/configs?force=false", payload)
+    
+    if err != nil {
+        // 请求失败（内核未启动或网络错误），立即解锁，否则 watchTunState 会永久卡死
+        isSystemInitializing = false
+        return
+    }
+    defer resp.Body.Close()
+
+    // 3. 只有成功响应时，才交给 syncConfigToKernel 执行后续的“稳定期”同步
+    if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
+        // syncConfigToKernel 会处理：PATCH 配置 -> 等待 3 秒 -> 解锁 isSystemInitializing
+        go syncConfigToKernel()
+    } else {
+        // 如果内核返回错误（如 400 路径错误），说明没重载成功，直接解锁
+        isSystemInitializing = false
+    }
 }
-
 func toggleAutoStart(enable bool) {
 	const taskName = "MihomoLauncherTask"
 	if key, err := registry.OpenKey(registry.CURRENT_USER, REG_RUN, registry.SET_VALUE); err == nil {
@@ -603,6 +613,7 @@ func onReady() {
 			setMihomoMode("direct")
 			modeMenus["rule"].Uncheck(); modeMenus["global"].Uncheck(); modeMenus["direct"].Check()
 		case <-mTun.ClickedCh:
+		    isSystemInitializing = true
 			next := !mTun.Checked()
 			saveIniConfig("tun_enabled", fmt.Sprint(next))
 			go syncConfigToKernel()
