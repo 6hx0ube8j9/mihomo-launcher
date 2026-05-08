@@ -480,61 +480,58 @@ func isProcessRunning(name string) bool {
 }
 
 func onReady() {
-    // 1. 立即初始化保底配置
-    ensureDefaultConfig()
-    // 2. 尝试从 yaml 矫正
-    sniffAndSolidifyConfig()
+	ensureDefaultConfig()
+	sniffAndSolidifyConfig()
 
-    setProxyRegistry(getIniConfig("system_proxy_enabled") == "true")
-    updateIconByState(StateStop)
+	setProxyRegistry(getIniConfig("system_proxy_enabled") == "true")
+	updateIconByState(StateStop)
 
-    // --- 第一组：Web 入口 (纯文本，无装饰) ---
-    mWeb := systray.AddMenuItem("进入 Web 面板", "") 
-    // 这道分隔线会将 Web 面板与下方的核心功能完全隔开
-    systray.AddSeparator()
+	// --- 第一组：Web 入口 ---
+	mWeb := systray.AddMenuItem("进入 Web 面板", "")
+	systray.AddSeparator()
 
-    // --- 第二组：功能开关 ---
-    mProxy := systray.AddMenuItemCheckbox("系统代理", "", getIniConfig("system_proxy_enabled") == "true")
-    mTun = systray.AddMenuItemCheckbox("TUN 模式", "", getIniConfig("tun_enabled") == "true")
-    systray.AddSeparator()
+	// --- 第二组：功能开关 ---
+	mProxy := systray.AddMenuItemCheckbox("系统代理", "", getIniConfig("system_proxy_enabled") == "true")
+	mTun = systray.AddMenuItemCheckbox("TUN 模式", "", getIniConfig("tun_enabled") == "true")
+	systray.AddSeparator()
 
-    // --- 第三组：运行模式 ---
-    curMode := getIniConfig("mode")
-    modeMenus := make(map[string]*systray.MenuItem)
-    modeMenus["rule"] = systray.AddMenuItemCheckbox("规则模式", "", curMode == "rule")
-    modeMenus["global"] = systray.AddMenuItemCheckbox("全局模式", "", curMode == "global")
-    modeMenus["direct"] = systray.AddMenuItemCheckbox("直连模式", "", curMode == "direct")
-    systray.AddSeparator()
+	// --- 第三组：运行模式 ---
+	curMode := getIniConfig("mode")
+	modeMenus := make(map[string]*systray.MenuItem)
+	modeMenus["rule"] = systray.AddMenuItemCheckbox("规则模式", "", curMode == "rule")
+	modeMenus["global"] = systray.AddMenuItemCheckbox("全局模式", "", curMode == "global")
+	modeMenus["direct"] = systray.AddMenuItemCheckbox("直连模式", "", curMode == "direct")
+	systray.AddSeparator()
 
-    // --- 第四组：系统项 ---
+	// --- 第四组：系统项 ---
 	isAuto := checkAutoStartStatus()
-    mAuto := systray.AddMenuItemCheckbox("开机自启动", "", isAuto)
-	if fmt.Sprint(isAuto) != getIniConfig("startup_enabled") {
-	    saveIniConfig("startup_enabled", fmt.Sprint(isAuto))
-	}	
-    mDir := systray.AddMenuItem("打开程序目录", "")
-    mRestart := systray.AddMenuItem("重启内核", "")
-    systray.AddSeparator()
-    mExit := systray.AddMenuItem("关闭程序", "")
+	mAuto := systray.AddMenuItemCheckbox("开机自启动", "", isAuto)
+    
+    // 【新增】重载配置文件菜单项
+	mReload := systray.AddMenuItem("重载配置文件", "") 
+    
+	mDir := systray.AddMenuItem("打开程序目录", "")
+	mRestart := systray.AddMenuItem("重启内核", "")
+	systray.AddSeparator()
+	mExit := systray.AddMenuItem("关闭程序", "")
 
 	for {
 		select {
 		case <-mWeb.ClickedCh:
-			// 自动提取配置并拼接全自动登录 URL
 			apiAddr := getIniConfig("external-controller")
 			secret := getIniConfig("secret")
 			host, port := "127.0.0.1", "9090"
-			
 			cleanAddr := strings.TrimPrefix(strings.TrimPrefix(apiAddr, "http://"), "https://")
 			if parts := strings.Split(cleanAddr, ":"); len(parts) == 2 {
 				host, port = parts[0], parts[1]
 			}
-			
-			// 最终合成：地址 + 免密参数 + 直接跳转到代理页面
-			finalURL := fmt.Sprintf("%s/ui/?hostname=%s&port=%s&secret=%s#/proxies",
-				apiAddr, host, port, secret)
-
+			finalURL := fmt.Sprintf("%s/ui/?hostname=%s&port=%s&secret=%s#/proxies", apiAddr, host, port, secret)
 			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(finalURL), nil, nil, windows.SW_SHOWNORMAL)
+
+		case <-mReload.ClickedCh:
+			// 【新增逻辑】手动重载
+			sniffAndSolidifyConfig() // 重新读取 YAML 里的端口和 Secret
+			reloadConfigFile()       // 通知内核生效
 
 		case <-modeMenus["rule"].ClickedCh:
 			setMihomoMode("rule")
@@ -562,7 +559,6 @@ func onReady() {
 			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
 		case <-mRestart.ClickedCh:
 			go func() {
-				// 强制结束内核进程以实现彻底重启
 				exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe").Run()
 				onceSync = sync.Once{}
 			}()
@@ -623,47 +619,51 @@ func setProxyRegistry(enable bool) {
 	}
 }
 
-// toggleAutoStart 实现开机自启动逻辑：使用 Windows 计划任务取代注册表
+// reloadConfigFile 直接通过 API 通知内核重载磁盘上的 YAML
+func reloadConfigFile() {
+	configPath := filepath.Join(baseDir, "config.yaml")
+	payload := map[string]string{
+		"path": configPath,
+	}
+	// force=false 表示平滑重载，不断开现有连接
+	resp, err := doAPIRequest("PUT", "/configs?force=false", payload)
+	if err != nil {
+		fmt.Printf("[重载] 失败: %v\n", err)
+		return
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
+		fmt.Println("[重载] 配置文件已平滑生效")
+	}
+}
+
 func toggleAutoStart(enable bool) {
-    const taskName = "MihomoLauncherTask"
-    
-    // 无论开启还是关闭，先尝试清理注册表旧项，保持配置一致
-    if key, err := registry.OpenKey(registry.CURRENT_USER, REG_RUN, registry.SET_VALUE); err == nil {
-        _ = key.DeleteValue(APP_NAME)
-        key.Close()
-    }
-    saveIniConfig("startup_enabled", fmt.Sprint(enable))
+	const taskName = "MihomoLauncherTask"
+	// 清理注册表旧项
+	if key, err := registry.OpenKey(registry.CURRENT_USER, REG_RUN, registry.SET_VALUE); err == nil {
+		_ = key.DeleteValue(APP_NAME)
+		key.Close()
+	}
+	saveIniConfig("startup_enabled", fmt.Sprint(enable))
 
-    if enable {
-        // 第一步：创建基础任务（利用 schtasks 处理权限最简单）
-        createCmd := exec.Command("schtasks", "/Create",
-            "/TN", taskName,
-            "/TR", "\""+exePath+"\"",
-            "/SC", "ONLOGON",
-            "/RL", "HIGHEST",
-            "/F")
-        createCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-        if err := createCmd.Run(); err != nil {
-            return 
-        }
-
-        // 第二步：使用你刚刚测试成功的 PowerShell 逻辑进行深度加固
-        // 增加 -ExecutionTimeLimit ([TimeSpan]::Zero) 彻底解决 72 小时停止问题
-        psScript := fmt.Sprintf(
-            `$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero); Set-ScheduledTask -TaskName '%s' -Settings $s`, 
-            taskName,
-        )
-        
-        modifyCmd := exec.Command("powershell", "-Command", psScript)
-        modifyCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-        _ = modifyCmd.Run()
-        
-    } else {
-        // 删除任务
-        deleteCmd := exec.Command("schtasks", "/Delete", "/TN", taskName, "/F")
-        deleteCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-        _ = deleteCmd.Run()
-    }
+	if enable {
+		// 1. 创建任务
+		createCmd := exec.Command("schtasks", "/Create", "/TN", taskName, "/TR", "\""+exePath+"\"", "/SC", "ONLOGON", "/RL", "HIGHEST", "/F")
+		createCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+		if err := createCmd.Run(); err != nil {
+			return 
+		}
+		// 2. PowerShell 深度加固 (解决电池启动和 72 小时限制)
+		psScript := fmt.Sprintf(`$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero); Set-ScheduledTask -TaskName '%s' -Settings $s`, taskName)
+		modifyCmd := exec.Command("powershell", "-Command", psScript)
+		modifyCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+		_ = modifyCmd.Run()
+	} else {
+		deleteCmd := exec.Command("schtasks", "/Delete", "/TN", taskName, "/F")
+		deleteCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+		_ = deleteCmd.Run()
+	}
 }
 
 // checkAutoStartStatus 实时检测系统计划任务列表中是否存在该自启项
