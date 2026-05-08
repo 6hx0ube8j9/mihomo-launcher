@@ -625,48 +625,44 @@ func setProxyRegistry(enable bool) {
 
 // toggleAutoStart 实现开机自启动逻辑：使用 Windows 计划任务取代注册表
 func toggleAutoStart(enable bool) {
+    const taskName = "MihomoLauncherTask"
+    
+    // 无论开启还是关闭，先尝试清理注册表旧项，保持配置一致
     if key, err := registry.OpenKey(registry.CURRENT_USER, REG_RUN, registry.SET_VALUE); err == nil {
-	    _ = key.DeleteValue(APP_NAME)
-		key.Close()
-	}	
+        _ = key.DeleteValue(APP_NAME)
+        key.Close()
+    }
     saveIniConfig("startup_enabled", fmt.Sprint(enable))
 
-    const taskName = "MihomoLauncherTask"
-
     if enable {
-        // --- 对应你脚本里的 :ADD 逻辑 ---
-        // /Create: 创建任务
-        // /TN: 任务名
-        // /TR: 执行路径（使用引号包裹 exePath 以处理路径中的空格）
-        // /SC ONLOGON: 当用户登录时触发启动
-        // /RL HIGHEST: 以最高权限运行（跳过开机 UAC 弹窗的关键）
-        // /F: 强制覆盖已有同名任务
-        cmd := exec.Command("schtasks", "/Create",
+        // 第一步：创建基础任务（利用 schtasks 处理权限最简单）
+        createCmd := exec.Command("schtasks", "/Create",
             "/TN", taskName,
             "/TR", "\""+exePath+"\"",
             "/SC", "ONLOGON",
             "/RL", "HIGHEST",
             "/F")
-
-        // 隐藏控制台窗口执行
-        cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-        if err := cmd.Run(); err != nil {
-            fmt.Printf("创建自启任务失败: %v\n", err)
+        createCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+        if err := createCmd.Run(); err != nil {
+            return 
         }
+
+        // 第二步：使用你刚刚测试成功的 PowerShell 逻辑进行深度加固
+        // 增加 -ExecutionTimeLimit ([TimeSpan]::Zero) 彻底解决 72 小时停止问题
+        psScript := fmt.Sprintf(
+            `$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero); Set-ScheduledTask -TaskName '%s' -Settings $s`, 
+            taskName,
+        )
+        
+        modifyCmd := exec.Command("powershell", "-Command", psScript)
+        modifyCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+        _ = modifyCmd.Run()
+        
     } else {
-        // --- 对应你脚本里的 :DEL 逻辑 ---
-        // /Delete: 删除任务
-        // /TN: 指定任务名（精准删除，不会影响其他任务）
-        // /F: 强制删除，无需用户手动输入 Y 确认
-        cmd := exec.Command("schtasks", "/Delete",
-            "/TN", taskName,
-            "/F")
-
-        cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-        if err := cmd.Run(); err != nil {
-            // 如果任务本来就不存在，这里会返回错误，直接忽略即可
-            fmt.Printf("删除自启任务跳过（可能任务不存在）: %v\n", err)
-        }
+        // 删除任务
+        deleteCmd := exec.Command("schtasks", "/Delete", "/TN", taskName, "/F")
+        deleteCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+        _ = deleteCmd.Run()
     }
 }
 
