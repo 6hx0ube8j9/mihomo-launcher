@@ -490,65 +490,54 @@ func updateIconByState(state int) {
 
 var syncMu sync.Mutex
 func syncConfigToKernel() {
-	// 1. 确保在同步期间，监听协程保持锁定状态
-	// 虽然调用它的地方通常已经设置了 true，但这里再加一道保险
-	isSystemInitializing = true
+    // 1. 确保在同步期间，监听协程保持锁定状态
+    isSystemInitializing = true
 
-	// 2. 从本地读取“真理” (INI 配置)
-	tun := getIniConfig("tun_enabled") == "true"
-	mode := getIniConfig("mode")
-	secret := getIniConfig("secret")
+    // 2. 从本地读取“真理” (INI 配置)
+    tun := getIniConfig("tun_enabled") == "true"
+    mode := getIniConfig("mode")
+    // --- 此处删除了 secret := getIniConfig("secret") ---
 
-	// 3. 构造推送负载
-	// 这里一次性推送所有核心配置，确保内核状态与本地配置完全对齐
-	payload := map[string]interface{}{
-		"mode": mode,
-		"tun":  map[string]bool{"enable": tun},
-	}
+    // 3. 构造推送负载
+    payload := map[string]interface{}{
+        "mode": mode,
+        "tun":  map[string]bool{"enable": tun},
+    }
 
-	// 4. 执行 Patch 请求
-	// 增加重试逻辑（可选），防止内核 API 还没完全准备好
-	var err error
-	var resp *http.Response
-	
-	// 最多重试 3 次，每次间隔 500ms
-	for i := 0; i < 3; i++ {
-		resp, err = doAPIRequest("PATCH", "/configs", payload)
-		if err == nil {
-			resp.Body.Close()
-			break
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
+    // 4. 执行 Patch 请求
+    var err error
+    var resp *http.Response
+    
+    for i := 0; i < 3; i++ {
+        resp, err = doAPIRequest("PATCH", "/configs", payload)
+        if err == nil {
+            resp.Body.Close()
+            break
+        }
+        time.Sleep(500 * time.Millisecond)
+    }
 
-	if err != nil {
-		fmt.Printf("同步配置到内核失败: %v\n", err)
-		// 如果同步失败，不解锁 isSystemInitializing，防止错误的逻辑导致反写
-		return
-	}
+    if err != nil {
+        fmt.Printf("同步配置到内核失败: %v\n", err)
+        return
+    }
 
-	// 5. 【关键手术点】进入稳定期
-	// 即使 Patch 成功，Windows 创建 TUN 网卡、分配 IP、设置路由也需要时间
-	// 如果立刻解锁，watchTunState 可能会因为“还没看到网卡”而瞬间把 tun_enabled 设为 false
-	
-	// 如果开启了 TUN，建议等待 3-4 秒；如果没开，1 秒足够
-	waitTime := 1 * time.Second
-	if tun {
-		waitTime = 3 * time.Second
-	}
-	
-	time.Sleep(waitTime)
+    // 5. 进入稳定期
+    waitTime := 1 * time.Second
+    if tun {
+        waitTime = 3 * time.Second
+    }
+    
+    time.Sleep(waitTime)
 
-	// 6. 正式交权
-	// 此时内核稳定，网卡已就绪，watchTunState 可以安全地开始监控外部变动了
-	isSystemInitializing = false
-	
-	// 同步 UI 勾选状态（确保菜单显示与 INI 一致）
-	if mTun != nil {
-		if tun { mTun.Check() } else { mTun.Uncheck() }
-	}
-	
-	fmt.Println("内核同步完成，保护锁已释放")
+    // 6. 正式交权
+    isSystemInitializing = false
+    
+    if mTun != nil {
+        if tun { mTun.Check() } else { mTun.Uncheck() }
+    }
+    
+    fmt.Println("内核同步完成，保护锁已释放")
 }
 
 // --- 程序主入口 ---
