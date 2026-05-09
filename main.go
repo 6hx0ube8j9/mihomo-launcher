@@ -332,7 +332,7 @@ func reloadConfigFile() {
 func toggleAutoStart(enable bool) {
 	const taskName = "MihomoLauncherTask"
 	
-	// 1. 先清理旧的注册表启动项残留（确保只使用任务计划这一种方式）
+	// 1. 清理旧的注册表启动项（保持环境纯净）
 	if key, err := registry.OpenKey(registry.CURRENT_USER, REG_RUN, registry.SET_VALUE); err == nil {
 		_ = key.DeleteValue(APP_NAME)
 		key.Close()
@@ -341,50 +341,49 @@ func toggleAutoStart(enable bool) {
 	success := false
 
 	if enable {
-		// 构建任务执行命令：进入程序目录并运行
-		taskCmd := fmt.Sprintf(`cmd.exe /c "cd /d \"%s\" && \"%s\""`, baseDir, exePath)
-
-		// A. 创建任务计划：登录时触发，以最高权限运行
+		// A. 创建基础任务（使用 schtasks 快速创建框架）
 		createCmd := exec.Command("schtasks", "/Create",
 			"/TN", taskName,
-			"/TR", taskCmd,
+			"/TR", fmt.Sprintf("\"%s\"", exePath), 
 			"/SC", "ONLOGON",
 			"/RL", "HIGHEST",
 			"/F")
-		
 		createCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 		
 		if err := createCmd.Run(); err == nil {
-			success = true // 基础任务创建成功
+			// B. 使用 PowerShell 进行深度修正
+			// 使用 @'' 这种 Here-Strings 方式处理路径，或者通过转义解决单引号问题
+			cleanExe := strings.ReplaceAll(exePath, "'", "''")
+			cleanDir := strings.ReplaceAll(baseDir, "'", "''")
 			
-			// B. 优化任务设置：允许电池模式启动、取消 3 天停止限制（使用 PowerShell 细化控制）
 			psScript := fmt.Sprintf(
-				`$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero); Set-ScheduledTask -TaskName '%s' -Settings $s`, 
-				taskName,
+				`$action = New-ScheduledTaskAction -Execute '%s' -WorkingDirectory '%s'; `+
+				`$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero); `+
+				`Set-ScheduledTask -TaskName '%s' -Action $action -Settings $settings`,
+				cleanExe, cleanDir, taskName,
 			)
+			
 			modifyCmd := exec.Command("powershell", "-Command", psScript)
 			modifyCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-			_ = modifyCmd.Run()
-		} else {
-			fmt.Printf("[AutoStart] 创建任务失败: %v\n", err)
+			
+			if err := modifyCmd.Run(); err == nil {
+				success = true // 只有这里成功了才算真正成功
+			}
 		}
 	} else {
 		// C. 删除任务计划
 		deleteCmd := exec.Command("schtasks", "/Delete", "/TN", taskName, "/F")
 		deleteCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-		
-		if err := deleteCmd.Run(); err == nil {
+		if err := deleteCmd.Run(); err == nil || !checkAutoStartStatus() {
 			success = true
-		} else {
-			// 如果任务本身就不存在，也视为“关闭”成功
-			if !checkAutoStartStatus() {
-				success = true
-			}
 		}
 	}
+
 	if success {
 		saveIniConfig("startup_enabled", fmt.Sprint(enable))
-		fmt.Printf("[AutoStart] 状态已同步为: %v\n", enable)
+		fmt.Printf("[AutoStart] 状态已成功同步为: %v\n", enable)
+	} else {
+		fmt.Printf("[AutoStart] 操作失败，请检查是否被安全软件拦截")
 	}
 }
 
