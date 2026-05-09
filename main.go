@@ -49,7 +49,7 @@ var (
 	isSystemInitializing = true
 	isSyncing            int32
 	isReallyExiting      bool
-	onceSync             sync.Once
+	hasFirstSynced       int32
 	exitOnce             sync.Once
 	configMu             sync.RWMutex
 	configData           = make(map[string]string)
@@ -224,7 +224,7 @@ func onReady() {
 			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
 		case <-mRestart.ClickedCh:
 			isSystemInitializing = true
-			onceSync = sync.Once{}
+			atomic.StoreInt32(&hasFirstSynced, 0)
 			KillProcessByName("mihomo.exe")
 		case <-mExit.ClickedCh:
 			isReallyExiting = true
@@ -235,17 +235,22 @@ func onReady() {
 }
 
 func onExit() {
-	exitOnce.Do(func() {
-		isReallyExiting = true
-		setProxyRegistry(false)
-		time.Sleep(100 * time.Millisecond)
-		if hJob != 0 {
-			windows.CloseHandle(hJob)
-		}
-		if hMutex != 0 {
-			windows.CloseHandle(hMutex)
-		}
-	})
+    exitOnce.Do(func() {
+        isReallyExiting = true
+        // 彻底关闭系统代理
+        setProxyRegistry(false)
+        
+        // 停止托盘图标
+        systray.Quit() 
+        
+        // 给 100ms 让协程收到 isReallyExiting 信号并退出
+        time.Sleep(100 * time.Millisecond)
+        
+        if hJob != 0 { windows.CloseHandle(hJob) }
+        if hMutex != 0 { windows.CloseHandle(hMutex) }
+        
+        os.Exit(0)
+    })
 }
 
 func monitorKernelDaemon() {
@@ -256,8 +261,8 @@ func monitorKernelDaemon() {
 			return
 		}
 		if !isProcessRunning("mihomo.exe") {
-			onceSync = sync.Once{}
 			isSystemInitializing = true
+			atomic.StoreInt32(&hasFirstSynced, 0)
 			atomic.StoreInt32(&isKernelActive, 0)
 			KillProcessByName("mihomo.exe")
 			time.Sleep(500 * time.Millisecond)
@@ -305,51 +310,84 @@ func monitorIconState() {
 }
 
 func watchTunState() {
-    modiphlpapi := syscall.NewLazyDLL("iphlpapi.dll")
-    procNotifyAddrChange := modiphlpapi.NewProc("NotifyAddrChange")
-    
-    var lastHasTun bool
-    // 初始化略...
+	// 使用 Ticker 替代阻塞 API。每 3-5 秒检查一次网卡状态对性能几乎无影响
+	// 但能保证程序退出的灵活性
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
 
-    for {
-        if isReallyExiting { return }
+	var lastHasTun bool
 
-        // 阻塞等待网卡状态变化，或 2秒超时
-        _, _, _ = procNotifyAddrChange.Call(0, 0)
-        time.Sleep(3 * time.Second)
+	// 初始化状态，先查一次防止漏掉启动时的状态
+	ifaces, _ := net.Interfaces()
+	for _, i := range ifaces {
+		if isTunInterfaceMatch(i.Name) {
+			lastHasTun = true
+			break
+		}
+	}
 
-        if isSystemInitializing || atomic.LoadInt32(&isSyncing) == 1 {
-            continue
-        }
+	for {
+		select {
+		case <-ticker.C:
+			// 1. 检查退出标志
+			if isReallyExiting {
+				return
+			}
 
-        // 检查 TUN 状态逻辑...
-        currentHasTun := false
-        ifaces, _ := net.Interfaces()
-        for _, i := range ifaces {
-            if isTunInterfaceMatch(i.Name) {
-                currentHasTun = true
-                break
-            }
-        }
+			// 2. 检查系统是否正在忙碌（初始化或正在同步中则跳过本次循环）
+			if isSystemInitializing || atomic.LoadInt32(&isSyncing) == 1 {
+				continue
+			}
 
-        if currentHasTun == lastHasTun { continue }
+			// 3. 获取当前网卡列表，检查 TUN 是否存在
+			currentHasTun := false
+			currentIfaces, err := net.Interfaces()
+			if err != nil {
+				// 获取失败可能是系统繁忙，跳过本次等待下一次 ticker
+				continue
+			}
 
-        // 只有内核活跃时才尝试同步
-        if atomic.LoadInt32(&isKernelActive) == 1 {
-            // 这里不需要关心 response，内部已处理释放
-            if _, err := doAPIRequest("GET", "/configs", nil); err == nil {
-                configEnabled := getIniConfig("tun_enabled") == "true"
-                if currentHasTun != configEnabled {
-                    if mTun != nil {
-                        if currentHasTun { mTun.Check() } else { mTun.Uncheck() }
-                    }
-                    saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
-                }
-            }
-        }
-        
-        lastHasTun = currentHasTun
-    }
+			for _, i := range currentIfaces {
+				if isTunInterfaceMatch(i.Name) {
+					currentHasTun = true
+					break
+				}
+			}
+
+			// 4. 只有当网卡状态发生“变化”时，才触发逻辑
+			if currentHasTun != lastHasTun {
+				// 记录日志或更新状态
+				lastHasTun = currentHasTun
+
+				// 只有内核处于活动状态时，才去同步 UI 和配置
+				if atomic.LoadInt32(&isKernelActive) == 1 {
+					// 更新托盘菜单的勾选状态
+					if mTun != nil {
+						if currentHasTun {
+							mTun.Check()
+						} else {
+							mTun.Uncheck()
+						}
+					}
+
+					// 自动持久化当前状态到 INI 配置
+					// 这样如果用户在外部手动关了 TUN，Launcher 也能记住
+					saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
+					
+					// 如果你希望在网卡丢失时通知内核，可以在这里调用 API
+					// _, _ = doAPIRequest("PATCH", "/configs", map[string]interface{}{"tun": map[string]bool{"enable": currentHasTun}})
+				}
+			}
+
+		default:
+			// 兜底检查，防止 select 意外卡死
+			if isReallyExiting {
+				return
+			}
+			// 稍微出让 CPU
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
 }
 func syncConfigToKernel() {
     if !atomic.CompareAndSwapInt32(&isSyncing, 0, 1) {
@@ -391,44 +429,67 @@ func syncConfigToKernel() {
 }
 
 func doAPIRequest(method, path string, payload interface{}) ([]byte, error) {
-    apiAddr := strings.TrimSuffix(getIniConfig("external-controller"), "/")
-    if apiAddr == "" {
-        return nil, fmt.Errorf("api address is empty")
-    }
-    url := apiAddr + "/" + strings.TrimPrefix(path, "/")
-    
-    var bodyReader io.Reader
-    if payload != nil {
-        b, _ := json.Marshal(payload)
-        bodyReader = bytes.NewBuffer(b)
-    }
+	// 1. 获取并格式化 API 地址
+	apiAddr := strings.TrimSuffix(getIniConfig("external-controller"), "/")
+	if apiAddr == "" {
+		return nil, fmt.Errorf("api address is empty")
+	}
+	url := apiAddr + "/" + strings.TrimPrefix(path, "/")
 
-    req, err := http.NewRequest(method, url, bodyReader)
-    if err != nil {
-        return nil, err
-    }
-    
-    req.Header.Set("Content-Type", "application/json")
-    if secret := getIniConfig("secret"); secret != "" {
-        req.Header.Set("Authorization", "Bearer "+secret)
-    }
+	// 2. 处理请求 Body
+	var bodyReader io.Reader
+	if payload != nil {
+		b, err := json.Marshal(payload)
+		if err != nil {
+			return nil, fmt.Errorf("marshal payload failed: %v", err)
+		}
+		bodyReader = bytes.NewBuffer(b)
+	}
 
-    resp, err := httpClient.Do(req)
-    if err != nil {
-        return nil, err
-    }
-    defer resp.Body.Close() // 确保释放
+	// 3. 创建请求
+	req, err := http.NewRequest(method, url, bodyReader)
+	if err != nil {
+		return nil, err
+	}
 
-    body, err := io.ReadAll(resp.Body)
-    if err != nil {
-        return nil, err
-    }
+	// 4. 设置 Header
+	req.Header.Set("Content-Type", "application/json")
+	if secret := getIniConfig("secret"); secret != "" {
+		req.Header.Set("Authorization", "Bearer "+secret)
+	}
 
-    if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-        return body, fmt.Errorf("API Error: %d", resp.StatusCode)
-    }
+	// 5. 执行请求
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	// 确保 Body 最终被关闭，防止连接泄漏
+	defer resp.Body.Close()
 
-    return body, nil
+	// 6. 性能优化：心跳检测逻辑
+	// 如果是 GET 请求且 path 为空（说明来自 checkSystemState 的存活检查）
+	// 我们只关心状态码，不关心内容，直接丢弃 Body 以节省内存分配
+	if method == "GET" && (path == "" || path == "/") {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("API Heartbeat Error: %d", resp.StatusCode)
+		}
+		return nil, nil
+	}
+
+	// 7. 读取响应内容
+	// 对于配置更新、状态获取等请求，我们需要读取完整的响应体
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response body failed: %v", err)
+	}
+
+	// 8. 错误状态码处理
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return body, fmt.Errorf("API Error: %d, Response: %s", resp.StatusCode, string(body))
+	}
+
+	return body, nil
 }
 
 func ensureDefaultConfig() {
@@ -605,54 +666,55 @@ func reloadConfigFile() {
 }
 
 func checkSystemState() int {
-    // 1. 尝试连接内核 API
-    // 既然 doAPIRequest 内部已经处理了 ReadAll 和 Close，这里直接判断 err
-    _, err := doAPIRequest("GET", "", nil) 
-    if err != nil {
-        tunErrorCounter = 0
-        return StateStop // 连不上 API，说明内核没启动或崩溃了
-    }
+	// 1. 尝试连接内核 API
+	// 传入空 path 会触发 doAPIRequest 内部的 io.Discard 优化，不产生内存开销
+	_, err := doAPIRequest("GET", "", nil) 
+	if err != nil {
+		tunErrorCounter = 0
+		return StateStop // 连不上 API，内核可能在重启或已崩溃
+	}
 
-    // 2. 内核连接成功，重置初始化标志
-    if isSystemInitializing {
-        isSystemInitializing = false
-    }
+	// 2. API 连接成功，确保初始化标志被重置
+	if isSystemInitializing {
+		isSystemInitializing = false
+	}
 
-    // 3. 首次启动成功后同步一次配置（只执行一次）
-    onceSync.Do(func() { 
-        go syncConfigToKernel() 
-    })
+	// 3. 核心修复：首次启动/重启内核后的第一次配置同步
+	// 使用 CompareAndSwap 保证全局只触发一次同步，且不会因为 onceSync 导致并发隐患
+	if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
+		go syncConfigToKernel()
+	}
 
-    // 4. 检查网卡/代理状态
-    if getIniConfig("tun_enabled") == "true" {
-        hasTun := false
-        ifaces, _ := net.Interfaces()
-        for _, i := range ifaces {
-            if isTunInterfaceMatch(i.Name) {
-                hasTun = true
-                break
-            }
-        }
+	// 4. 检查网卡/代理状态
+	if getIniConfig("tun_enabled") == "true" {
+		hasTun := false
+		ifaces, _ := net.Interfaces()
+		for _, i := range ifaces {
+			if isTunInterfaceMatch(i.Name) {
+				hasTun = true
+				break
+			}
+		}
 
-        if hasTun {
-            tunErrorCounter = 0
-            return StateTun // 正常：TUN 已开启且网卡存在
-        }
+		if hasTun {
+			tunErrorCounter = 0
+			return StateTun // 正常：TUN 已开启且网卡存在
+		}
 
-        // 容错逻辑：如果配置开启了 TUN 但找不到网卡，给予 8 秒左右的缓冲
-        tunErrorCounter++
-        if tunErrorCounter > 8 { 
-            return StateError // 确实出错了，显示感叹号图标
-        }
-        return StateStop // 缓冲中，显示停止状态
-    }
+		// 容错缓冲：防止内核启动 TUN 时网卡创建太慢导致图标闪烁
+		tunErrorCounter++
+		if tunErrorCounter > 8 { 
+			return StateError // 超过 8 秒还没看到网卡，确实出错了
+		}
+		return StateStop // 缓冲中
+	}
 
-    // 5. 检查系统代理状态
-    if getIniConfig("system_proxy_enabled") == "true" {
-        return StateProxy
-    }
+	// 5. 检查系统代理状态
+	if getIniConfig("system_proxy_enabled") == "true" {
+		return StateProxy
+	}
 
-    return StateDefault
+	return StateDefault
 }
 
 func isAdmin() bool {
@@ -687,24 +749,32 @@ func isProcessRunning(name string) bool {
 }
 
 func KillProcessByName(name string) {
-	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
-	if err != nil { return }
-	defer windows.CloseHandle(snapshot)
-	var pe windows.ProcessEntry32
-	pe.Size = uint32(unsafe.Sizeof(pe))
-	if err := windows.Process32First(snapshot, &pe); err != nil { return }
-	for {
-		if strings.EqualFold(windows.UTF16ToString(pe.ExeFile[:]), name) {
-			if pe.ProcessID != uint32(os.Getpid()) {
-				h, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, pe.ProcessID)
-				if err == nil {
-					_ = windows.TerminateProcess(h, 9)
-					windows.CloseHandle(h)
-				}
-			}
-		}
-		if err := windows.Process32Next(snapshot, &pe); err != nil { break }
-	}
+    snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+    if err != nil { return }
+    defer windows.CloseHandle(snapshot)
+    
+    var pe windows.ProcessEntry32
+    pe.Size = uint32(unsafe.Sizeof(pe))
+    
+    if err := windows.Process32First(snapshot, &pe); err != nil { return }
+    
+    for {
+        if strings.EqualFold(windows.UTF16ToString(pe.ExeFile[:]), name) {
+            pid := pe.ProcessID
+            if pid != uint32(os.Getpid()) {
+                h, err := windows.OpenProcess(windows.PROCESS_QUERY_INFORMATION|windows.PROCESS_TERMINATE, false, pid)
+                if err == nil {
+                    // 检查路径（可选）：确保只杀掉本程序目录下的内核
+                    // path, _ := getProcessPath(h) 
+                    // if strings.Contains(path, baseDir) { ... }
+                    
+                    _ = windows.TerminateProcess(h, 9)
+                    windows.CloseHandle(h)
+                }
+            }
+        }
+        if err := windows.Process32Next(snapshot, &pe); err != nil { break }
+    }
 }
 
 func checkAutoStartStatus() bool {
