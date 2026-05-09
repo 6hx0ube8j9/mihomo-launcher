@@ -23,6 +23,13 @@ jobs:
           go mod init mihomo-launcher || true
           go mod tidy
 
+      - name: Prepare Windows Resources
+        shell: pwsh
+        run: |
+          go install github.com/akavel/rsrc@latest
+          $GOPATH = go env GOPATH
+          & "$GOPATH\bin\rsrc.exe" -manifest main.manifest -o rsrc.syso
+
       - name: Build EXE
         shell: pwsh
         run: |
