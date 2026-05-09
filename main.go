@@ -76,7 +76,7 @@ func runAsAdmin() {
 	verb, _ := syscall.UTF16PtrFromString("runas")
 	exe, _ := syscall.UTF16PtrFromString(exePath)
 	cwd, _ := syscall.UTF16PtrFromString(baseDir)
-	_ = windows.ShellExecute(0, verb, exe, nil, cwd, windows.SW_SHOWNORMAL)
+	_ = windows.ShellExecute(0, verb, exe, nil, cwd, windows.SW_HIDE)
 }
 
 
@@ -378,25 +378,27 @@ func monitorKernelDaemon() {
 	absBaseDir, _ := filepath.Abs(baseDir)
 
 	for {
-		// 0. 退出判定
+		// 0. 退出判定：如果主程序准备退出，直接结束守护
 		if isReallyExiting {
 			return
 		}
 
 		// 1. 检查内核进程是否存活
 		if !isProcessRunning("mihomo.exe") {
-			// 发现进程丢失，重置 Once 对象，确保新进程拉起后能重新触发配置同步
+			// 状态重置：发现内核丢失，重置 Once 对象以便新进程拉起后同步配置
 			onceSync = sync.Once{}
 			
-			// 锁定初始化状态，防止 watchTunState 在内核还没拉起来时进行反向改写
+			// 锁定系统状态：进入初始化锁定，防止 watchTunState 等协程逻辑冲突
 			isSystemInitializing = true
+			atomic.StoreInt32(&isKernelActive, 0)
 
-			fmt.Println("[Daemon] 检测到内核未运行，准备启动...")
+			fmt.Println("[Daemon] 内核未运行，正在尝试拉起...")
 
-			// 2. 强力清理残留
-			// 使用 Taskkill 确保端口被完全释放
-			killCmd := exec.Command("taskkill", "/F", "/IM", "mihomo.exe", "/T")
-			killCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+			// 2. 强力清理残留：确保端口占用和僵尸进程被彻底清除
+			killCmd := exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe")
+			killCmd.SysProcAttr = &windows.SysProcAttr{
+				CreationFlags: windows.CREATE_NO_WINDOW | 0x00000008,
+			}
 			_ = killCmd.Run()
 			time.Sleep(500 * time.Millisecond)
 
@@ -404,47 +406,60 @@ func monitorKernelDaemon() {
 			cmd := exec.Command(target, "-d", ".")
 			cmd.Dir = absBaseDir
 
-			// 4. Windows 专用属性设置
+			// 4. 重要：丢弃输出流
+			// 如果不设置，子进程日志会发送到父进程管道，若不及时读取会导致子进程挂起
+			cmd.Stdout = nil
+			cmd.Stderr = nil
+
+			// 5. Windows 专用属性设置
 			cmd.SysProcAttr = &windows.SysProcAttr{
-				CreationFlags: windows.CREATE_NO_WINDOW | 0x00000008 | windows.CREATE_BREAKAWAY_FROM_JOB,
+				// CREATE_NO_WINDOW: 隐藏黑框
+				// CREATE_BREAKAWAY_FROM_JOB: 允许脱离父级 Job 以便我们手动将其加入 hJob
+				// 0x00000008: DETACHED_PROCESS 完全分离
+				CreationFlags: windows.CREATE_NO_WINDOW | 
+							   windows.CREATE_BREAKAWAY_FROM_JOB | 
+							   0x00000008,
 			}
 
-			// 5. 启动进程
+			// 6. 启动进程
 			if err := cmd.Start(); err == nil {
-				fmt.Printf("[Daemon] 内核已启动, PID: %d\n", cmd.Process.Pid)
+				fmt.Printf("[Daemon] 内核已拉起, PID: %d\n", cmd.Process.Pid)
 
-				// === 核心状态：标记内核活跃 ===
+				// 标记内核已激活
 				atomic.StoreInt32(&isKernelActive, 1)
 
-				// 6. 绑定 Job Object (生命周期强绑定)
+				// 7. 绑定 Job Object (如果初始化成功)
+				// 确保主程序异常崩溃时，Windows 会自动收割 mihomo.exe
 				if hJob != 0 {
-					hp, _ := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
-					if hp != 0 {
-						_ = windows.AssignProcessToJobObject(hJob, hp)
+					hp, err := windows.OpenProcess(
+						windows.PROCESS_SET_QUOTA | windows.PROCESS_TERMINATE, 
+						false, 
+						uint32(cmd.Process.Pid),
+					)
+					if err == nil {
+						_, _ = windows.AssignProcessToJobObject(hJob, hp)
 						_ = windows.CloseHandle(hp)
 					}
 				}
 
-				// 7. 异步监听退出
-				go func() {
-					_ = cmd.Wait()
-					// === 核心状态：标记内核停止 ===
+				// 8. 异步监听子进程结束
+				go func(c *exec.Cmd) {
+					_ = c.Wait()
 					atomic.StoreInt32(&isKernelActive, 0)
-					fmt.Println("[Daemon] 内核进程已结束")
-				}()
+					fmt.Println("[Daemon] 内核进程已退出")
+				}(cmd)
 
-				// 给内核 1 秒钟初始化 API 服务的时间
-				time.Sleep(1 * time.Second)
+				// 9. 启动安定期：等待 1.5 秒让内核 API 启动就绪
+				time.Sleep(1500 * time.Millisecond)
 				isSystemInitializing = false
 			} else {
-				// 启动失败的容错处理
-				fmt.Printf("[Daemon] 启动失败: %v\n", err)
-				atomic.StoreInt32(&isKernelActive, 0)
-				isSystemInitializing = false // 释放锁，允许重试逻辑介入
+				// 启动失败容错
+				fmt.Printf("[Daemon] 启动失败: %v，将在下次轮询重试\n", err)
+				isSystemInitializing = false
 			}
 		}
 
-		// 8. 轮询频率：每 2 秒检查一次
+		// 10. 轮询频率：2秒检查一次
 		time.Sleep(2 * time.Second)
 	}
 }
@@ -826,7 +841,9 @@ func main() {
     }()
 
     // 6. 强制清理残留进程 (内核层清理)
-    _ = exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe").Run()
+    killCmd := exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe")
+	killCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+	_ = killCmd.Run()	
     time.Sleep(200 * time.Millisecond)
 
     // 7. 配置预热
