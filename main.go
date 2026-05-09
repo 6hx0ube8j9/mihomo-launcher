@@ -1,27 +1,27 @@
 package main
 
 import (
-    "bytes"
-    "embed"
-    "encoding/json"
-    "fmt"
-    "io"
-    "net"
-    "net/http"
-    "os"
-    "os/exec"
-    "os/signal"
-    "path/filepath"
-    "strings"
-    "sync"
-    "sync/atomic"
-    "syscall"
-    "time"
-    "unsafe"
+	"bytes"
+	"embed"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+	"unsafe"
 
-    "github.com/getlantern/systray"
-    "golang.org/x/sys/windows"
-    "golang.org/x/sys/windows/registry"
+	"github.com/getlantern/systray"
+	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
 )
 
 //go:embed icons/*.ico
@@ -115,54 +115,9 @@ func main() {
 	}()
 
 	systray.Run(onReady, onExit)
+	onExit()
 }
 
-
-func isPanelAlreadyRunning() bool {
-    // 获取系统进程快照
-    h, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
-    if err != nil {
-        return false
-    }
-    defer windows.CloseHandle(h)
-
-    var pe windows.ProcessEntry32
-    pe.Size = uint32(unsafe.Sizeof(pe))
-    if err := windows.Process32First(h, &pe); err != nil {
-        return false
-    }
-
-    for {
-        exeName := windows.UTF16ToString(pe.ExeFile[:])
-        // 检查进程名是否为 msedge.exe
-        if strings.EqualFold(exeName, "msedge.exe") {
-            // 关键：检查该进程的命令行中是否包含我们定义的缓存目录关键字
-            // 这样可以防止误判用户自己平时打开的普通 Edge 浏览器
-            if checkProcessCmdline(pe.ProcessID, "EdgeAppCache") {
-                return true
-            }
-        }
-        if err := windows.Process32Next(h, &pe); err != nil {
-            break
-        }
-    }
-    return false
-}
-
-
-func checkProcessCmdline(pid uint32, keyword string) bool {
-    // 执行 wmic 获取命令行
-    cmd := exec.Command("wmic", "process", "where", fmt.Sprintf("ProcessId=%d", pid), "get", "CommandLine")
-    // 隐藏命令行窗口
-    cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-    
-    out, err := cmd.Output()
-    if err != nil {
-        return false
-    }
-    // 检查输出结果中是否包含关键字（如 EdgeAppCache）
-    return strings.Contains(string(out), keyword)
-}
 func onReady() {
 	saveIniConfig("startup_enabled", fmt.Sprint(checkAutoStartStatus()))
 	ensureDefaultConfig()
@@ -194,57 +149,46 @@ func onReady() {
 
 	mExit := systray.AddMenuItem("关闭程序", "")
 
-    for {
+	for {
 		select {
         case <-mWeb.ClickedCh:
-			// 1. 检查面板是否已在运行
-			if isPanelAlreadyRunning() {
-				// 如果已运行，发送一个唤醒指令给 Edge
-				// Edge 探测到目录占用时会自动将已有的窗口置顶
-				edgePath := `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`
-				if _, err := os.Stat(edgePath); err != nil {
-				    edgePath = "msedge"
-				}
-				userDataDir := filepath.Join(os.Getenv("TEMP"), "EdgeAppCache")
-				tempCmd := exec.Command(edgePath, "--user-data-dir="+userDataDir)
-				tempCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-				_ = tempCmd.Start()
-				
-				continue // 关键：拦截在此，不再执行下方的启动逻辑
-			}
+            apiAddr := getIniConfig("external-controller")
+            secret := getIniConfig("secret")
+            proxyAddr := getIniConfig("proxy_address")
 
-			// 2. 正常启动逻辑
-			apiAddr := getIniConfig("external-controller")
-			secret := getIniConfig("secret")
-			proxyAddr := getIniConfig("proxy_address")
+            cleanAddr := strings.TrimPrefix(strings.TrimPrefix(apiAddr, "http://"), "https://")
+            host, port := "127.0.0.1", "9090"
+            if parts := strings.Split(cleanAddr, ":"); len(parts) == 2 {
+                host, port = parts[0], parts[1]
+            }
 
-			cleanAddr := strings.TrimPrefix(strings.TrimPrefix(apiAddr, "http://"), "https://")
-			host, port := "127.0.0.1", "9090"
-			if parts := strings.Split(cleanAddr, ":"); len(parts) == 2 {
-				host, port = parts[0], parts[1]
-			}
+            finalURL := fmt.Sprintf("%s/ui/#/setup?hostname=%s&port=%s&secret=%s", apiAddr, host, port, secret)
+            userDataDir := filepath.Join(os.Getenv("TEMP"), "EdgeAppCache")
 
-			finalURL := fmt.Sprintf("%s/ui/#/setup?hostname=%s&port=%s&secret=%s", apiAddr, host, port, secret)
-			userDataDir := filepath.Join(os.Getenv("TEMP"), "EdgeAppCache")
+            args := []string{
+                "--app=" + finalURL,
+                "--window-size=1280,768",
+                "--user-data-dir=" + userDataDir,
+                "--proxy-server=" + proxyAddr,
+                "--no-first-run",
+                "--no-default-browser-check",
+            }
 
-			args := []string{
-				"--app=" + finalURL,
-				"--window-size=1280,768",
-				"--user-data-dir=" + userDataDir,
-				"--proxy-server=" + proxyAddr,
-				"--no-first-run",
-			}
+            edgePath := `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`
 
-			edgePath := `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`
-			var cmd *exec.Cmd
-			if _, err := os.Stat(edgePath); err == nil {
-				cmd = exec.Command(edgePath, args...)
-			} else {
-				cmd = exec.Command("cmd", append([]string{"/c", "start", "msedge"}, args...)...)
-			}
-
-			cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-			_ = cmd.Start()
+            // 检查文件是否存在，存在则直接启动（不通过 cmd 转发，最稳）
+            if _, err := os.Stat(edgePath); err == nil {
+                cmd := exec.Command(edgePath, args...)
+                cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+                _ = cmd.Start()
+            } else {
+                // 如果找不到路径，说明可能是绿色版或安装在别处，交给系统 PATH 寻找
+                // 这里不要手动加 "" 标题，直接启动 msedge
+                fallbackArgs := append([]string{"/c", "start", "msedge"}, args...)
+                cmd := exec.Command("cmd", fallbackArgs...)
+                cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+                _ = cmd.Start()
+            }
 		case <-mReload.ClickedCh:
 			sniffAndSolidifyConfig()
 			reloadConfigFile()
@@ -361,105 +305,153 @@ func monitorIconState() {
 }
 
 func watchTunState() {
-	modiphlpapi := syscall.NewLazyDLL("iphlpapi.dll")
-	procNotifyAddrChange := modiphlpapi.NewProc("NotifyAddrChange")
-	var lastHasTun bool
-	for {
-		if isReallyExiting { return }
-		var handle windows.Handle
-		procNotifyAddrChange.Call(uintptr(unsafe.Pointer(&handle)), 0)
-		time.Sleep(2 * time.Second)
-		if isSystemInitializing || atomic.LoadInt32(&isSyncing) == 1 {
-			continue
-		}
-		currentHasTun := false
-		ifaces, _ := net.Interfaces()
-		for _, i := range ifaces {
-			if isTunInterfaceMatch(i.Name) {
-				currentHasTun = true
-				break
-			}
-		}
-		if currentHasTun == lastHasTun {
-			continue
-		}
-		if atomic.LoadInt32(&isKernelActive) == 0 {
-			continue
-		}
-		resp, err := doAPIRequest("GET", "/configs", nil)
-		if err != nil {
-			continue
-		}
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-		configEnabled := getIniConfig("tun_enabled") == "true"
-		if currentHasTun != configEnabled {
-			if mTun != nil {
-				if currentHasTun { mTun.Check() } else { mTun.Uncheck() }
-			}
-			saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
-		}
-		lastHasTun = currentHasTun
-	}
-}
+    modiphlpapi := syscall.NewLazyDLL("iphlpapi.dll")
+    procNotifyAddrChange := modiphlpapi.NewProc("NotifyAddrChange")
+    
+    var lastHasTun bool
+    // 首次运行时先初始化状态
+    ifaces, _ := net.Interfaces()
+    for _, i := range ifaces {
+        if isTunInterfaceMatch(i.Name) {
+            lastHasTun = true
+            break
+        }
+    }
 
+    for {
+        if isReallyExiting { return }
+
+        // 阻塞点：直到网络配置发生变化才会继续往下走
+        // NotifyAddrChange 在阻塞模式下，直到变化发生才会返回
+        var handle windows.Handle
+        var overlapped windows.Overlapped
+        // 简单做法：直接调用阻塞版本（第二个参数传 nil/0）
+        procNotifyAddrChange.Call(uintptr(unsafe.Pointer(&handle)), 0)
+
+        // 变化发生后，稍微等一下，让系统完成网卡状态切换（可选）
+        time.Sleep(500 * time.Millisecond)
+
+        if isSystemInitializing || atomic.LoadInt32(&isSyncing) == 1 {
+            continue
+        }
+
+        // 检查当前是否有 TUN 网卡
+        currentHasTun := false
+        ifaces, _ := net.Interfaces()
+        for _, i := range ifaces {
+            if isTunInterfaceMatch(i.Name) {
+                currentHasTun = true
+                break
+            }
+        }
+
+        // 状态没变就不操作
+        if currentHasTun == lastHasTun {
+            continue
+        }
+
+        // 如果内核没跑，记下状态但不更新配置
+        if atomic.LoadInt32(&isKernelActive) == 0 {
+            lastHasTun = currentHasTun
+            continue
+        }
+
+        // 检查内核通信是否正常
+        _, err := doAPIRequest("GET", "/configs", nil)
+        if err != nil { 
+            continue 
+        }
+
+        // 状态同步逻辑
+        configEnabled := getIniConfig("tun_enabled") == "true"
+        if currentHasTun != configEnabled {
+            if mTun != nil {
+                if currentHasTun { mTun.Check() } else { mTun.Uncheck() }
+            }
+            saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
+        }
+        
+        lastHasTun = currentHasTun
+    }
+}
 func syncConfigToKernel() {
-	if !atomic.CompareAndSwapInt32(&isSyncing, 0, 1) {
-		return
-	}
-	defer atomic.StoreInt32(&isSyncing, 0)
-	isSystemInitializing = true
-	timer := time.AfterFunc(10*time.Second, func() { isSystemInitializing = false })
-	defer timer.Stop()
-	tunEnabled := getIniConfig("tun_enabled") == "true"
-	payload := map[string]interface{}{
-		"mode": getIniConfig("mode"),
-		"tun":  map[string]bool{"enable": tunEnabled},
-	}
-	success := false
-	for i := 0; i < 3; i++ {
-		resp, err := doAPIRequest("PATCH", "/configs", payload)
-		if err == nil {
-			io.Copy(io.Discard, resp.Body)
-			resp.Body.Close()
-			success = true
-			break
-		}
-		time.Sleep(time.Duration(i+1) * 500 * time.Millisecond)
-	}
-	if success && mTun != nil {
-		if tunEnabled { mTun.Check() } else { mTun.Uncheck() }
-	}
-	time.Sleep(1 * time.Second)
-	isSystemInitializing = false
+    if !atomic.CompareAndSwapInt32(&isSyncing, 0, 1) {
+        return
+    }
+    defer atomic.StoreInt32(&isSyncing, 0)
+
+    isSystemInitializing = true
+    // 保护：如果函数因为意外卡死，10秒后强制解除初始化状态
+    timer := time.AfterFunc(10*time.Second, func() { isSystemInitializing = false })
+    defer timer.Stop()
+
+    tunEnabled := getIniConfig("tun_enabled") == "true"
+    payload := map[string]interface{}{
+        "mode": getIniConfig("mode"),
+        "tun":  map[string]bool{"enable": tunEnabled},
+    }
+
+    success := false
+    for i := 0; i < 3; i++ {
+        _, err := doAPIRequest("PATCH", "/configs", payload)
+        if err == nil {
+            success = true
+            break // <--- 关键修改：成功了就别再试了
+        }
+        // 如果失败，等待一段时间重试
+        time.Sleep(time.Duration(i+1) * 500 * time.Millisecond)
+    }
+
+    if success {
+        if mTun != nil {
+            if tunEnabled { mTun.Check() } else { mTun.Uncheck() }
+        }
+        // 同步成功后稍微稳一下状态
+        time.Sleep(500 * time.Millisecond)
+    }
+
+    isSystemInitializing = false
 }
 
-func doAPIRequest(method, path string, payload interface{}) (*http.Response, error) {
-	apiAddr := strings.TrimSuffix(getIniConfig("external-controller"), "/")
-	url := apiAddr + "/" + strings.TrimPrefix(path, "/")
-	var bodyReader io.Reader
-	if payload != nil {
-		b, _ := json.Marshal(payload)
-		bodyReader = bytes.NewBuffer(b)
-	}
-	req, err := http.NewRequest(method, url, bodyReader)
-	if err != nil {
-		return nil, err
-	}
-	req.Header.Set("Content-Type", "application/json")
-	if secret := getIniConfig("secret"); secret != "" {
-		req.Header.Set("Authorization", "Bearer "+secret)
-	}
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-		return nil, fmt.Errorf("API Error: %d", resp.StatusCode)
-	}
-	return resp, nil
+func doAPIRequest(method, path string, payload interface{}) ([]byte, error) {
+    apiAddr := strings.TrimSuffix(getIniConfig("external-controller"), "/")
+    if apiAddr == "" {
+        return nil, fmt.Errorf("api address is empty")
+    }
+    url := apiAddr + "/" + strings.TrimPrefix(path, "/")
+    
+    var bodyReader io.Reader
+    if payload != nil {
+        b, _ := json.Marshal(payload)
+        bodyReader = bytes.NewBuffer(b)
+    }
+
+    req, err := http.NewRequest(method, url, bodyReader)
+    if err != nil {
+        return nil, err
+    }
+    
+    req.Header.Set("Content-Type", "application/json")
+    if secret := getIniConfig("secret"); secret != "" {
+        req.Header.Set("Authorization", "Bearer "+secret)
+    }
+
+    resp, err := httpClient.Do(req)
+    if err != nil {
+        return nil, err
+    }
+    defer resp.Body.Close() // 确保释放
+
+    body, err := io.ReadAll(resp.Body)
+    if err != nil {
+        return nil, err
+    }
+
+    if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+        return body, fmt.Errorf("API Error: %d", resp.StatusCode)
+    }
+
+    return body, nil
 }
 
 func ensureDefaultConfig() {
@@ -626,44 +618,66 @@ func toggleAutoStart(enable bool) {
 }
 
 func reloadConfigFile() {
-	isSystemInitializing = true
-	resp, err := doAPIRequest("PUT", "/configs?force=false", map[string]string{"path": filepath.Join(baseDir, "config.yaml")})
-	if err != nil {
-		isSystemInitializing = false
-		return
-	}
-	resp.Body.Close()
-	go syncConfigToKernel()
+    isSystemInitializing = true
+    // doAPIRequest 已经处理了 Body 的读取和关闭
+    _, err := doAPIRequest("PUT", "/configs?force=false", map[string]string{"path": filepath.Join(baseDir, "config.yaml")})
+    if err != nil {
+        isSystemInitializing = false
+        return
+    }
+    // 删掉 resp.Body.Close()
+    go syncConfigToKernel()
 }
 
 func checkSystemState() int {
-	resp, err := doAPIRequest("GET", "", nil)
-	if err != nil {
-		tunErrorCounter = 0
-		return StateStop
-	}
-	resp.Body.Close()
-	if isSystemInitializing { isSystemInitializing = false }
-	onceSync.Do(func() { go syncConfigToKernel() })
-	if getIniConfig("tun_enabled") == "true" {
-		hasTun := false
-		ifaces, _ := net.Interfaces()
-		for _, i := range ifaces {
-			if isTunInterfaceMatch(i.Name) {
-				hasTun = true
-				break
-			}
-		}
-		if hasTun {
-			tunErrorCounter = 0
-			return StateTun
-		}
-		tunErrorCounter++
-		if tunErrorCounter > 8 { return StateError }
-		return StateStop
-	}
-	if getIniConfig("system_proxy_enabled") == "true" { return StateProxy }
-	return StateDefault
+    // 1. 尝试连接内核 API
+    // 既然 doAPIRequest 内部已经处理了 ReadAll 和 Close，这里直接判断 err
+    _, err := doAPIRequest("GET", "", nil) 
+    if err != nil {
+        tunErrorCounter = 0
+        return StateStop // 连不上 API，说明内核没启动或崩溃了
+    }
+
+    // 2. 内核连接成功，重置初始化标志
+    if isSystemInitializing {
+        isSystemInitializing = false
+    }
+
+    // 3. 首次启动成功后同步一次配置（只执行一次）
+    onceSync.Do(func() { 
+        go syncConfigToKernel() 
+    })
+
+    // 4. 检查网卡/代理状态
+    if getIniConfig("tun_enabled") == "true" {
+        hasTun := false
+        ifaces, _ := net.Interfaces()
+        for _, i := range ifaces {
+            if isTunInterfaceMatch(i.Name) {
+                hasTun = true
+                break
+            }
+        }
+
+        if hasTun {
+            tunErrorCounter = 0
+            return StateTun // 正常：TUN 已开启且网卡存在
+        }
+
+        // 容错逻辑：如果配置开启了 TUN 但找不到网卡，给予 8 秒左右的缓冲
+        tunErrorCounter++
+        if tunErrorCounter > 8 { 
+            return StateError // 确实出错了，显示感叹号图标
+        }
+        return StateStop // 缓冲中，显示停止状态
+    }
+
+    // 5. 检查系统代理状态
+    if getIniConfig("system_proxy_enabled") == "true" {
+        return StateProxy
+    }
+
+    return StateDefault
 }
 
 func isAdmin() bool {
