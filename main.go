@@ -328,61 +328,61 @@ func reloadConfigFile() {
     }
 }
 func toggleAutoStart(enable bool) {
-	const taskName = "MihomoLauncherTask"
-	
-	// 1. 清理旧的注册表启动项（保持环境纯净）
-	if key, err := registry.OpenKey(registry.CURRENT_USER, REG_RUN, registry.SET_VALUE); err == nil {
-		_ = key.DeleteValue(APP_NAME)
-		key.Close()
-	}
+    const taskName = "MihomoLauncherTask"
+    
+    // 1. 清理旧的注册表启动项（保持环境纯净）
+    if key, err := registry.OpenKey(registry.CURRENT_USER, REG_RUN, registry.SET_VALUE); err == nil {
+        _ = key.DeleteValue(APP_NAME)
+        key.Close()
+    }
 
-	success := false
+    success := false
 
-	if enable {
-		// A. 创建基础任务（使用 schtasks 快速创建框架）
-		createCmd := exec.Command("schtasks", "/Create",
-			"/TN", taskName,
-			"/TR", fmt.Sprintf("\"%s\"", exePath), 
-			"/SC", "ONLOGON",
-			"/RL", "HIGHEST",
-			"/F")
-		createCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-		
-		if err := createCmd.Run(); err == nil {
-			// B. 使用 PowerShell 进行深度修正
-			// 使用 @'' 这种 Here-Strings 方式处理路径，或者通过转义解决单引号问题
-			cleanExe := strings.ReplaceAll(exePath, "'", "''")
-			cleanDir := strings.ReplaceAll(baseDir, "'", "''")
-			
-			psScript := fmt.Sprintf(
-				`$action = New-ScheduledTaskAction -Execute '%s' -WorkingDirectory '%s'; `+
-				`$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero); `+
-				`Set-ScheduledTask -TaskName '%s' -Action $action -Settings $settings`,
-				cleanExe, cleanDir, taskName,
-			)
-			
-			modifyCmd := exec.Command("powershell", "-Command", psScript)
-			modifyCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-			
-			if err := modifyCmd.Run(); err == nil {
-				success = true // 只有这里成功了才算真正成功
-			}
-		}
-	} else {
-		// C. 删除任务计划
-		deleteCmd := exec.Command("schtasks", "/Delete", "/TN", taskName, "/F")
-		deleteCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-		if err := deleteCmd.Run(); err == nil || !checkAutoStartStatus() {
-			success = true
-		}
-	}
+    if enable {
+        // A. 创建基础任务（使用 schtasks 快速创建框架）
+        createCmd := exec.Command("schtasks", "/Create",
+            "/TN", taskName,
+            "/TR", fmt.Sprintf("\"%s\"", exePath), 
+            "/SC", "ONLOGON",
+            "/RL", "HIGHEST",
+            "/F")
+        createCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+        
+        if err := createCmd.Run(); err == nil {
+            // B. 使用 PowerShell 进行深度修正
+            cleanExe := strings.ReplaceAll(exePath, "'", "''")
+            cleanDir := strings.ReplaceAll(baseDir, "'", "''")
+            
+            // 修复点：将所有 PowerShell 指令正确放入 fmt.Sprintf 的字符串参数内
+            psScript := fmt.Sprintf(
+                "$action = New-ScheduledTaskAction -Execute '%s' -WorkingDirectory '%s'; "+
+                "$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero); "+
+                "Set-ScheduledTask -TaskName '%s' -Action $action -Settings $settings",
+                cleanExe, cleanDir, taskName,
+            )
+            
+            modifyCmd := exec.Command("powershell", "-Command", psScript)
+            modifyCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+            
+            if err := modifyCmd.Run(); err == nil {
+                success = true // 只有这里成功了才算真正成功
+            }
+        }
+    } else {
+        // C. 删除任务计划
+        deleteCmd := exec.Command("schtasks", "/Delete", "/TN", taskName, "/F")
+        deleteCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+        if err := deleteCmd.Run(); err == nil || !checkAutoStartStatus() {
+            success = true
+        }
+    }
 
-	if success {
-		saveIniConfig("startup_enabled", fmt.Sprint(enable))
-		fmt.Printf("[AutoStart] 状态已成功同步为: %v\n", enable)
-	} else {
-		fmt.Printf("[AutoStart] 操作失败，请检查是否被安全软件拦截")
-	}
+    if success {
+        saveIniConfig("startup_enabled", fmt.Sprint(enable))
+        fmt.Printf("[AutoStart] 状态已成功同步为: %v\n", enable)
+    } else {
+        fmt.Printf("[AutoStart] 操作失败，请检查是否被安全软件拦截")
+    }
 }
 
 func checkAutoStartStatus() bool {
@@ -419,9 +419,7 @@ func monitorKernelDaemon() {
 
 			// 5. Windows 专用属性设置
 			cmd.SysProcAttr = &windows.SysProcAttr{
-				CreationFlags: windows.CREATE_NO_WINDOW | 
-							   windows.CREATE_BREAKAWAY_FROM_JOB | 
-							   0x00000008,
+				CreationFlags: windows.CREATE_NO_WINDOW,
 			}
 
 			// 6. 启动进程
@@ -800,88 +798,98 @@ func onExit() {
 }
 
 func main() {
-    // 1. 基础初始化
-    var err error
-    exePath, err = os.Executable()
-    if err != nil {
-        return
-    }
+    // 1. 基础环境初始化
+    exePath, _ = os.Executable()
     baseDir = filepath.Dir(exePath)
     _ = os.Chdir(baseDir)
 
-    // 2. 权限判定与提权
+    // 2. 【核心修复】先判定权限，不要在这里拿锁！
     if !isAdmin() {
         runAsAdmin()
-        // 提权后，普通进程必须立刻消失
+        // 这里直接退出，因为此时还没创建锁，不会干扰新进程
         os.Exit(0) 
     }
 
-    // --- 此时已是管理员身份 ---
-
-    // 3. 【解决锁死逻辑】先清理可能存在的僵尸进程
-    // 如果是因为之前的进程挂了导致的锁死，先尝试强杀除了自己以外的所有同名进程
-    // 这能有效解决“打不开”的问题
-    killOtherInstances()
-
-    // 4. 尝试加锁
+    // 3. 此时已经是管理员权限了，再去申请单实例锁
     mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
     h, err := windows.CreateMutex(nil, false, mName)
+    
+    // 如果锁已被占用，说明真的有一个程序在运行
     if err != nil || windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
-        // 如果还是报已存在，说明真的有一个正在运行的有效实例
         if h != 0 {
             windows.CloseHandle(h)
         }
-        return
+        return // 静默退出
     }
     hMutex = h
+    // 确保程序崩溃或意外退出时能释放锁（虽然系统会回收，但显式关闭更好）
+    defer windows.CloseHandle(hMutex)
 
-    // 5. 剩余初始化逻辑
+    // 4. 环境初始化
     ensureDefaultConfig()
-    sniffAndSolidifyConfig()
-
-    // 恢复代理状态
+    
+    // 5. 恢复代理状态
     lastProxyState := getIniConfig("system_proxy_enabled") == "true"
     setProxyRegistry(lastProxyState)
 
-    // 后台守护逻辑
+    // 6. 信号监听 (改为异步并在退出时正确触发 systray 停止)
+    go func() {
+        sigCh := make(chan os.Signal, 1)
+        signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+        <-sigCh
+        // 不要在这里直接 os.Exit，而是让 systray 退出，从而走统一的 onExit
+        systray.Quit()
+    }()
+
+    // 7. 清理并预热
+    KillProcessByName("mihomo.exe")
+    time.Sleep(200 * time.Millisecond) // 给系统回收资源一点时间
+    sniffAndSolidifyConfig()
     initJobObject()
-    KillProcessByName("mihomo.exe") // 清理残留内核
-    
+
+    // 8. 启动守护逻辑
     go monitorKernelDaemon()
     go monitorIconState()
     go watchTunState()
 
+    // 9. 进入事件循环
+    // 注意：onExit 会在这里作为回调被 systray 自动调用
     systray.Run(onReady, onExit)
 }
 
-// 新增：清理其他 launcher 实例的函数
-func killOtherInstances() {
-    myPid := uint32(os.Getpid())
-    myName := filepath.Base(exePath)
-    
-    snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
-    if err != nil {
-        return
-    }
-    defer windows.CloseHandle(snapshot)
+func KillProcessByName(name string) {
+	// 获取进程快照
+	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return
+	}
+	defer windows.CloseHandle(snapshot)
 
-    var pe windows.ProcessEntry32
-    pe.Size = uint32(unsafe.Sizeof(pe))
+	var pe windows.ProcessEntry32
+	pe.Size = uint32(unsafe.Sizeof(pe))
 
-    if err := windows.Process32First(snapshot, &pe); err == nil {
-        for {
-            pname := windows.UTF16ToString(pe.ExeFile[:])
-            // 如果名字相同但 PID 不同，说明是残留的僵尸进程
-            if strings.EqualFold(pname, myName) && pe.ProcessID != myPid {
-                hProcess, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, pe.ProcessID)
-                if err == nil {
-                    _ = windows.TerminateProcess(hProcess, 0)
-                    windows.CloseHandle(hProcess)
-                }
-            }
-            if err := windows.Process32Next(snapshot, &pe); err != nil {
-                break
-            }
-        }
-    }
+	if err := windows.Process32First(snapshot, &pe); err != nil {
+		return
+	}
+
+	for {
+		pname := windows.UTF16ToString(pe.ExeFile[:])
+		if strings.EqualFold(pname, name) {
+			if pe.ProcessID != uint32(os.Getpid()) {
+				// 尝试获取终止权限
+				hProcess, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, pe.ProcessID)
+				if err == nil {
+					// 强制终止：第二个参数是退出码，通常给 0 或 1
+					err = windows.TerminateProcess(hProcess, 9) 
+					windows.CloseHandle(hProcess)
+					if err == nil {
+						fmt.Printf("[Native] 成功秒杀残留进程: %s (PID: %d)\n", pname, pe.ProcessID)
+					}
+				}
+			}
+		}
+		if err := windows.Process32Next(snapshot, &pe); err != nil {
+			break
+		}
+	}
 }
