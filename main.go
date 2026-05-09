@@ -152,7 +152,38 @@ func onReady() {
 	for {
 		select {
         case <-mWeb.ClickedCh:
+            debugPort := "9823"
+            activated := false
+
+            // 使用短超时探测，避免阻塞 UI 线程
+            fastClient := &http.Client{Timeout: 500 * time.Millisecond}
+            resp, err := fastClient.Get(fmt.Sprintf("http://127.0.0.1:%s/json", debugPort))
+            
+            if err == nil {
+                var targets []map[string]interface{}
+                if err := json.NewDecoder(resp.Body).Decode(&targets); err == nil {
+                    for _, t := range targets {
+                        // 精准匹配：必须是页面，且 URL 包含 ui 或 setup 关键词
+                        pURL, _ := t["url"].(string)
+                        if t["type"] == "page" && (strings.Contains(pURL, "/ui/") || strings.Contains(pURL, "setup")) {
+                            if id, ok := t["id"].(string); ok {
+                                _, _ = fastClient.Get(fmt.Sprintf("http://127.0.0.1:%s/json/activate/%s", debugPort, id))
+                                activated = true
+                                break
+                            }
+                        }
+                    }
+                }
+                resp.Body.Close()
+            }
+
+            if activated {
+                continue
+            }
+
+            // --- 下面保持你原有的启动逻辑即可 ---
             apiAddr := getIniConfig("external-controller")
+            // ... 其余逻辑
             secret := getIniConfig("secret")
             proxyAddr := getIniConfig("proxy_address")
 
@@ -163,10 +194,11 @@ func onReady() {
             }
 
             finalURL := fmt.Sprintf("%s/ui/#/setup?hostname=%s&port=%s&secret=%s", apiAddr, host, port, secret)
-            userDataDir := filepath.Join(os.Getenv("TEMP"), "EdgeAppCache")
+            userDataDir := filepath.Join(os.Getenv("TEMP"), "MihomoLauncherEdge")
 
             args := []string{
                 "--app=" + finalURL,
+                "--remote-debugging-port=" + debugPort, // 注入调试端口
                 "--window-size=1280,768",
                 "--user-data-dir=" + userDataDir,
                 "--proxy-server=" + proxyAddr,
@@ -176,14 +208,11 @@ func onReady() {
 
             edgePath := `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`
 
-            // 检查文件是否存在，存在则直接启动（不通过 cmd 转发，最稳）
             if _, err := os.Stat(edgePath); err == nil {
                 cmd := exec.Command(edgePath, args...)
                 cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
                 _ = cmd.Start()
             } else {
-                // 如果找不到路径，说明可能是绿色版或安装在别处，交给系统 PATH 寻找
-                // 这里不要手动加 "" 标题，直接启动 msedge
                 fallbackArgs := append([]string{"/c", "start", "msedge"}, args...)
                 cmd := exec.Command("cmd", fallbackArgs...)
                 cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
