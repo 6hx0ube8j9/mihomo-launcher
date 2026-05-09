@@ -310,13 +310,9 @@ func reloadConfigFile() {
         "path": configPath,
     }
 
-    // 2. 调用 API 进行热重载
-    // 注意：这里我们不需要在 reloadConfigFile 里再次声明 secret，
-    // 因为 doAPIRequest 函数内部已经自动处理了从 INI 读取 secret 并加入 Header 的逻辑。
     resp, err := doAPIRequest("PUT", "/configs?force=false", payload)
     
     if err != nil {
-        // 请求失败（内核未启动或网络错误），立即解锁，否则 watchTunState 会永久卡死
         isSystemInitializing = false
         return
     }
@@ -324,16 +320,14 @@ func reloadConfigFile() {
 
     // 3. 只有成功响应时，才交给 syncConfigToKernel 执行后续的“稳定期”同步
     if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
-        // syncConfigToKernel 会处理：PATCH 配置 -> 等待 3 秒 -> 解锁 isSystemInitializing
         go syncConfigToKernel()
     } else {
-        // 如果内核返回错误（如 400 路径错误），说明没重载成功，直接解锁
         isSystemInitializing = false
     }
 }
 func toggleAutoStart(enable bool) {
     const taskName = "MihomoLauncherTask"
-    // 1. 清理旧的注册表启动项（保持整洁）
+    
     if key, err := registry.OpenKey(registry.CURRENT_USER, REG_RUN, registry.SET_VALUE); err == nil {
         _ = key.DeleteValue(APP_NAME)
         key.Close()
@@ -341,25 +335,25 @@ func toggleAutoStart(enable bool) {
     saveIniConfig("startup_enabled", fmt.Sprint(enable))
 
     if enable {
-        // 2. 创建任务：新增了 /D 参数定位工作目录
-        // 注意：/RL HIGHEST 确保了以管理员权限运行，这对 TUN 模式至关重要
+        taskCmd := fmt.Sprintf(`cmd.exe /c "cd /d \"%s\" && \"%s\""`, baseDir, exePath)
+
         createCmd := exec.Command("schtasks", "/Create", 
             "/TN", taskName, 
-            "/TR", "\""+exePath+"\"", 
-            "/D", "\""+baseDir+"\"", 
+            "/TR", taskCmd, 
             "/SC", "ONLOGON", 
             "/RL", "HIGHEST", 
             "/F")
+        
         createCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
         if err := createCmd.Run(); err != nil {
             return
         }
+
         psScript := fmt.Sprintf(`$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero); Set-ScheduledTask -TaskName '%s' -Settings $s`, taskName)
         modifyCmd := exec.Command("powershell", "-Command", psScript)
         modifyCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
         _ = modifyCmd.Run()
     } else {
-        // 4. 删除任务
         deleteCmd := exec.Command("schtasks", "/Delete", "/TN", taskName, "/F")
         deleteCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
         _ = deleteCmd.Run()
