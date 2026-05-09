@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"os/signal"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -793,94 +794,72 @@ func onExit() {
         // 5. 释放单实例互斥锁
         if hMutex != 0 {
             windows.CloseHandle(hMutex)
-			hMutex = 0
         }
-		time.Sleep(100 * time.Millisecond)
-		os.Exit(0)
     })
 }
 
 func main() {
-	// 1. 初始化基础路径 (直接写在 main 里，不使用新函数)
-	exePath, err := os.Executable()
-	if err == nil {
-		baseDir = filepath.Dir(exePath)
-		_ = os.Chdir(baseDir)
-	}
+    // 1. 路径初始化与工作目录锁定
+    var err error
+    exePath, err = os.Executable()
+    if err != nil {
+        return
+    }
+    baseDir = filepath.Dir(exePath)
+    _ = os.Chdir(baseDir)
 
-	// 2. 定义全局锁名称
-	// 注意：APP_MUTEX 常量已经包含了 "Global\"，所以这里不需要再加前缀
-	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
-	
-	// 3. 尝试创建互斥锁
-	// 使用 _ 忽略未使用的 err 变量，解决编译报错
-	h, _ := windows.CreateMutex(nil, false, mName)
-	lastErr := windows.GetLastError()
+    // 2. 环境自愈与状态恢复
+    // 首先确保加载了配置文件
+    ensureDefaultConfig()
+    // 读取上次保存的意图：如果是 true，启动时会自动把注册表勾选上
+    lastProxyState := getIniConfig("system_proxy_enabled") == "true"
+    setProxyRegistry(lastProxyState)
 
-	// --- 场景 A：高权限实例已存在，或正在启动中 ---
-	// 错误 5 (Access Denied) 或 183 (Already Exists) 都意味着该退场了
-	if lastErr == windows.ERROR_ALREADY_EXISTS || lastErr == windows.ERROR_ACCESS_DENIED {
-		if h != 0 {
-			windows.CloseHandle(h)
-		}
-		return 
-	}
+    // 3. 权限判定与提权
+    if !isAdmin() {
+        runAsAdmin()
+        return
+    }
 
-	// --- 场景 B：当前是普通权限，且拿到了唯一的锁 ---
-	if !isAdmin() {
-		// 发起提权请求
-		runAsAdmin()
+    // 4. 单实例互斥锁
+    mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
+    h, err := windows.CreateMutex(nil, false, mName)
+    if err != nil || windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
+        if h != 0 {
+            windows.CloseHandle(h)
+        }
+        return
+    }
+    hMutex = h
 
-		// 【关键】占住坑位 1 秒钟。
-		// 这 1 秒内，如果用户狂点，新开的普通进程会因为上面“场景 A”的判断而直接自杀
-		time.Sleep(1 * time.Second)
-		
-		if h != 0 {
-			windows.CloseHandle(h)
-		}
-		return
-	}
-
-	// --- 场景 C：管理员进程刚刚启动 ---
-	// 它可能正好撞上还没睡醒的普通进程。这时候要“等一等”，而不是直接退出。
-	if lastErr == windows.ERROR_ALREADY_EXISTS {
-		success := false
-		for i := 0; i < 20; i++ { // 最多排队等 2 秒
-			time.Sleep(100 * time.Millisecond)
-			// 再次尝试拿锁
-			h, _ = windows.CreateMutex(nil, false, mName)
-			if windows.GetLastError() != windows.ERROR_ALREADY_EXISTS {
-				success = true
-				break
-			}
-		}
-		if !success {
-			// 等了 2 秒锁还是没放开，说明后台确实有一个货真价实的管理员实例在跑
-			return 
-		}
-	}
-
-	// 成功获取唯一的运行权，接管锁句柄
-	hMutex = h
-
-	// 4. 后续初始化与启动
-	ensureDefaultConfig()
-	
-	isProxy := getIniConfig("system_proxy_enabled") == "true"
-	setProxyRegistry(isProxy)
+    // 5. 系统信号监听
+    go func() {
+        sigCh := make(chan os.Signal, 1)
+        signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+        <-sigCh
+        onExit()
+        os.Exit(0)
+    }()
 
 	KillProcessByName("mihomo.exe")
-	time.Sleep(200 * time.Millisecond)
-	
-	sniffAndSolidifyConfig()
-	initJobObject()
+    time.Sleep(200 * time.Millisecond)
 
-	// 开启守护与托盘
-	go monitorKernelDaemon()
-	go monitorIconState()
-	go watchTunState()
+    // 7. 配置预热
+    sniffAndSolidifyConfig()
 
-	systray.Run(onReady, onExit)
+    // 8. 初始化 Windows 作业对象
+    initJobObject()
+
+    // 9. 启动后台守护协程
+    go monitorKernelDaemon()
+    go monitorIconState()
+    go watchTunState()
+
+    // 10. 启动托盘界面
+    systray.Run(onReady, onExit)
+
+    // 11. 正常退出流程
+    onExit()
 }
 
 func KillProcessByName(name string) {
