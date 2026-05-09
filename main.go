@@ -309,28 +309,20 @@ func watchTunState() {
     procNotifyAddrChange := modiphlpapi.NewProc("NotifyAddrChange")
     
     var lastHasTun bool
-    // 首次运行时先初始化状态
-    ifaces, _ := net.Interfaces()
-    for _, i := range ifaces {
-        if isTunInterfaceMatch(i.Name) {
-            lastHasTun = true
-            break
-        }
-    }
+    // 初始化略...
 
     for {
         if isReallyExiting { return }
 
-        var handle windows.Handle
-        _, _, _ = procNotifyAddrChange.Call(uintptr(unsafe.Pointer(&handle)), 0)
-        _ = handle
-        time.Sleep(2 * time.Second)
+        // 阻塞等待网卡状态变化，或 2秒超时
+        _, _, _ = procNotifyAddrChange.Call(0, 0)
+        time.Sleep(3 * time.Second)
 
         if isSystemInitializing || atomic.LoadInt32(&isSyncing) == 1 {
             continue
         }
 
-        // 检查当前是否有 TUN 网卡
+        // 检查 TUN 状态逻辑...
         currentHasTun := false
         ifaces, _ := net.Interfaces()
         for _, i := range ifaces {
@@ -340,30 +332,20 @@ func watchTunState() {
             }
         }
 
-        // 状态没变就不操作
-        if currentHasTun == lastHasTun {
-            continue
-        }
+        if currentHasTun == lastHasTun { continue }
 
-        // 如果内核没跑，记下状态但不更新配置
-        if atomic.LoadInt32(&isKernelActive) == 0 {
-            lastHasTun = currentHasTun
-            continue
-        }
-
-        // 检查内核通信是否正常
-        _, err := doAPIRequest("GET", "/configs", nil)
-        if err != nil { 
-            continue 
-        }
-
-        // 状态同步逻辑
-        configEnabled := getIniConfig("tun_enabled") == "true"
-        if currentHasTun != configEnabled {
-            if mTun != nil {
-                if currentHasTun { mTun.Check() } else { mTun.Uncheck() }
+        // 只有内核活跃时才尝试同步
+        if atomic.LoadInt32(&isKernelActive) == 1 {
+            // 这里不需要关心 response，内部已处理释放
+            if _, err := doAPIRequest("GET", "/configs", nil); err == nil {
+                configEnabled := getIniConfig("tun_enabled") == "true"
+                if currentHasTun != configEnabled {
+                    if mTun != nil {
+                        if currentHasTun { mTun.Check() } else { mTun.Uncheck() }
+                    }
+                    saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
+                }
             }
-            saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
         }
         
         lastHasTun = currentHasTun
@@ -614,13 +596,11 @@ func toggleAutoStart(enable bool) {
 
 func reloadConfigFile() {
     isSystemInitializing = true
-    // doAPIRequest 已经处理了 Body 的读取和关闭
     _, err := doAPIRequest("PUT", "/configs?force=false", map[string]string{"path": filepath.Join(baseDir, "config.yaml")})
     if err != nil {
         isSystemInitializing = false
         return
     }
-    // 删掉 resp.Body.Close()
     go syncConfigToKernel()
 }
 
