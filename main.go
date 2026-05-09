@@ -2,6 +2,7 @@ package main
 
 import (
 	"bytes"
+	"os/signal"
 	"embed"
 	"encoding/json"
 	"fmt"
@@ -41,36 +42,22 @@ const (
 )
 
 var (
-	// --- 资源句柄与路径 ---
-	hJob        windows.Handle // 用于关联内核进程，实现“同生共死”
-	hMutex      windows.Handle // 单实例运行互斥锁句柄
-	httpClient  = &http.Client{Timeout: 1 * time.Second}
-	exePath, _  = os.Executable()
-	baseDir     = filepath.Dir(exePath)
-
-	// --- 核心状态保护 ---
-	// isSystemInitializing: 逻辑锁。为 true 时，禁止 watchTunState 写入 INI，
-	// 防止启动、重启或重载配置时的瞬时状态抖动破坏配置。
+	hJob                 windows.Handle
+	hMutex               windows.Handle
+	httpClient           = &http.Client{Timeout: 1 * time.Second}
+	exePath, _           = os.Executable()
+	baseDir              = filepath.Dir(exePath)
 	isSystemInitializing = true
-
-	// isSyncing: 并发锁。配合 atomic 包使用，防止多个协程同时发起 API 推送，
-	// 避免在快速点击菜单或网络波动时产生竞态冲突。
-	isSyncing int32
-
-	// isReallyExiting: 退出锁。防止程序在正常关闭时误触发代理恢复逻辑。
-	isReallyExiting bool
-
-	// onceSync: 确保内核启动后，只在第一次连接成功时执行环境同步。
-	onceSync sync.Once
-
-	// --- 配置与读写锁 ---
-	configMu   sync.RWMutex      // 保护 configData 这个 Map 的线程安全
-	configData = make(map[string]string)
-
-	// --- 状态跟踪与 UI ---
-	lastState       = -1 // 记录上一次图标状态，避免高频重复刷新任务栏图标
-	tunErrorCounter = 0  // TUN 网卡启动失败的容错计数器
-	mTun            *systray.MenuItem // 缓存 TUN 菜单项句柄，方便异步更新 Check 状态
+	isSyncing            int32
+	isReallyExiting      bool
+	onceSync             sync.Once
+	exitOnce             sync.Once
+	configMu             sync.RWMutex
+	configData           = make(map[string]string)
+	lastState            = -1
+	tunErrorCounter      = 0
+	mTun                 *systray.MenuItem
+	isKernelActive       int32
 )
 
 // --- 基础工具函数 ---
@@ -89,8 +76,9 @@ func runAsAdmin() {
 	verb, _ := syscall.UTF16PtrFromString("runas")
 	exe, _ := syscall.UTF16PtrFromString(exePath)
 	cwd, _ := syscall.UTF16PtrFromString(baseDir)
-	windows.ShellExecute(0, verb, exe, nil, cwd, windows.SW_HIDE)
+	_ = windows.ShellExecute(0, verb, exe, nil, cwd, windows.SW_SHOWNORMAL)
 }
+
 
 func isTunInterfaceMatch(ifaceName string) bool {
 	name := strings.ToLower(ifaceName)
@@ -380,37 +368,79 @@ func checkAutoStartStatus() bool {
 }
 
 func monitorKernelDaemon() {
-    target := filepath.Join(baseDir, "mihomo.exe")
-    absBaseDir, _ := filepath.Abs(baseDir) // 强制使用绝对路径
+	target := filepath.Join(baseDir, "mihomo.exe")
+	absBaseDir, _ := filepath.Abs(baseDir)
 
-    for {
-        if isReallyExiting { return }
-        
-        if !isProcessRunning("mihomo.exe") {
-            onceSync = sync.Once{}
-            
-            // 杀掉可能的残留进程树
-            exec.Command("taskkill", "/F", "/IM", "mihomo.exe", "/T").Run()
-            time.Sleep(500 * time.Millisecond)
+	for {
+		// 0. 退出判定
+		if isReallyExiting {
+			return
+		}
 
-            // 核心修复：-d 指定配置目录，且 cmd.Dir 锁定工作目录
-            cmd := exec.Command(target, "-d", ".")
-            cmd.Dir = absBaseDir 
-            cmd.SysProcAttr = &windows.SysProcAttr{
-                CreationFlags: windows.CREATE_NO_WINDOW | windows.CREATE_BREAKAWAY_FROM_JOB,
-            }
-            
-            if err := cmd.Start(); err == nil {
-                if hJob != 0 {
-                    hp, _ := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
-                    windows.AssignProcessToJobObject(hJob, hp)
-                    windows.CloseHandle(hp)
-                }
-                cmd.Wait() 
-            }
-        }
-        time.Sleep(2 * time.Second)
-    }
+		// 1. 检查内核进程是否存活
+		if !isProcessRunning("mihomo.exe") {
+			// 发现进程丢失，重置 Once 对象，确保新进程拉起后能重新触发配置同步
+			onceSync = sync.Once{}
+			
+			// 锁定初始化状态，防止 watchTunState 在内核还没拉起来时进行反向改写
+			isSystemInitializing = true
+
+			fmt.Println("[Daemon] 检测到内核未运行，准备启动...")
+
+			// 2. 强力清理残留
+			// 使用 Taskkill 确保端口被完全释放
+			killCmd := exec.Command("taskkill", "/F", "/IM", "mihomo.exe", "/T")
+			killCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+			_ = killCmd.Run()
+			time.Sleep(500 * time.Millisecond)
+
+			// 3. 构造启动指令
+			cmd := exec.Command(target, "-d", ".")
+			cmd.Dir = absBaseDir
+
+			// 4. Windows 专用属性设置
+			cmd.SysProcAttr = &windows.SysProcAttr{
+				CreationFlags: windows.CREATE_NO_WINDOW | 0x00000008 | windows.CREATE_BREAKAWAY_FROM_JOB,
+			}
+
+			// 5. 启动进程
+			if err := cmd.Start(); err == nil {
+				fmt.Printf("[Daemon] 内核已启动, PID: %d\n", cmd.Process.Pid)
+
+				// === 核心状态：标记内核活跃 ===
+				atomic.StoreInt32(&isKernelActive, 1)
+
+				// 6. 绑定 Job Object (生命周期强绑定)
+				if hJob != 0 {
+					hp, _ := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
+					if hp != 0 {
+						_ = windows.AssignProcessToJobObject(hJob, hp)
+						_ = windows.CloseHandle(hp)
+					}
+				}
+
+				// 7. 异步监听退出
+				go func() {
+					_ = cmd.Wait()
+					// === 核心状态：标记内核停止 ===
+					atomic.StoreInt32(&isKernelActive, 0)
+					fmt.Println("[Daemon] 内核进程已结束")
+				}()
+
+				// 给内核 1 秒钟初始化 API 服务的时间
+				time.Sleep(1 * time.Second)
+				isSystemInitializing = false
+			} else {
+				// 启动失败的容错处理
+				fmt.Printf("[Daemon] 启动失败: %v\n", err)
+				atomic.StoreInt32(&isKernelActive, 0)
+				isSystemInitializing = false // 释放锁，允许重试逻辑介入
+			}
+		}
+
+		// 8. 轮询频率：每 2 秒检查一次
+		time.Sleep(2 * time.Second)
+	}
 }
 
 func monitorIconState() {
@@ -464,81 +494,107 @@ func checkSystemState() int {
 }
 
 func watchTunState() {
-    modiphlpapi := syscall.NewLazyDLL("iphlpapi.dll")
-    procNotifyAddrChange := modiphlpapi.NewProc("NotifyAddrChange")
+	modiphlpapi := syscall.NewLazyDLL("iphlpapi.dll")
+	procNotifyAddrChange := modiphlpapi.NewProc("NotifyAddrChange")
 
-    for {
-        if isReallyExiting { return }
+	// 增加一个局部状态缓存，只有状态真正改变时才触发逻辑
+	var lastHasTun bool 
 
-        var handle windows.Handle
-        var overlapped windows.Overlapped
-        // 阻塞等待系统网络信号
-        procNotifyAddrChange.Call(uintptr(unsafe.Pointer(&handle)), uintptr(unsafe.Pointer(&overlapped)))
-
-        // --- 核心修复逻辑 ---
-        
-        // 1. 检查是否正在进行合法的初始化或同步
-        // 如果是母程序正在重启内核或重载，直接忽略网络波动
-        if isSystemInitializing || atomic.LoadInt32(&isSyncing) == 1 {
-            continue
-        }
-
-        // 2. 检查进程是否健在
-        // 如果进程没了，说明是异常退出，此时网卡消失是正常的，不应该改写配置
-        if !isProcessRunning("mihomo.exe") {
-            continue 
-        }
-
-        // 3. 安定期：给系统一点时间完成网卡注销/挂载
-        time.Sleep(2 * time.Second)
-
-        // 4. 双重确认：API 必须是通的
-        resp, err := doAPIRequest("GET", "/configs", nil)
-        if err != nil {
-            // API 不通说明内核不可用，放弃同步，保护 INI
-            continue
-        }
-        io.Copy(io.Discard, resp.Body)
-        resp.Body.Close()
-
-        // --- 执行真正的状态比对 ---
-        hasTun := false
-        ifaces, _ := net.Interfaces()
-        for _, i := range ifaces {
-            if isTunInterfaceMatch(i.Name) {
-                hasTun = true
-                break
-            }
-        }
-
-        configEnabled := getIniConfig("tun_enabled") == "true"
-        if hasTun != configEnabled {
-            // 只有内核在线、且不在初始化状态、且 API 响应正常时，才允许对齐配置
-            if mTun != nil {
-                if hasTun { mTun.Check() } else { mTun.Uncheck() }
-            }
-            saveIniConfig("tun_enabled", fmt.Sprint(hasTun))
-        }
-    }
-}
-
-func isProcessRunning(name string) bool {
-	h, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
-	if err != nil { return false }
-	defer windows.CloseHandle(h)
-	var pe windows.ProcessEntry32
-	pe.Size = uint32(unsafe.Sizeof(pe))
-	currPid := uint32(os.Getpid())
-	if err := windows.Process32First(h, &pe); err != nil { return false }
 	for {
-		pname := windows.UTF16ToString(pe.ExeFile[:])
-		if strings.EqualFold(pname, name) && pe.ProcessID != currPid { return true }
-		pe.Size = uint32(unsafe.Sizeof(pe))
-		if err := windows.Process32Next(h, &pe); err != nil { break }
-	}
-	return false
-}
+		// 1. 退出判定
+		if isReallyExiting {
+			return
+		}
 
+		// 2. 核心修复：同步阻塞监听
+		// 第二个参数设为 0 (NULL)，让系统在网络变动时才释放此调用
+		// 彻底规避异步内存回写导致的崩溃
+		var handle windows.Handle
+		procNotifyAddrChange.Call(uintptr(unsafe.Pointer(&handle)), 0)
+
+		// 3. 安定期
+		// 硬件或驱动变化后，等待 2 秒让系统网络堆栈彻底就绪
+		time.Sleep(2 * time.Second)
+
+		// 4. 逻辑锁过滤
+		// 如果此时 Launcher 正在启动内核或同步配置，不执行反向检查
+		if isSystemInitializing || atomic.LoadInt32(&isSyncing) == 1 {
+			continue
+		}
+
+		// 5. 扫描当前系统中的 TUN 网卡
+		currentHasTun := false
+		ifaces, _ := net.Interfaces()
+		for _, i := range ifaces {
+			if isTunInterfaceMatch(i.Name) {
+				currentHasTun = true
+				break
+			}
+		}
+
+		// 6. 状态对比优化
+		// 如果网卡状态没变（例如只是 Wi-Fi 信号跳变），则直接跳过后续昂贵的检查
+		if currentHasTun == lastHasTun {
+			continue
+		}
+
+		// 7. 内核存活与 API 校验
+		// 只有内核在跑且 API 能通，我们才认为当前网卡的消失是“用户手动关闭”而非“内核崩溃”
+		if atomic.LoadInt32(&isKernelActive) == 0 {
+			continue
+		}
+
+		resp, err := doAPIRequest("GET", "/configs", nil)
+		if err != nil {
+			// API 不通时，不确定内核状态，保持配置文件现状，不进行反向改写
+			continue
+		}
+		io.Copy(io.Discard, resp.Body)
+		resp.Body.Close()
+
+		// 8. 执行对齐逻辑
+		// 读取本地 INI 记录的意图
+		configEnabled := getIniConfig("tun_enabled") == "true"
+
+		if currentHasTun != configEnabled {
+			// 说明出现了“配置要开启但网卡没了”或“配置要关闭但网卡还在”的冲突
+			if mTun != nil {
+				if currentHasTun {
+					mTun.Check()
+				} else {
+					mTun.Uncheck()
+				}
+			}
+			// 将硬件的真实状态同步回配置文件，确保 UI 图标、配置文件与实际网卡三位一体
+			saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
+			fmt.Printf("[Monitor] 检测到网卡状态变动, 配置文件已同步为: %v\n", currentHasTun)
+		}
+
+		// 更新缓存，准备下一次监听
+		lastHasTun = currentHasTun
+	}
+}
+func isProcessRunning(name string) bool {
+    h, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+    if err != nil { return false }
+    defer windows.CloseHandle(h)
+
+    var pe windows.ProcessEntry32
+    pe.Size = uint32(unsafe.Sizeof(pe))
+    
+    if err := windows.Process32First(h, &pe); err != nil { return false }
+    for {
+        pname := windows.UTF16ToString(pe.ExeFile[:])
+        if strings.EqualFold(pname, name) {
+            // 排除掉 Launcher 自身（如果名字雷同的话）
+            if pe.ProcessID != uint32(os.Getpid()) {
+                return true
+            }
+        }
+        if err := windows.Process32Next(h, &pe); err != nil { break }
+    }
+    return false
+}
 func updateIconByState(state int) {
 	files := []string{"stop.ico", "error.ico", "tun.ico", "proxy.ico", "default.ico"}
 	if state < 0 || state >= len(files) { return }
@@ -695,41 +751,57 @@ func onReady() {
 	}
 }
 
+
+
 func onExit() {
-	if isReallyExiting {
+	exitOnce.Do(func() {
+		// 优先标记正在退出，阻断后台协程的所有写操作
+		isReallyExiting = true
+
+		// 无论权限，立刻恢复注册表，确保网络不断开
 		setProxyRegistry(false)
-		time.Sleep(50 * time.Millisecond)
-		if hJob != 0 { windows.CloseHandle(hJob) }
-		if hMutex != 0 { windows.CloseHandle(hMutex) }
-	}
+
+		// 留出物理时间让注册表写入完成
+		time.Sleep(100 * time.Millisecond)
+
+		// 关闭 Job 对象会自动让 mihomo.exe 随之退出
+		if hJob != 0 {
+			windows.CloseHandle(hJob)
+		}
+		// 释放锁
+		if hMutex != 0 {
+			windows.CloseHandle(hMutex)
+		}
+	})
 }
 
 func main() {
-    // 获取真实的执行路径
-    exePath, _ = os.Executable()
-    baseDir = filepath.Dir(exePath)
-
-    // 强制切换工作目录
-    err := os.Chdir(baseDir)
-    if err != nil {
-        // 如果切换失败，可能导致后续所有相对路径失效
-        return 
-    }
-	if !isAdmin() {
-		runAsAdmin()
-		os.Exit(0)
-	}
-
-	// 2. 【手术第二步】确认是管理员权限后，再进行单实例检测
-	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
-	h, err := windows.CreateMutex(nil, false, mName)
+	// 1. 路径初始化与工作目录锁定
+	// 确保程序在任何位置运行（如快捷方式、开机启动），都能正确找到同目录下的内核和图标
+	var err error
+	exePath, err = os.Executable()
 	if err != nil {
 		return
 	}
-	
-	// 尝试获取所有权
-	event, _ := windows.WaitForSingleObject(h, 0)
-	if event == uint32(windows.WAIT_TIMEOUT) || event == uint32(windows.WAIT_FAILED) {
+	baseDir = filepath.Dir(exePath)
+	_ = os.Chdir(baseDir)
+
+	// 2. 初始环境自愈
+	// 防止程序上次崩溃残留了代理设置导致无法上网
+	setProxyRegistry(false)
+
+	// 3. 权限判定与提权
+	// TUN 模式必须以管理员权限运行
+	if !isAdmin() {
+		runAsAdmin()
+		return
+	}
+
+	// 4. 单实例互斥锁
+	// 防止用户多次运行程序导致内核端口冲突
+	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
+	h, err := windows.CreateMutex(nil, false, mName)
+	if err != nil || windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
 		if h != 0 {
 			windows.CloseHandle(h)
 		}
@@ -737,13 +809,39 @@ func main() {
 	}
 	hMutex = h
 
-	// 3. 后续初始化逻辑
-	os.Chdir(baseDir)
+	// 5. 系统信号监听 (保镖协程)
+	// 捕获 Ctrl+C (SIGINT)、关机请求 (SIGTERM)
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		<-sigCh
+		onExit()
+		os.Exit(0)
+	}()
+
+	// 6. 强制清理残留进程
+	// 在提权后立即执行，确保 7890/9090 端口完全释放
+	_ = exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe").Run()
+	time.Sleep(200 * time.Millisecond)
+
+	// 7. 配置预热
+	// 确保 .ini 文件存在且已经同步了 config.yaml 里的端口和密钥
+	ensureDefaultConfig()
+	sniffAndSolidifyConfig()
+
+	// 8. 初始化 Windows 作业对象 (Job Object)
+	// 这是实现“Launcher 退出，内核必退出”的最底层保险
 	initJobObject()
 
-	go monitorKernelDaemon()
-	go monitorIconState()
-	go watchTunState()
+	// 9. 启动后台守护协程
+	go monitorKernelDaemon() // 负责拉起内核、绑定 JobObject、维护 isKernelActive 状态
+	go monitorIconState()   // 负责根据 API 连通性切换托盘图标
+	go watchTunState()      // 负责监听网卡变动，实现配置与硬件同步
 
+	// 10. 启动托盘界面 (进入 GUI 消息循环，此行会阻塞)
+	// systray.Run 内部会调用 onReady
 	systray.Run(onReady, onExit)
+
+	// 11. 正常退出流程
+	onExit()
 }
