@@ -151,16 +151,41 @@ func onReady() {
 
 	for {
 		select {
-		case <-mWeb.ClickedCh:
+        case <-mWeb.ClickedCh:
 			apiAddr := getIniConfig("external-controller")
 			secret := getIniConfig("secret")
-			host, port := "127.0.0.1", "9090"
+			proxyAddr := getIniConfig("proxy_address")
+
+			// 动态解析 Host 和 Port
 			cleanAddr := strings.TrimPrefix(strings.TrimPrefix(apiAddr, "http://"), "https://")
+			host, port := "127.0.0.1", "9090"
 			if parts := strings.Split(cleanAddr, ":"); len(parts) == 2 {
 				host, port = parts[0], parts[1]
 			}
-			finalURL := fmt.Sprintf("%s/ui/?hostname=%s&port=%s&secret=%s#/proxies", apiAddr, host, port, secret)
-			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(finalURL), nil, nil, windows.SW_SHOWNORMAL)
+
+			// 组装自动登录 URL
+			finalURL := fmt.Sprintf("%s/ui/#/setup?hostname=%s&port=%s&secret=%s", apiAddr, host, port, secret)
+
+			// 准备 Edge 启动参数
+			userDataDir := filepath.Join(os.Getenv("TEMP"), "EdgeAppCache")
+			args := []string{
+				"--app=" + finalURL,
+				"--window-size=1280,768",
+				"--user-data-dir=" + userDataDir,
+				"--proxy-server=" + proxyAddr,
+			}
+
+			// 尝试定位 Edge 路径启动，失败则回退到系统环境变量启动
+			edgePath := `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`
+			cmd := exec.Command(edgePath, args...)
+			cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+			if err := cmd.Start(); err != nil {
+				// Fallback: 使用 cmd start 自动搜寻 msedge
+				fallbackArgs := append([]string{"/c", "start", "msedge"}, args...)
+				retryCmd := exec.Command("cmd", fallbackArgs...)
+				retryCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+				_ = retryCmd.Start()
+			}
 		case <-mReload.ClickedCh:
 			sniffAndSolidifyConfig()
 			reloadConfigFile()
