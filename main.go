@@ -326,38 +326,62 @@ func reloadConfigFile() {
     }
 }
 func toggleAutoStart(enable bool) {
-    const taskName = "MihomoLauncherTask"
-    
-    if key, err := registry.OpenKey(registry.CURRENT_USER, REG_RUN, registry.SET_VALUE); err == nil {
-        _ = key.DeleteValue(APP_NAME)
-        key.Close()
-    }
-    saveIniConfig("startup_enabled", fmt.Sprint(enable))
+	const taskName = "MihomoLauncherTask"
+	
+	// 1. 先清理旧的注册表启动项残留（确保只使用任务计划这一种方式）
+	if key, err := registry.OpenKey(registry.CURRENT_USER, REG_RUN, registry.SET_VALUE); err == nil {
+		_ = key.DeleteValue(APP_NAME)
+		key.Close()
+	}
 
-    if enable {
-        taskCmd := fmt.Sprintf(`cmd.exe /c "cd /d \"%s\" && \"%s\""`, baseDir, exePath)
+	success := false
 
-        createCmd := exec.Command("schtasks", "/Create", 
-            "/TN", taskName, 
-            "/TR", taskCmd, 
-            "/SC", "ONLOGON", 
-            "/RL", "HIGHEST", 
-            "/F")
-        
-        createCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-        if err := createCmd.Run(); err != nil {
-            return
-        }
+	if enable {
+		// 构建任务执行命令：进入程序目录并运行
+		taskCmd := fmt.Sprintf(`cmd.exe /c "cd /d \"%s\" && \"%s\""`, baseDir, exePath)
 
-        psScript := fmt.Sprintf(`$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero); Set-ScheduledTask -TaskName '%s' -Settings $s`, taskName)
-        modifyCmd := exec.Command("powershell", "-Command", psScript)
-        modifyCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-        _ = modifyCmd.Run()
-    } else {
-        deleteCmd := exec.Command("schtasks", "/Delete", "/TN", taskName, "/F")
-        deleteCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-        _ = deleteCmd.Run()
-    }
+		// A. 创建任务计划：登录时触发，以最高权限运行
+		createCmd := exec.Command("schtasks", "/Create",
+			"/TN", taskName,
+			"/TR", taskCmd,
+			"/SC", "ONLOGON",
+			"/RL", "HIGHEST",
+			"/F")
+		
+		createCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+		
+		if err := createCmd.Run(); err == nil {
+			success = true // 基础任务创建成功
+			
+			// B. 优化任务设置：允许电池模式启动、取消 3 天停止限制（使用 PowerShell 细化控制）
+			psScript := fmt.Sprintf(
+				`$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero); Set-ScheduledTask -TaskName '%s' -Settings $s`, 
+				taskName,
+			)
+			modifyCmd := exec.Command("powershell", "-Command", psScript)
+			modifyCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+			_ = modifyCmd.Run()
+		} else {
+			fmt.Printf("[AutoStart] 创建任务失败: %v\n", err)
+		}
+	} else {
+		// C. 删除任务计划
+		deleteCmd := exec.Command("schtasks", "/Delete", "/TN", taskName, "/F")
+		deleteCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+		
+		if err := deleteCmd.Run(); err == nil {
+			success = true
+		} else {
+			// 如果任务本身就不存在，也视为“关闭”成功
+			if !checkAutoStartStatus() {
+				success = true
+			}
+		}
+	}
+	if success {
+		saveIniConfig("startup_enabled", fmt.Sprint(enable))
+		fmt.Printf("[AutoStart] 状态已同步为: %v\n", enable)
+	}
 }
 
 func checkAutoStartStatus() bool {
@@ -654,6 +678,7 @@ func syncConfigToKernel() {
 }
 
 func onReady() {
+    saveIniConfig("startup_enabled", fmt.Sprint(checkAutoStartStatus()))
     ensureDefaultConfig()
     sniffAndSolidifyConfig()
 
@@ -683,7 +708,7 @@ func onReady() {
     
     mMoreRoot := systray.AddMenuItem("更多", "")
     isAuto := checkAutoStartStatus()
-    mAuto := mMoreRoot.AddSubMenuItemCheckbox("开机自动启动", "", isAuto)
+    mAuto := mMoreRoot.AddSubMenuItemCheckbox("开机自启动", "", isAuto)
     mRestart := mMoreRoot.AddSubMenuItem("重启内核", "")
     mReload := mMoreRoot.AddSubMenuItem("重载配置文件", "手动通知内核读取 config.yaml")
     systray.AddSeparator()
@@ -774,67 +799,86 @@ func onExit() {
 }
 
 func main() {
-    // 1. 路径初始化与工作目录锁定
-    var err error
-    exePath, err = os.Executable()
-    if err != nil {
-        return
-    }
-    baseDir = filepath.Dir(exePath)
-    _ = os.Chdir(baseDir)
+	// 1. 基础环境初始化
+	var err error
+	exePath, err = os.Executable()
+	if err != nil {
+		return
+	}
+	baseDir = filepath.Dir(exePath)
+	_ = os.Chdir(baseDir)
 
-    // 2. 环境自愈与状态恢复
-    // 首先确保加载了配置文件
-    ensureDefaultConfig()
-    // 读取上次保存的意图：如果是 true，启动时会自动把注册表勾选上
-    lastProxyState := getIniConfig("system_proxy_enabled") == "true"
-    setProxyRegistry(lastProxyState)
+	// 2. 【核心修复 A】权限判定必须置顶
+	// 如果不是管理员，立即叫起管理员进程并退出
+	// 这样普通进程就不会去占坑（Mutex）或锁死配置文件（INI）
+	if !isAdmin() {
+		runAsAdmin()
+		return 
+	}
 
-    // 3. 权限判定与提权
-    if !isAdmin() {
-        runAsAdmin()
-        return
-    }
+	// 3. 【核心修复 B】带重试机制的单实例互斥锁
+	// 当管理员进程被叫起时，普通进程可能还没来得及完全退出
+	// 我们给它 1 秒钟（100ms * 10）的“交接时间”
+	var h windows.Handle
+	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
+	
+	for i := 0; i < 10; i++ {
+		h, err = windows.CreateMutex(nil, false, mName)
+		// 如果成功创建且系统没报错“已存在”，说明拿到了唯一的锁
+		if err == nil && windows.GetLastError() != windows.ERROR_ALREADY_EXISTS {
+			break 
+		}
+		
+		// 如果没拿到，记得关闭这次尝试产生的句柄，等 100ms 再试
+		if h != 0 {
+			windows.CloseHandle(h)
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
 
-    // 4. 单实例互斥锁
-    mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
-    h, err := windows.CreateMutex(nil, false, mName)
-    if err != nil || windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
-        if h != 0 {
-            windows.CloseHandle(h)
-        }
-        return
-    }
-    hMutex = h
+	// 最终还是拿不到锁，说明真的有另一个程序在运行
+	if h == 0 || windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
+		return
+	}
+	hMutex = h
 
-    // 5. 系统信号监听
-    go func() {
-        sigCh := make(chan os.Signal, 1)
-        signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-        <-sigCh
-        onExit()
-        os.Exit(0)
-    }()
+	// 4. 【现在我是唯一的管理员进程】开始处理配置自愈
+	// 这时再写 INI 文件，绝对不会和刚才退出的普通进程冲突
+	ensureDefaultConfig()
+	
+	// 读取用户之前的代理意图，并应用到注册表
+	lastProxyState := getIniConfig("system_proxy_enabled") == "true"
+	setProxyRegistry(lastProxyState)
 
+	// 5. 设置系统信号监听（处理 Ctrl+C 或 关机信号）
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		<-sigCh
+		onExit()
+		os.Exit(0)
+	}()
+
+	// 6. 清理可能残留的内核进程
 	KillProcessByName("mihomo.exe")
-    time.Sleep(200 * time.Millisecond)
+	time.Sleep(200 * time.Millisecond)
 
-    // 7. 配置预热
-    sniffAndSolidifyConfig()
+	// 7. 配置预热：从 config.yaml 提取最新的端口、密钥等信息同步到 INI
+	sniffAndSolidifyConfig()
 
-    // 8. 初始化 Windows 作业对象
-    initJobObject()
+	// 8. 初始化 Windows 作业对象（确保 Launcher 挂了内核也跟着挂）
+	initJobObject()
 
-    // 9. 启动后台守护协程
-    go monitorKernelDaemon()
-    go monitorIconState()
-    go watchTunState()
+	// 9. 启动后台守护协程
+	go monitorKernelDaemon() // 负责拉起并监控 mihomo.exe
+	go monitorIconState()   // 负责定时更新托盘图标
+	go watchTunState()      // 负责监听网络环境变动
 
-    // 10. 启动托盘界面
-    systray.Run(onReady, onExit)
+	// 10. 启动托盘界面（阻塞运行）
+	systray.Run(onReady, onExit)
 
-    // 11. 正常退出流程
-    onExit()
+	// 11. 正常退出逻辑（虽然 systray.Run 内部也会调 onExit，这里做二次保险）
+	onExit()
 }
 
 func KillProcessByName(name string) {
