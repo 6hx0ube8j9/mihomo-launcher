@@ -330,7 +330,7 @@ func reloadConfigFile() {
 func toggleAutoStart(enable bool) {
 	const taskName = "MihomoLauncherTask"
 	
-	// 1. 清理旧的注册表启动项（保持环境纯净）
+	// 1. 清理旧的注册表启动项（保持环境纯净，防止双重启动）
 	if key, err := registry.OpenKey(registry.CURRENT_USER, REG_RUN, registry.SET_VALUE); err == nil {
 		_ = key.DeleteValue(APP_NAME)
 		key.Close()
@@ -339,19 +339,21 @@ func toggleAutoStart(enable bool) {
 	success := false
 
 	if enable {
-		// 这里的路径处理保持你原有的逻辑
+		// 路径转义，防止路径中有空格或单引号导致脚本失效
 		cleanExe := strings.ReplaceAll(exePath, "'", "''")
 		cleanDir := strings.ReplaceAll(baseDir, "'", "''")
 		
-		// 优化后的 PowerShell 脚本：
-		// 1. 直接创建触发器并设置 5 秒延迟 (PT5S)
-		// 2. 一步到位注册任务，包含工作目录、权限、电池策略
+		// 核心逻辑：
+		// - AtLogOn: 登录时触发
+		// - Delay PT8S: 延迟 8 秒启动，确保系统托盘 (Explorer) 已完全就绪
+		// - Argument '---autostart': 显式告知程序是从自启进入，直接跳过二次提权，防止消息循环断裂
+		// - RunLevel Highest: 以管理员权限运行
 		psScript := fmt.Sprintf(
 			"$trigger = New-ScheduledTaskTrigger -AtLogOn; "+
-			"$trigger.Delay = 'PT5S'; "+
-			"$action = New-ScheduledTaskAction -Execute '%s' -WorkingDirectory '%s'; "+
-			"$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero); "+
-			"Register-ScheduledTask -TaskName '%s' -Trigger $trigger -Action $action -Settings $settings -User $env:USERNAME -RunLevel Highest -Force",
+				"$trigger.Delay = 'PT8S'; "+
+				"$action = New-ScheduledTaskAction -Execute '%s' -Argument '---autostart' -WorkingDirectory '%s'; "+
+				"$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero); "+
+				"Register-ScheduledTask -TaskName '%s' -Trigger $trigger -Action $action -Settings $settings -User $env:USERNAME -RunLevel Highest -Force",
 			cleanExe, cleanDir, taskName,
 		)
 		
@@ -362,7 +364,7 @@ func toggleAutoStart(enable bool) {
 			success = true 
 		}
 	} else {
-		// C. 删除任务计划
+		// 删除任务计划
 		deleteCmd := exec.Command("schtasks", "/Delete", "/TN", taskName, "/F")
 		deleteCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 		if err := deleteCmd.Run(); err == nil || !checkAutoStartStatus() {
@@ -374,7 +376,7 @@ func toggleAutoStart(enable bool) {
 		saveIniConfig("startup_enabled", fmt.Sprint(enable))
 		fmt.Printf("[AutoStart] 状态已成功同步为: %v\n", enable)
 	} else {
-		fmt.Printf("[AutoStart] 操作失败，请检查是否被安全软件拦截")
+		fmt.Printf("[AutoStart] 操作失败，请检查是否被安全软件拦截\n")
 	}
 }
 
@@ -791,85 +793,86 @@ func onExit() {
 }
 
 func main() {
-    // 1. 基础环境初始化（最快速度完成）
-    var err error
-    exePath, err = os.Executable()
-    if err != nil {
-        return
-    }
-    baseDir = filepath.Dir(exePath)
-    _ = os.Chdir(baseDir)
+	// 1. 基础环境初始化（最快速度定位目录）
+	var err error
+	exePath, err = os.Executable()
+	if err != nil {
+		return
+	}
+	baseDir = filepath.Dir(exePath)
+	_ = os.Chdir(baseDir)
 
-    // 2. 权限判定：必须放在拿锁之前
-    // 如果勾选了“以管理员身份运行”，这里会直接通过
-    if !isAdmin() {
-        runAsAdmin()
-        os.Exit(0) // 必须立刻退出，释放当前进程占用的所有资源
-    }
+	// 2. 互斥锁检测（必须放在最前面）
+	// 先拿锁，防止用户连点导致的多个提权窗口或程序多开
+	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
+	h, err := windows.CreateMutex(nil, false, mName)
+	if err != nil || windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
+		if h != 0 {
+			windows.CloseHandle(h)
+		}
+		// 如果锁已存在，直接退出
+		return
+	}
+	hMutex = h
 
-    // 3. 互斥锁检测（带重试逻辑，解决连点问题）
-    mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
-    var h windows.Handle
-    
-    // 尝试 3 次拿锁，应对系统回收句柄的微小延迟
-    for i := 0; i < 3; i++ {
-        h, err = windows.CreateMutex(nil, false, mName)
-        if err == nil && windows.GetLastError() != windows.ERROR_ALREADY_EXISTS {
-            break // 成功拿锁
-        }
-        
-        // 如果拿不到，先关闭当前尝试产生的句柄（如果有的话）
-        if h != 0 {
-            windows.CloseHandle(h)
-        }
+	// 3. 判定是否为自启动模式
+	isAutostart := false
+	for _, arg := range os.Args {
+		if arg == "---autostart" {
+			isAutostart = true
+			break
+		}
+	}
 
-        // 如果已经到最后一次尝试还是拿不到，说明真的有另一个程序在运行
-        if i == 2 {
-            return 
-        }
-        
-        // 等待 100ms 再试，通常足以解决“连点”产生的残留干扰
-        time.Sleep(100 * time.Millisecond)
-    }
-    hMutex = h
+	// 4. 权限检查与提权
+	// 如果不是管理员，且不是自启动模式，则尝试提权
+	// 任务计划程序启动时已经是 Highest 权限，配合 isAutostart 避免二次提权导致的 UI 失效
+	if !isAdmin() && !isAutostart {
+		runAsAdmin()
+		return // 退出当前低权限进程
+	}
 
-    // 4. 环境自愈与配置加载
-    ensureDefaultConfig()
-    
-    // 恢复用户上次关闭时的代理意图
-    lastProxyState := getIniConfig("system_proxy_enabled") == "true"
-    setProxyRegistry(lastProxyState)
+	// 5. 环境自愈与配置加载
+	ensureDefaultConfig()
+	
+	// 恢复用户上次关闭时的代理意图（确保上网不中断）
+	lastProxyState := getIniConfig("system_proxy_enabled") == "true"
+	setProxyRegistry(lastProxyState)
 
-    // 5. 系统信号监听（优雅退出处理）
-    go func() {
-        sigCh := make(chan os.Signal, 1)
-        signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-        <-sigCh
-        // 通知托盘退出，从而触发统一的 onExit 逻辑
-        systray.Quit()
-    }()
+	// 6. 系统信号监听（优雅退出）
+	go func() {
+		sigCh := make(chan os.Signal, 1)
+		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+		<-sigCh
+		// 触发 systray.Quit() 会进而调用 onExit
+		systray.Quit()
+	}()
 
-    // 6. 清理旧残留并预热配置
-    // 注意：有了管理员权限，这步操作会非常干脆
-    KillProcessByName("mihomo.exe")
-    time.Sleep(200 * time.Millisecond)
-    sniffAndSolidifyConfig()
+	// 7. 清理残留并初始化作业对象
+	// 在启动内核前，先干掉可能残留的内核进程
+	KillProcessByName("mihomo.exe")
+	time.Sleep(200 * time.Millisecond)
+	
+	initJobObject()
+	sniffAndSolidifyConfig()
 
-    // 7. 初始化 Windows 作业对象 (Job Object)
-    initJobObject()
+	// 8. 启动后台守护协程
+	// 使用匿名函数包裹，稍微延迟启动非 UI 逻辑，优先保障托盘初始化
+	go func() {
+		time.Sleep(1 * time.Second)
+		go monitorKernelDaemon() // 守护内核
+		go monitorIconState()   // 监控图标
+		go watchTunState()      // 监控网卡
+	}()
 
-    // 8. 启动后台守护协程
-    go monitorKernelDaemon() // 守护内核进程
-    go monitorIconState()    // 监控托盘图标
-    go watchTunState()       // 监控网卡状态，防止手动修改冲突
+	// 9. 运行托盘程序
+	// systray.Run 会阻塞主线程并开启 Windows 消息循环
+	// onReady: 初始化菜单项
+	// onExit:  程序退出时的清理工作
+	systray.Run(onReady, onExit)
 
-    // 9. 启动托盘界面逻辑
-    // systray.Run 会阻塞在这里，直到调用 systray.Quit()
-    // 退出时会自动调用我们定义的 onExit
-    systray.Run(onReady, onExit)
-
-    // 10. 兜底退出
-    onExit()
+	// 10. 兜底退出（正常情况下不会执行到这里）
+	onExit()
 }
 
 func KillProcessByName(name string) {
