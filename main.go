@@ -404,64 +404,85 @@ func ensureDefaultConfig() {
 }
 
 func sniffAndSolidifyConfig() {
-    data, err := os.ReadFile(filepath.Join(baseDir, "config.yaml"))
-    if err != nil { return }
-    
-    lines := strings.Split(string(data), "\n")
-    inTunSection := false
-    foundMixed := false // 优先级锁：一旦找到 mixed-port 就不再被 port 覆盖
+	// 读取同目录下的 config.yaml
+	data, err := os.ReadFile(filepath.Join(baseDir, "config.yaml"))
+	if err != nil {
+		return
+	}
 
-    for _, line := range lines {
-        trimmed := strings.TrimSpace(line)
-        if trimmed == "" || strings.HasPrefix(trimmed, "#") { continue }
+	lines := strings.Split(string(data), "\n")
+	inTunSection := false
+	foundMixed := false // 优先级锁：确保 mixed-port 不会被后续的 port 覆盖
 
-        // --- 1. 端口嗅探模块 (单行逻辑，带优先级控制) ---
-        if strings.HasPrefix(trimmed, "mixed-port:") {
-            if port := strings.Trim(strings.SplitN(trimmed, ":", 2)[1], " \"'"); port != "" {
-                saveIniConfig("proxy_address", "127.0.0.1:"+port)
-                foundMixed = true // 锁定优先级
-            }
-        } else if !foundMixed && strings.HasPrefix(trimmed, "port:") {
-            // 只有在没找到 mixed-port 的情况下，才会去抓 port
-            if port := strings.Trim(strings.SplitN(trimmed, ":", 2)[1], " \"'"); port != "" {
-                saveIniConfig("proxy_address", "127.0.0.1:"+port)
-            }
-        }
+	for _, line := range lines {
+		// 去除首尾空格，跳过空行和注释
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+			continue
+		}
 
-        // --- 2. TUN 模块 (嵌套逻辑) ---
-        if strings.HasPrefix(trimmed, "tun:") {
-            inTunSection = true
-            continue
-        }
-        // 如果碰到不带缩进的新行，说明退出了 tun 区域
-        if inTunSection && !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") {
-            inTunSection = false
-        }
-        // 在 tun 区域内找设备名
-        if inTunSection && strings.Contains(trimmed, "device:") {
-            if parts := strings.SplitN(trimmed, ":", 2); len(parts) == 2 {
-                devName := strings.Trim(parts[1], " \"'")
-                if devName != "" {
-                    saveIniConfig("tun_device_name", devName)
-                }
-            }
-        }
+		// --- 1. 端口嗅探模块 (带优先级逻辑) ---
+		// 优先级：mixed-port > port (HTTP)
+		if strings.HasPrefix(trimmed, "mixed-port:") {
+			if parts := strings.SplitN(trimmed, ":", 2); len(parts) == 2 {
+				port := strings.Trim(parts[1], " \"'")
+				if port != "" {
+					saveIniConfig("proxy_address", "127.0.0.1:"+port)
+					foundMixed = true // 锁定，不再允许 port: 修改 proxy_address
+				}
+			}
+		} else if !foundMixed && strings.HasPrefix(trimmed, "port:") {
+			// 只有在没找到 mixed-port 时才记录普通端口
+			if parts := strings.SplitN(trimmed, ":", 2); len(parts) == 2 {
+				port := strings.Trim(parts[1], " \"'")
+				if port != "" {
+					saveIniConfig("proxy_address", "127.0.0.1:"+port)
+				}
+			}
+		}
 
-        // --- 3. 基础信息嗅探 (API 地址及密钥) ---
-        if strings.HasPrefix(trimmed, "external-controller:") {
-            addr := strings.Trim(strings.TrimPrefix(trimmed, "external-controller:"), " \"'")
-            if strings.HasPrefix(addr, ":") { addr = "127.0.0.1" + addr }
-            if addr != "" {
-                // 统一格式为 http://ip:port
-                if !strings.HasPrefix(addr, "http") { addr = "http://" + addr }
-                saveIniConfig("external-controller", addr)
-            }
-        }
-        if strings.HasPrefix(trimmed, "secret:") {
-            saveIniConfig("secret", strings.Trim(strings.TrimPrefix(trimmed, "secret:"), " \"'"))
-        }
-        
-    }
+		// --- 2. TUN 模块 (嵌套逻辑) ---
+		if strings.HasPrefix(trimmed, "tun:") {
+			inTunSection = true
+			continue
+		}
+		// 如果碰到不带缩进的新行，说明退出了 tun 区域
+		if inTunSection && !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") {
+			inTunSection = false
+		}
+		// 在 tun 区域内寻找设备名
+		if inTunSection && strings.Contains(trimmed, "device:") {
+			if parts := strings.SplitN(trimmed, ":", 2); len(parts) == 2 {
+				devName := strings.Trim(parts[1], " \"'")
+				if devName != "" {
+					saveIniConfig("tun_device_name", devName)
+				}
+			}
+		}
+
+		// --- 3. 基础信息嗅探 (用于 Web 面板访问) ---
+		// 提取 API 控制地址
+		if strings.HasPrefix(trimmed, "external-controller:") {
+			addr := strings.Trim(strings.TrimPrefix(trimmed, "external-controller:"), " \"'")
+			// 如果是 ":9090" 这种格式，补全 IP
+			if strings.HasPrefix(addr, ":") {
+				addr = "127.0.0.1" + addr
+			}
+			if addr != "" {
+				// 统一补全协议头
+				if !strings.HasPrefix(addr, "http://") && !strings.HasPrefix(addr, "https://") {
+					addr = "http://" + addr
+				}
+				saveIniConfig("external-controller", addr)
+			}
+		}
+
+		// 提取 API 密钥 (Secret)
+		if strings.HasPrefix(trimmed, "secret:") {
+			val := strings.Trim(strings.TrimPrefix(trimmed, "secret:"), " \"'")
+			saveIniConfig("secret", val)
+		}
+	}
 }
 
 func setMihomoMode(mode string) {
