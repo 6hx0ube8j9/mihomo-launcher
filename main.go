@@ -321,15 +321,10 @@ func watchTunState() {
     for {
         if isReallyExiting { return }
 
-        // 阻塞点：直到网络配置发生变化才会继续往下走
-        // NotifyAddrChange 在阻塞模式下，直到变化发生才会返回
         var handle windows.Handle
-        var overlapped windows.Overlapped
-        // 简单做法：直接调用阻塞版本（第二个参数传 nil/0）
-        procNotifyAddrChange.Call(uintptr(unsafe.Pointer(&handle)), 0)
-
-        // 变化发生后，稍微等一下，让系统完成网卡状态切换（可选）
-        time.Sleep(500 * time.Millisecond)
+        _, _, _ = procNotifyAddrChange.Call(uintptr(unsafe.Pointer(&handle)), 0)
+        _ = handle
+        time.Sleep(2 * time.Second)
 
         if isSystemInitializing || atomic.LoadInt32(&isSyncing) == 1 {
             continue
