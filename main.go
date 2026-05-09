@@ -1,680 +1,117 @@
 package main
 
 import (
-	"bytes"
-	"os/signal"
-	"embed"
-	"encoding/json"
-	"fmt"
-	"net"
-	"net/http"
-	"os"
-	"io"
-	"os/exec"
-	"path/filepath"
-	"sync/atomic"
-	"strings"
-	"sync"
-	"syscall"
-	"time"
-	"unsafe"
+    "bytes"
+    "os/signal"
+    "embed"
+    "encoding/json"
+    "fmt"
+    "net"
+    "net/http"
+    "os"
+    "io"
+    "os/exec"
+    "path/filepath"
+    "sync/atomic"
+    "strings"
+    "sync"
+    "syscall"
+    "time"
+    "unsafe"
 
-	"github.com/getlantern/systray"
-	"golang.org/x/sys/windows"
-	"golang.org/x/sys/windows/registry"
+    "github.com/getlantern/systray"
+    "golang.org/x/sys/windows"
+    "golang.org/x/sys/windows/registry"
 )
 
 //go:embed icons/*.ico
 var iconFs embed.FS
 
 const (
-	APP_MUTEX   = "Global\\MihomoLauncher_Unique_Mutex"
-	CONFIG_FILE = "mihomo-launcher.ini"
-	REG_RUN     = `Software\Microsoft\Windows\CurrentVersion\Run`
-	REG_PROXY   = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
-	APP_NAME    = "MihomoLauncher"
+    APP_MUTEX   = "Global\\MihomoLauncher_Unique_Mutex"
+    CONFIG_FILE = "mihomo-launcher.ini"
+    REG_RUN     = `Software\Microsoft\Windows\CurrentVersion\Run`
+    REG_PROXY   = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
+    APP_NAME    = "MihomoLauncher"
 
-	StateStop    = 0
-	StateError   = 1
-	StateTun     = 2
-	StateProxy   = 3
-	StateDefault = 4
+    StateStop    = 0
+    StateError   = 1
+    StateTun     = 2
+    StateProxy   = 3
+    StateDefault = 4
 )
 
 var (
-	hJob                 windows.Handle
-	hMutex               windows.Handle
-	httpClient           = &http.Client{Timeout: 1 * time.Second}
-	exePath, _           = os.Executable()
-	baseDir              = filepath.Dir(exePath)
-	isSystemInitializing = true
-	isSyncing            int32
-	isReallyExiting      bool
-	onceSync             sync.Once
-	exitOnce             sync.Once
-	configMu             sync.RWMutex
-	configData           = make(map[string]string)
-	lastState            = -1
-	tunErrorCounter      = 0
-	mTun                 *systray.MenuItem
-	isKernelActive       int32
+    hJob                 windows.Handle
+    hMutex               windows.Handle
+    httpClient           = &http.Client{Timeout: 1 * time.Second}
+    exePath, _           = os.Executable()
+    baseDir              = filepath.Dir(exePath)
+    isSystemInitializing = true
+    isSyncing            int32
+    isReallyExiting      bool
+    onceSync             sync.Once
+    exitOnce             sync.Once
+    configMu             sync.RWMutex
+    configData           = make(map[string]string)
+    lastState            = -1
+    tunErrorCounter      = 0
+    mTun                 *systray.MenuItem
+    isKernelActive       int32
 )
 
-// --- 基础工具函数 ---
+// --- 入口与生命周期管理 ---
 
-func isAdmin() bool {
-	var token windows.Token
-	err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token)
-	if err != nil {
-		return false
-	}
-	defer token.Close()
-	return token.IsElevated()
-}
-
-func runAsAdmin() {
-	verb, _ := syscall.UTF16PtrFromString("runas")
-	exe, _ := syscall.UTF16PtrFromString(exePath)
-	cwd, _ := syscall.UTF16PtrFromString(baseDir)
-	_ = windows.ShellExecute(0, verb, exe, nil, cwd, windows.SW_HIDE)
-}
-
-
-func isTunInterfaceMatch(ifaceName string) bool {
-	name := strings.ToLower(ifaceName)
-	target := strings.ToLower(getIniConfig("tun_device_name"))
-	if target != "" && strings.Contains(name, target) {
-		return true
-	}
-	keywords := []string{"mihomo", "meta", "clash", "sing-box", "wintun"}
-	for _, kw := range keywords {
-		if strings.Contains(name, kw) {
-			return true
-		}
-	}
-	return false
-}
-
-func initJobObject() {
-	h, _ := windows.CreateJobObject(nil, nil)
-	if h != 0 {
-		var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
-		info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-		windows.NewLazySystemDLL("kernel32.dll").NewProc("SetInformationJobObject").Call(
-			uintptr(h), 9, uintptr(unsafe.Pointer(&info)), uintptr(uint32(unsafe.Sizeof(info))),
-		)
-		hJob = h
-	}
-}
-
-// --- 配置管理核心 ---
-
-func ensureDefaultConfig() {
-	configMu.Lock()
-	b, _ := os.ReadFile(filepath.Join(baseDir, CONFIG_FILE))
-	lines := strings.Split(string(b), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if line == "" || strings.HasPrefix(line, "#") {
-			continue
-		}
-		if parts := strings.SplitN(line, "=", 2); len(parts) == 2 {
-			configData[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
-		}
-	}
-	defaults := [][]string{
-		{"mode", "rule"},
-		{"tun_enabled", "false"},
-		{"system_proxy_enabled", "false"},
-		{"startup_enabled", "false"},
-		{"proxy_address", "127.0.0.1:7890"},
-		{"tun_device_name", "Mihomo"},
-		{"external-controller", "http://127.0.0.1:9090"},
-		{"secret", ""},
-	}
-	for _, pair := range defaults {
-		if val, exists := configData[pair[0]]; !exists || val == "" {
-			configData[pair[0]] = pair[1]
-		}
-	}
-	configMu.Unlock()
-	saveIniConfig("", "")
-}
-
-func sniffAndSolidifyConfig() {
-	configPath := filepath.Join(baseDir, "config.yaml")
-	data, err := os.ReadFile(configPath)
-	if err != nil {
-		return
-	}
-	lines := strings.Split(string(data), "\n")
-	inTunSection := false
-	for _, line := range lines {
-		trimmed := strings.TrimSpace(line)
-		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
-			continue
-		}
-		if strings.HasPrefix(trimmed, "tun:") {
-			inTunSection = true
-			continue
-		}
-		if inTunSection && !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") {
-			inTunSection = false
-		}
-		if inTunSection && strings.Contains(trimmed, "device:") {
-			parts := strings.SplitN(trimmed, ":", 2)
-			if len(parts) == 2 {
-				devName := strings.Trim(parts[1], " \"'")
-				if devName != "" {
-					saveIniConfig("tun_device_name", devName)
-				}
-			}
-		}
-		if strings.HasPrefix(trimmed, "external-controller:") {
-			addr := strings.Trim(strings.TrimPrefix(trimmed, "external-controller:"), " \"'")
-			if strings.HasPrefix(addr, ":") {
-				addr = "127.0.0.1" + addr
-			}
-			if addr != "" {
-				saveIniConfig("external-controller", "http://"+addr)
-			}
-		}
-		if strings.HasPrefix(trimmed, "secret:") {
-			saveIniConfig("secret", strings.Trim(strings.TrimPrefix(trimmed, "secret:"), " \"'"))
-		}
-		if strings.HasPrefix(trimmed, "mixed-port:") || (strings.HasPrefix(trimmed, "port:") && getIniConfig("proxy_address") == "127.0.0.1:7890") {
-			port := strings.Trim(strings.SplitN(trimmed, ":", 2)[1], " \"'")
-			if port != "" {
-				saveIniConfig("proxy_address", "127.0.0.1:"+port)
-			}
-		}
-	}
-}
-
-func getIniConfig(key string) string {
-	configMu.RLock()
-	defer configMu.RUnlock()
-	return configData[key]
-}
-
-func saveIniConfig(key, val string) {
-	configMu.Lock()
-	if key != "" {
-		configData[key] = val
-	}
-	priorityKeys := []string{"mode", "tun_enabled", "system_proxy_enabled", "startup_enabled", "proxy_address", "tun_device_name", "external-controller", "secret"}
-	var buf bytes.Buffer
-	for _, k := range priorityKeys {
-		if v, ok := configData[k]; ok {
-			buf.WriteString(fmt.Sprintf("%s = %s\n", k, v))
-		}
-	}
-	configMu.Unlock()
-	_ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), buf.Bytes(), 0644)
-}
-
-func doAPIRequest(method, path string, payload interface{}) (*http.Response, error) {
-	apiAddr := getIniConfig("external-controller")
-	if apiAddr == "" {
-		return nil, fmt.Errorf("API 地址未配置")
-	}
-
-	// 1. 规范化 URL 拼接，防止出现 // 或缺少 / 的情况
-	apiAddr = strings.TrimSuffix(apiAddr, "/")
-	path = "/" + strings.TrimPrefix(path, "/")
-	url := apiAddr + path
-
-	// 2. 处理请求体
-	var bodyReader io.Reader
-	if payload != nil {
-		b, err := json.Marshal(payload)
-		if err != nil {
-			return nil, fmt.Errorf("JSON 序列化失败: %v", err)
-		}
-		bodyReader = bytes.NewBuffer(b)
-	}
-
-	// 3. 创建请求
-	req, err := http.NewRequest(method, url, bodyReader)
-	if err != nil {
-		return nil, fmt.Errorf("创建请求失败: %v", err)
-	}
-
-	// 4. 注入核心 Header
-	req.Header.Set("Content-Type", "application/json")
-	if secret := getIniConfig("secret"); secret != "" {
-		req.Header.Set("Authorization", "Bearer "+secret)
-	}
-
-	// 5. 执行请求
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		// 如果发生错误，httpClient 会自动关闭连接，无需处理 resp
-		return nil, err
-	}
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-	    io.Copy(io.Discard, resp.Body)
-		return nil, fmt.Errorf("API Error: %d", resp.StatusCode)
-	}	
-	return resp, nil
-}
-
-// --- 系统操作 ---
-
-func setMihomoMode(mode string) {
-	saveIniConfig("mode", mode)
-	payload := map[string]string{"mode": mode}
-	_, _ = doAPIRequest("PATCH", "/configs", payload)
-}
-
-func setTunMode(enable bool) {
-	isSystemInitializing = true
-	saveIniConfig("tun_enabled", fmt.Sprint(enable))
-	payload := map[string]interface{}{"tun": map[string]bool{"enable": enable}}
-	_, _ = doAPIRequest("PATCH", "/configs", payload)
-	go func() {
-		time.Sleep(3 * time.Second)
-		isSystemInitializing = false
-	}()
-}
-
-func setProxyRegistry(enable bool) {
-    // 关键修复：只有在非退出状态下，才认为这是用户的手动意图，并写入配置文件
-    if !isReallyExiting {
-        saveIniConfig("system_proxy_enabled", fmt.Sprint(enable))
-    }
-
-    // 无论是否退出，都要执行注册表物理操作，确保上网安全
-    key, err := registry.OpenKey(registry.CURRENT_USER, REG_PROXY, registry.SET_VALUE)
+func main() {
+    var err error
+    exePath, err = os.Executable()
     if err != nil {
         return
     }
-    defer key.Close()
+    baseDir = filepath.Dir(exePath)
+    _ = os.Chdir(baseDir)
 
-    if enable {
-        // 开启代理：设置开关为 1，并指定服务器地址
-        _ = key.SetDWordValue("ProxyEnable", 1)
-        _ = key.SetStringValue("ProxyServer", getIniConfig("proxy_address"))
-    } else {
-        // 关闭代理：仅需将开关设为 0
-        _ = key.SetDWordValue("ProxyEnable", 0)
-    }
-}
+    ensureDefaultConfig()
+    lastProxyState := getIniConfig("system_proxy_enabled") == "true"
+    setProxyRegistry(lastProxyState)
 
-func reloadConfigFile() {
-    // 1. 开启保护锁，防止重载期间的逻辑抖动
-    isSystemInitializing = true
-
-    configPath := filepath.Join(baseDir, "config.yaml")
-    payload := map[string]string{
-        "path": configPath,
-    }
-
-    resp, err := doAPIRequest("PUT", "/configs?force=false", payload)
-    
-    if err != nil {
-        isSystemInitializing = false
+    if !isAdmin() {
+        runAsAdmin()
         return
     }
-    defer resp.Body.Close()
 
-    // 3. 只有成功响应时，才交给 syncConfigToKernel 执行后续的“稳定期”同步
-    if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
-        go syncConfigToKernel()
-    } else {
-        isSystemInitializing = false
-    }
-}
-func toggleAutoStart(enable bool) {
-	const taskName = "MihomoLauncherTask"
-	
-	// 1. 先清理旧的注册表启动项残留（确保只使用任务计划这一种方式）
-	if key, err := registry.OpenKey(registry.CURRENT_USER, REG_RUN, registry.SET_VALUE); err == nil {
-		_ = key.DeleteValue(APP_NAME)
-		key.Close()
-	}
-
-	success := false
-
-	if enable {
-		// 构建任务执行命令：进入程序目录并运行
-		taskCmd := fmt.Sprintf(`cmd.exe /c "cd /d \"%s\" && \"%s\""`, baseDir, exePath)
-
-		// A. 创建任务计划：登录时触发，以最高权限运行
-		createCmd := exec.Command("schtasks", "/Create",
-			"/TN", taskName,
-			"/TR", taskCmd,
-			"/SC", "ONLOGON",
-			"/RL", "HIGHEST",
-			"/F")
-		
-		createCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-		
-		if err := createCmd.Run(); err == nil {
-			success = true // 基础任务创建成功
-			
-			// B. 优化任务设置：允许电池模式启动、取消 3 天停止限制（使用 PowerShell 细化控制）
-			psScript := fmt.Sprintf(
-				`$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero); Set-ScheduledTask -TaskName '%s' -Settings $s`, 
-				taskName,
-			)
-			modifyCmd := exec.Command("powershell", "-Command", psScript)
-			modifyCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-			_ = modifyCmd.Run()
-		} else {
-			fmt.Printf("[AutoStart] 创建任务失败: %v\n", err)
-		}
-	} else {
-		// C. 删除任务计划
-		deleteCmd := exec.Command("schtasks", "/Delete", "/TN", taskName, "/F")
-		deleteCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-		
-		if err := deleteCmd.Run(); err == nil {
-			success = true
-		} else {
-			// 如果任务本身就不存在，也视为“关闭”成功
-			if !checkAutoStartStatus() {
-				success = true
-			}
-		}
-	}
-	if success {
-		saveIniConfig("startup_enabled", fmt.Sprint(enable))
-		fmt.Printf("[AutoStart] 状态已同步为: %v\n", enable)
-	}
-}
-
-func checkAutoStartStatus() bool {
-	const taskName = "MihomoLauncherTask"
-	cmd := exec.Command("schtasks", "/Query", "/TN", taskName)
-	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-	return cmd.Run() == nil
-}
-
-func monitorKernelDaemon() {
-	target := filepath.Join(baseDir, "mihomo.exe")
-	absBaseDir, _ := filepath.Abs(baseDir)
-
-	for {
-		// 0. 退出判定：如果主程序准备退出，直接结束守护
-		if isReallyExiting {
-			return
-		}
-
-		// 1. 检查内核进程是否存活
-       if !isProcessRunning("mihomo.exe") {
-            // 状态重置：发现内核丢失，重置 Once 对象以便新进程拉起后同步配置
-            onceSync = sync.Once{}
-            
-            // 锁定系统状态：进入初始化锁定，防止 watchTunState 等协程逻辑冲突
-            isSystemInitializing = true
-            atomic.StoreInt32(&isKernelActive, 0)
-            KillProcessByName("mihomo.exe")
-            time.Sleep(500 * time.Millisecond)
-            cmd := exec.Command(target, "-d", ".")
-            cmd.Dir = absBaseDir
-			cmd.Stdout = nil
-			cmd.Stderr = nil
-
-			// 5. Windows 专用属性设置
-			cmd.SysProcAttr = &windows.SysProcAttr{
-				CreationFlags: windows.CREATE_NO_WINDOW | 
-							   windows.CREATE_BREAKAWAY_FROM_JOB | 
-							   0x00000008,
-			}
-
-			// 6. 启动进程
-			if err := cmd.Start(); err == nil {
-				fmt.Printf("[Daemon] 内核已拉起, PID: %d\n", cmd.Process.Pid)
-
-				// 标记内核已激活
-				atomic.StoreInt32(&isKernelActive, 1)
-
-				// 7. 绑定 Job Object (如果初始化成功)
-				// 确保主程序异常崩溃时，Windows 会自动收割 mihomo.exe
-				if hJob != 0 {
-					hp, err := windows.OpenProcess(
-						windows.PROCESS_SET_QUOTA | windows.PROCESS_TERMINATE, 
-						false, 
-						uint32(cmd.Process.Pid),
-					)
-					if err == nil {
-						_ = windows.AssignProcessToJobObject(hJob, hp)
-						_ = windows.CloseHandle(hp)
-					}
-				}
-
-				// 8. 异步监听子进程结束
-				go func(c *exec.Cmd) {
-					_ = c.Wait()
-					atomic.StoreInt32(&isKernelActive, 0)
-					fmt.Println("[Daemon] 内核进程已退出")
-				}(cmd)
-
-				// 9. 启动安定期：等待 1.5 秒让内核 API 启动就绪
-				time.Sleep(1500 * time.Millisecond)
-				isSystemInitializing = false
-			} else {
-				// 启动失败容错
-				fmt.Printf("[Daemon] 启动失败: %v，将在下次轮询重试\n", err)
-				isSystemInitializing = false
-			}
-		}
-
-		// 10. 轮询频率：2秒检查一次
-		time.Sleep(2 * time.Second)
-	}
-}
-
-func monitorIconState() {
-	for {
-		if isReallyExiting { return }
-		var curr int
-		if !isProcessRunning("mihomo.exe") {
-			curr = StateStop
-		} else {
-			curr = checkSystemState()
-		}
-		if curr != lastState {
-			updateIconByState(curr)
-			lastState = curr
-		}
-		time.Sleep(1 * time.Second)
-	}
-}
-
-func checkSystemState() int {
-	resp, err := doAPIRequest("GET", "", nil)
-	if err != nil {
-		tunErrorCounter = 0
-		return StateStop
-	}
-	defer resp.Body.Close()
-
-	if isSystemInitializing { isSystemInitializing = false }
-	onceSync.Do(func() { go syncConfigToKernel() })
-
-	if getIniConfig("tun_enabled") == "true" {
-		hasTun := false
-		ifaces, _ := net.Interfaces()
-		for _, i := range ifaces {
-			if isTunInterfaceMatch(i.Name) {
-				hasTun = true
-				break
-			}
-		}
-		if hasTun {
-			tunErrorCounter = 0
-			return StateTun
-		} else {
-			tunErrorCounter++
-			if tunErrorCounter > 8 { return StateError }
-			return StateStop
-		}
-	}
-	if getIniConfig("system_proxy_enabled") == "true" { return StateProxy }
-	return StateDefault
-}
-
-func watchTunState() {
-	modiphlpapi := syscall.NewLazyDLL("iphlpapi.dll")
-	procNotifyAddrChange := modiphlpapi.NewProc("NotifyAddrChange")
-
-	// 增加一个局部状态缓存，只有状态真正改变时才触发逻辑
-	var lastHasTun bool 
-
-	for {
-		// 1. 退出判定
-		if isReallyExiting {
-			return
-		}
-
-		// 2. 核心修复：同步阻塞监听
-		// 第二个参数设为 0 (NULL)，让系统在网络变动时才释放此调用
-		// 彻底规避异步内存回写导致的崩溃
-		var handle windows.Handle
-		procNotifyAddrChange.Call(uintptr(unsafe.Pointer(&handle)), 0)
-
-		// 3. 安定期
-		// 硬件或驱动变化后，等待 2 秒让系统网络堆栈彻底就绪
-		time.Sleep(2 * time.Second)
-
-		// 4. 逻辑锁过滤
-		// 如果此时 Launcher 正在启动内核或同步配置，不执行反向检查
-		if isSystemInitializing || atomic.LoadInt32(&isSyncing) == 1 {
-			continue
-		}
-
-		// 5. 扫描当前系统中的 TUN 网卡
-		currentHasTun := false
-		ifaces, _ := net.Interfaces()
-		for _, i := range ifaces {
-			if isTunInterfaceMatch(i.Name) {
-				currentHasTun = true
-				break
-			}
-		}
-
-		// 6. 状态对比优化
-		// 如果网卡状态没变（例如只是 Wi-Fi 信号跳变），则直接跳过后续昂贵的检查
-		if currentHasTun == lastHasTun {
-			continue
-		}
-
-		// 7. 内核存活与 API 校验
-		// 只有内核在跑且 API 能通，我们才认为当前网卡的消失是“用户手动关闭”而非“内核崩溃”
-		if atomic.LoadInt32(&isKernelActive) == 0 {
-			continue
-		}
-
-		resp, err := doAPIRequest("GET", "/configs", nil)
-		if err != nil {
-			// API 不通时，不确定内核状态，保持配置文件现状，不进行反向改写
-			continue
-		}
-		io.Copy(io.Discard, resp.Body)
-		resp.Body.Close()
-
-		// 8. 执行对齐逻辑
-		// 读取本地 INI 记录的意图
-		configEnabled := getIniConfig("tun_enabled") == "true"
-
-		if currentHasTun != configEnabled {
-			// 说明出现了“配置要开启但网卡没了”或“配置要关闭但网卡还在”的冲突
-			if mTun != nil {
-				if currentHasTun {
-					mTun.Check()
-				} else {
-					mTun.Uncheck()
-				}
-			}
-			// 将硬件的真实状态同步回配置文件，确保 UI 图标、配置文件与实际网卡三位一体
-			saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
-			fmt.Printf("[Monitor] 检测到网卡状态变动, 配置文件已同步为: %v\n", currentHasTun)
-		}
-
-		// 更新缓存，准备下一次监听
-		lastHasTun = currentHasTun
-	}
-}
-func isProcessRunning(name string) bool {
-    h, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
-    if err != nil { return false }
-    defer windows.CloseHandle(h)
-
-    var pe windows.ProcessEntry32
-    pe.Size = uint32(unsafe.Sizeof(pe))
-    
-    if err := windows.Process32First(h, &pe); err != nil { return false }
-    for {
-        pname := windows.UTF16ToString(pe.ExeFile[:])
-        if strings.EqualFold(pname, name) {
-            // 排除掉 Launcher 自身（如果名字雷同的话）
-            if pe.ProcessID != uint32(os.Getpid()) {
-                return true
-            }
+    mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
+    h, err := windows.CreateMutex(nil, false, mName)
+    if err != nil || windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
+        if h != 0 {
+            windows.CloseHandle(h)
         }
-        if err := windows.Process32Next(h, &pe); err != nil { break }
+        return
     }
-    return false
-}
-func updateIconByState(state int) {
-	files := []string{"stop.ico", "error.ico", "tun.ico", "proxy.ico", "default.ico"}
-	if state < 0 || state >= len(files) { return }
-	b, err := iconFs.ReadFile("icons/" + files[state])
-	if err == nil { systray.SetIcon(b) }
-}
+    hMutex = h
 
-func syncConfigToKernel() {
-    // 1. 【并发锁】使用原子操作防止多个协程同时同步，产生指令交织
-    if !atomic.CompareAndSwapInt32(&isSyncing, 0, 1) {
-        return 
-    }
-    defer atomic.StoreInt32(&isSyncing, 0)
+    go func() {
+        sigCh := make(chan os.Signal, 1)
+        signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+        <-sigCh
+        onExit()
+        os.Exit(0)
+    }()
 
-    // 2. 【逻辑锁】进入系统初始化状态，此时 watchTunState 监控会静默，不会反向改写 INI
-    isSystemInitializing = true
-    
-    // 自动兜底：无论同步成功失败，10秒后必须解除初始化锁，防止程序逻辑永久死锁
-    timer := time.AfterFunc(10*time.Second, func() {
-        isSystemInitializing = false
-    })
-    defer timer.Stop()
+    KillProcessByName("mihomo.exe")
+    time.Sleep(200 * time.Millisecond)
 
-    // 准备推送的数据
-    tunEnabled := getIniConfig("tun_enabled") == "true"
-    payload := map[string]interface{}{
-        "mode": getIniConfig("mode"),
-        "tun":  map[string]bool{"enable": tunEnabled},
-    }
+    sniffAndSolidifyConfig()
 
-    // 3. 【健壮重试】使用指数退避策略尝试同步，应对内核刚启动 API 还没就绪的情况
-    success := false
-    for i := 0; i < 3; i++ {
-        resp, err := doAPIRequest("PATCH", "/configs", payload)
-        if err == nil {
-            // ✅ 关键：即使不需要内容，也要读取并关闭，确保连接复用
-            io.Copy(io.Discard, resp.Body)
-            resp.Body.Close()
-            success = true
-            break
-        }
-        
-        // 如果失败，等待时间随次数增加 (500ms, 1000ms, 1500ms)
-        time.Sleep(time.Duration(i+1) * 500 * time.Millisecond)
-    }
+    initJobObject()
 
-    // 4. 【状态回填】同步成功后，更新 UI 菜单的勾选状态
-    if success && mTun != nil {
-        if tunEnabled {
-            mTun.Check()
-        } else {
-            mTun.Uncheck()
-        }
-    }
+    go monitorKernelDaemon()
+    go monitorIconState()
+    go watchTunState()
 
-    time.Sleep(1 * time.Second)
-    isSystemInitializing = false
+    systray.Run(onReady, onExit)
+
+    onExit()
 }
 
 func onReady() {
@@ -685,16 +122,13 @@ func onReady() {
     setProxyRegistry(getIniConfig("system_proxy_enabled") == "true")
     updateIconByState(StateStop)
 
-    // --- 第一部分：基础操作 ---
     mWeb := systray.AddMenuItem("进入 Web 面板", "")
     systray.AddSeparator()
 
-    // --- 第二部分：核心开关 ---
     mProxy := systray.AddMenuItemCheckbox("系统代理", "", getIniConfig("system_proxy_enabled") == "true")
     mTun = systray.AddMenuItemCheckbox("虚拟网卡 (TUN)", "", getIniConfig("tun_enabled") == "true")
     systray.AddSeparator()
 
-    // --- 第三部分：模式切换 (二级菜单) ---
     mModeRoot := systray.AddMenuItem("模式切换", "")
     curMode := getIniConfig("mode")
     modeMenus := make(map[string]*systray.MenuItem)
@@ -703,7 +137,6 @@ func onReady() {
     modeMenus["direct"] = mModeRoot.AddSubMenuItemCheckbox("直连模式", "", curMode == "direct")
     systray.AddSeparator()
 
-    // --- 第四部分：工具与更多 (二级菜单) ---
     mDir := systray.AddMenuItem("打开目录", "")
     
     mMoreRoot := systray.AddMenuItem("更多", "")
@@ -713,10 +146,8 @@ func onReady() {
     mReload := mMoreRoot.AddSubMenuItem("重载配置文件", "手动通知内核读取 config.yaml")
     systray.AddSeparator()
 
-    // --- 第五部分：退出 ---
     mExit := systray.AddMenuItem("关闭程序", "")
 
-    // 事件循环保持不变...
     for {
         select {
         case <-mWeb.ClickedCh:
@@ -745,7 +176,7 @@ func onReady() {
             modeMenus["rule"].Uncheck(); modeMenus["global"].Uncheck(); modeMenus["direct"].Check()            
         case <-mTun.ClickedCh:
             next := !mTun.Checked()
-			if next { mTun.Check() } else { mTun.Uncheck() }
+            if next { mTun.Check() } else { mTun.Uncheck() }
             go setTunMode(next)
         case <-mProxy.ClickedCh:
             next := !mProxy.Checked()
@@ -765,136 +196,554 @@ func onReady() {
             isSystemInitializing = true
             onceSync = sync.Once{}
             KillProcessByName("mihomo.exe")
-		case <-mExit.ClickedCh:
-			isReallyExiting = true
-			systray.Quit()
-			return
-		}
-	}
+        case <-mExit.ClickedCh:
+            isReallyExiting = true
+            systray.Quit()
+            return
+        }
+    }
 }
-
-
 
 func onExit() {
     exitOnce.Do(func() {
-        // 1. 优先标记正在退出，这会告诉 setProxyRegistry 不要弄脏配置文件
         isReallyExiting = true
-
-        // 2. 执行注册表清理：此时只会关掉 Windows 代理开关，INI 里的状态依然是 true
         setProxyRegistry(false)
-
-        // 3. 留出物理时间让注册表写入完成
         time.Sleep(100 * time.Millisecond)
-
-        // 4. 关闭 Job 对象，利用 Windows 内核特性自动收割 mihomo.exe 进程
         if hJob != 0 {
             windows.CloseHandle(hJob)
         }
-        
-        // 5. 释放单实例互斥锁
         if hMutex != 0 {
             windows.CloseHandle(hMutex)
         }
     })
 }
 
-func main() {
-    // 1. 路径初始化与工作目录锁定
-    var err error
-    exePath, err = os.Executable()
+// --- 核心业务逻辑与守护 ---
+
+func monitorKernelDaemon() {
+    target := filepath.Join(baseDir, "mihomo.exe")
+    absBaseDir, _ := filepath.Abs(baseDir)
+    for {
+        if isReallyExiting {
+            return
+        }
+       if !isProcessRunning("mihomo.exe") {
+            onceSync = sync.Once{}
+            isSystemInitializing = true
+            atomic.StoreInt32(&isKernelActive, 0)
+            KillProcessByName("mihomo.exe")
+            time.Sleep(500 * time.Millisecond)
+            cmd := exec.Command(target, "-d", ".")
+            cmd.Dir = absBaseDir
+            cmd.Stdout = nil
+            cmd.Stderr = nil
+            cmd.SysProcAttr = &windows.SysProcAttr{
+                CreationFlags: windows.CREATE_NO_WINDOW | 
+                               windows.CREATE_BREAKAWAY_FROM_JOB | 
+                               0x00000008,
+            }
+            if err := cmd.Start(); err == nil {
+                atomic.StoreInt32(&isKernelActive, 1)
+                if hJob != 0 {
+                    hp, err := windows.OpenProcess(
+                        windows.PROCESS_SET_QUOTA | windows.PROCESS_TERMINATE, 
+                        false, 
+                        uint32(cmd.Process.Pid),
+                    )
+                    if err == nil {
+                        _ = windows.AssignProcessToJobObject(hJob, hp)
+                        _ = windows.CloseHandle(hp)
+                    }
+                }
+                go func(c *exec.Cmd) {
+                    _ = c.Wait()
+                    atomic.StoreInt32(&isKernelActive, 0)
+                }(cmd)
+                time.Sleep(1500 * time.Millisecond)
+                isSystemInitializing = false
+            } else {
+                isSystemInitializing = false
+            }
+        }
+        time.Sleep(2 * time.Second)
+    }
+}
+
+func syncConfigToKernel() {
+    if !atomic.CompareAndSwapInt32(&isSyncing, 0, 1) {
+        return 
+    }
+    defer atomic.StoreInt32(&isSyncing, 0)
+    isSystemInitializing = true
+    timer := time.AfterFunc(10*time.Second, func() {
+        isSystemInitializing = false
+    })
+    defer timer.Stop()
+    tunEnabled := getIniConfig("tun_enabled") == "true"
+    payload := map[string]interface{}{
+        "mode": getIniConfig("mode"),
+        "tun":  map[string]bool{"enable": tunEnabled},
+    }
+    success := false
+    for i := 0; i < 3; i++ {
+        resp, err := doAPIRequest("PATCH", "/configs", payload)
+        if err == nil {
+            io.Copy(io.Discard, resp.Body)
+            resp.Body.Close()
+            success = true
+            break
+        }
+        time.Sleep(time.Duration(i+1) * 500 * time.Millisecond)
+    }
+    if success && mTun != nil {
+        if tunEnabled {
+            mTun.Check()
+        } else {
+            mTun.Uncheck()
+        }
+    }
+    time.Sleep(1 * time.Second)
+    isSystemInitializing = false
+}
+
+func watchTunState() {
+    modiphlpapi := syscall.NewLazyDLL("iphlpapi.dll")
+    procNotifyAddrChange := modiphlpapi.NewProc("NotifyAddrChange")
+    var lastHasTun bool 
+    for {
+        if isReallyExiting {
+            return
+        }
+        var handle windows.Handle
+        procNotifyAddrChange.Call(uintptr(unsafe.Pointer(&handle)), 0)
+        time.Sleep(2 * time.Second)
+        if isSystemInitializing || atomic.LoadInt32(&isSyncing) == 1 {
+            continue
+        }
+        currentHasTun := false
+        ifaces, _ := net.Interfaces()
+        for _, i := range ifaces {
+            if isTunInterfaceMatch(i.Name) {
+                currentHasTun = true
+                break
+            }
+        }
+        if currentHasTun == lastHasTun {
+            continue
+        }
+        if atomic.LoadInt32(&isKernelActive) == 0 {
+            continue
+        }
+        resp, err := doAPIRequest("GET", "/configs", nil)
+        if err != nil {
+            continue
+        }
+        io.Copy(io.Discard, resp.Body)
+        resp.Body.Close()
+        configEnabled := getIniConfig("tun_enabled") == "true"
+        if currentHasTun != configEnabled {
+            if mTun != nil {
+                if currentHasTun {
+                    mTun.Check()
+                } else {
+                    mTun.Uncheck()
+                }
+            }
+            saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
+        }
+        lastHasTun = currentHasTun
+    }
+}
+
+func monitorIconState() {
+    for {
+        if isReallyExiting { return }
+        var curr int
+        if !isProcessRunning("mihomo.exe") {
+            curr = StateStop
+        } else {
+            curr = checkSystemState()
+        }
+        if curr != lastState {
+            updateIconByState(curr)
+            lastState = curr
+        }
+        time.Sleep(1 * time.Second)
+    }
+}
+
+func checkSystemState() int {
+    resp, err := doAPIRequest("GET", "", nil)
+    if err != nil {
+        tunErrorCounter = 0
+        return StateStop
+    }
+    defer resp.Body.Close()
+    if isSystemInitializing { isSystemInitializing = false }
+    onceSync.Do(func() { go syncConfigToKernel() })
+    if getIniConfig("tun_enabled") == "true" {
+        hasTun := false
+        ifaces, _ := net.Interfaces()
+        for _, i := range ifaces {
+            if isTunInterfaceMatch(i.Name) {
+                hasTun = true
+                break
+            }
+        }
+        if hasTun {
+            tunErrorCounter = 0
+            return StateTun
+        } else {
+            tunErrorCounter++
+            if tunErrorCounter > 8 { return StateError }
+            return StateStop
+        }
+    }
+    if getIniConfig("system_proxy_enabled") == "true" { return StateProxy }
+    return StateDefault
+}
+
+// --- 配置管理 ---
+
+func ensureDefaultConfig() {
+    configMu.Lock()
+    b, _ := os.ReadFile(filepath.Join(baseDir, CONFIG_FILE))
+    lines := strings.Split(string(b), "\n")
+    for _, line := range lines {
+        line = strings.TrimSpace(line)
+        if line == "" || strings.HasPrefix(line, "#") {
+            continue
+        }
+        if parts := strings.SplitN(line, "=", 2); len(parts) == 2 {
+            configData[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
+        }
+    }
+    defaults := [][]string{
+        {"mode", "rule"},
+        {"tun_enabled", "false"},
+        {"system_proxy_enabled", "false"},
+        {"startup_enabled", "false"},
+        {"proxy_address", "127.0.0.1:7890"},
+        {"tun_device_name", "Mihomo"},
+        {"external-controller", "http://127.0.0.1:9090"},
+        {"secret", ""},
+    }
+    for _, pair := range defaults {
+        if val, exists := configData[pair[0]]; !exists || val == "" {
+            configData[pair[0]] = pair[1]
+        }
+    }
+    configMu.Unlock()
+    saveIniConfig("", "")
+}
+
+func sniffAndSolidifyConfig() {
+    configPath := filepath.Join(baseDir, "config.yaml")
+    data, err := os.ReadFile(configPath)
     if err != nil {
         return
     }
-    baseDir = filepath.Dir(exePath)
-    _ = os.Chdir(baseDir)
-
-    // 2. 环境自愈与状态恢复
-    // 首先确保加载了配置文件
-    ensureDefaultConfig()
-    // 读取上次保存的意图：如果是 true，启动时会自动把注册表勾选上
-    lastProxyState := getIniConfig("system_proxy_enabled") == "true"
-    setProxyRegistry(lastProxyState)
-
-    // 3. 权限判定与提权
-    if !isAdmin() {
-        runAsAdmin()
-        return
-    }
-
-    // 4. 单实例互斥锁
-    mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
-    h, err := windows.CreateMutex(nil, false, mName)
-    if err != nil || windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
-        if h != 0 {
-            windows.CloseHandle(h)
+    lines := strings.Split(string(data), "\n")
+    inTunSection := false
+    for _, line := range lines {
+        trimmed := strings.TrimSpace(line)
+        if trimmed == "" || strings.HasPrefix(trimmed, "#") {
+            continue
         }
+        if strings.HasPrefix(trimmed, "tun:") {
+            inTunSection = true
+            continue
+        }
+        if inTunSection && !strings.HasPrefix(line, " ") && !strings.HasPrefix(line, "\t") {
+            inTunSection = false
+        }
+        if inTunSection && strings.Contains(trimmed, "device:") {
+            parts := strings.SplitN(trimmed, ":", 2)
+            if len(parts) == 2 {
+                devName := strings.Trim(parts[1], " \"'")
+                if devName != "" {
+                    saveIniConfig("tun_device_name", devName)
+                }
+            }
+        }
+        if strings.HasPrefix(trimmed, "external-controller:") {
+            addr := strings.Trim(strings.TrimPrefix(trimmed, "external-controller:"), " \"'")
+            if strings.HasPrefix(addr, ":") {
+                addr = "127.0.0.1" + addr
+            }
+            if addr != "" {
+                saveIniConfig("external-controller", "http://"+addr)
+            }
+        }
+        if strings.HasPrefix(trimmed, "secret:") {
+            saveIniConfig("secret", strings.Trim(strings.TrimPrefix(trimmed, "secret:"), " \"'"))
+        }
+        if strings.HasPrefix(trimmed, "mixed-port:") || (strings.HasPrefix(trimmed, "port:") && getIniConfig("proxy_address") == "127.0.0.1:7890") {
+            port := strings.Trim(strings.SplitN(trimmed, ":", 2)[1], " \"'")
+            if port != "" {
+                saveIniConfig("proxy_address", "127.0.0.1:"+port)
+            }
+        }
+    }
+}
+
+func getIniConfig(key string) string {
+    configMu.RLock()
+    defer configMu.RUnlock()
+    return configData[key]
+}
+
+func saveIniConfig(key, val string) {
+    configMu.Lock()
+    if key != "" {
+        configData[key] = val
+    }
+    priorityKeys := []string{"mode", "tun_enabled", "system_proxy_enabled", "startup_enabled", "proxy_address", "tun_device_name", "external-controller", "secret"}
+    var buf bytes.Buffer
+    for _, k := range priorityKeys {
+        if v, ok := configData[k]; ok {
+            buf.WriteString(fmt.Sprintf("%s = %s\n", k, v))
+        }
+    }
+    configMu.Unlock()
+    _ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), buf.Bytes(), 0644)
+}
+
+func doAPIRequest(method, path string, payload interface{}) (*http.Response, error) {
+    apiAddr := getIniConfig("external-controller")
+    if apiAddr == "" {
+        return nil, fmt.Errorf("API 地址未配置")
+    }
+    apiAddr = strings.TrimSuffix(apiAddr, "/")
+    path = "/" + strings.TrimPrefix(path, "/")
+    url := apiAddr + path
+    var bodyReader io.Reader
+    if payload != nil {
+        b, err := json.Marshal(payload)
+        if err != nil {
+            return nil, fmt.Errorf("JSON 序列化失败: %v", err)
+        }
+        bodyReader = bytes.NewBuffer(b)
+    }
+    req, err := http.NewRequest(method, url, bodyReader)
+    if err != nil {
+        return nil, fmt.Errorf("创建请求失败: %v", err)
+    }
+    req.Header.Set("Content-Type", "application/json")
+    if secret := getIniConfig("secret"); secret != "" {
+        req.Header.Set("Authorization", "Bearer "+secret)
+    }
+    resp, err := httpClient.Do(req)
+    if err != nil {
+        return nil, err
+    }
+    if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+        io.Copy(io.Discard, resp.Body)
+        return nil, fmt.Errorf("API Error: %d", resp.StatusCode)
+    }    
+    return resp, nil
+}
+
+func reloadConfigFile() {
+    isSystemInitializing = true
+    configPath := filepath.Join(baseDir, "config.yaml")
+    payload := map[string]string{
+        "path": configPath,
+    }
+    resp, err := doAPIRequest("PUT", "/configs?force=false", payload)
+    if err != nil {
+        isSystemInitializing = false
         return
     }
-    hMutex = h
+    defer resp.Body.Close()
+    if resp.StatusCode == http.StatusNoContent || resp.StatusCode == http.StatusOK {
+        go syncConfigToKernel()
+    } else {
+        isSystemInitializing = false
+    }
+}
 
-    // 5. 系统信号监听
+// --- 控制操作 ---
+
+func setMihomoMode(mode string) {
+    saveIniConfig("mode", mode)
+    payload := map[string]string{"mode": mode}
+    _, _ = doAPIRequest("PATCH", "/configs", payload)
+}
+
+func setTunMode(enable bool) {
+    isSystemInitializing = true
+    saveIniConfig("tun_enabled", fmt.Sprint(enable))
+    payload := map[string]interface{}{"tun": map[string]bool{"enable": enable}}
+    _, _ = doAPIRequest("PATCH", "/configs", payload)
     go func() {
-        sigCh := make(chan os.Signal, 1)
-        signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-        <-sigCh
-        onExit()
-        os.Exit(0)
+        time.Sleep(3 * time.Second)
+        isSystemInitializing = false
     }()
+}
 
-	KillProcessByName("mihomo.exe")
-    time.Sleep(200 * time.Millisecond)
+// --- 系统工具函数 ---
 
-    // 7. 配置预热
-    sniffAndSolidifyConfig()
+func isAdmin() bool {
+    var token windows.Token
+    err := windows.OpenProcessToken(windows.CurrentProcess(), windows.TOKEN_QUERY, &token)
+    if err != nil {
+        return false
+    }
+    defer token.Close()
+    return token.IsElevated()
+}
 
-    // 8. 初始化 Windows 作业对象
-    initJobObject()
+func runAsAdmin() {
+    verb, _ := syscall.UTF16PtrFromString("runas")
+    exe, _ := syscall.UTF16PtrFromString(exePath)
+    cwd, _ := syscall.UTF16PtrFromString(baseDir)
+    _ = windows.ShellExecute(0, verb, exe, nil, cwd, windows.SW_HIDE)
+}
 
-    // 9. 启动后台守护协程
-    go monitorKernelDaemon()
-    go monitorIconState()
-    go watchTunState()
+func setProxyRegistry(enable bool) {
+    if !isReallyExiting {
+        saveIniConfig("system_proxy_enabled", fmt.Sprint(enable))
+    }
+    key, err := registry.OpenKey(registry.CURRENT_USER, REG_PROXY, registry.SET_VALUE)
+    if err != nil {
+        return
+    }
+    defer key.Close()
+    if enable {
+        _ = key.SetDWordValue("ProxyEnable", 1)
+        _ = key.SetStringValue("ProxyServer", getIniConfig("proxy_address"))
+    } else {
+        _ = key.SetDWordValue("ProxyEnable", 0)
+    }
+}
 
-    // 10. 启动托盘界面
-    systray.Run(onReady, onExit)
+func toggleAutoStart(enable bool) {
+    const taskName = "MihomoLauncherTask"
+    if key, err := registry.OpenKey(registry.CURRENT_USER, REG_RUN, registry.SET_VALUE); err == nil {
+        _ = key.DeleteValue(APP_NAME)
+        key.Close()
+    }
+    success := false
+    if enable {
+        taskCmd := fmt.Sprintf(`cmd.exe /c "cd /d \"%s\" && \"%s\""`, baseDir, exePath)
+        createCmd := exec.Command("schtasks", "/Create",
+            "/TN", taskName,
+            "/TR", taskCmd,
+            "/SC", "ONLOGON",
+            "/RL", "HIGHEST",
+            "/F")
+        createCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+        if err := createCmd.Run(); err == nil {
+            success = true 
+            psScript := fmt.Sprintf(
+                `$s = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero); Set-ScheduledTask -TaskName '%s' -Settings $s`, 
+                taskName,
+            )
+            modifyCmd := exec.Command("powershell", "-Command", psScript)
+            modifyCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+            _ = modifyCmd.Run()
+        }
+    } else {
+        deleteCmd := exec.Command("schtasks", "/Delete", "/TN", taskName, "/F")
+        deleteCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+        if err := deleteCmd.Run(); err == nil {
+            success = true
+        } else {
+            if !checkAutoStartStatus() {
+                success = true
+            }
+        }
+    }
+    if success {
+        saveIniConfig("startup_enabled", fmt.Sprint(enable))
+    }
+}
 
-    // 11. 正常退出流程
-    onExit()
+func checkAutoStartStatus() bool {
+    const taskName = "MihomoLauncherTask"
+    cmd := exec.Command("schtasks", "/Query", "/TN", taskName)
+    cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+    return cmd.Run() == nil
+}
+
+func isTunInterfaceMatch(ifaceName string) bool {
+    name := strings.ToLower(ifaceName)
+    target := strings.ToLower(getIniConfig("tun_device_name"))
+    if target != "" && strings.Contains(name, target) {
+        return true
+    }
+    keywords := []string{"mihomo", "meta", "clash", "sing-box", "wintun"}
+    for _, kw := range keywords {
+        if strings.Contains(name, kw) {
+            return true
+        }
+    }
+    return false
+}
+
+func initJobObject() {
+    h, _ := windows.CreateJobObject(nil, nil)
+    if h != 0 {
+        var info windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION
+        info.BasicLimitInformation.LimitFlags = windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        windows.NewLazySystemDLL("kernel32.dll").NewProc("SetInformationJobObject").Call(
+            uintptr(h), 9, uintptr(unsafe.Pointer(&info)), uintptr(uint32(unsafe.Sizeof(info))),
+        )
+        hJob = h
+    }
+}
+
+func isProcessRunning(name string) bool {
+    h, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+    if err != nil { return false }
+    defer windows.CloseHandle(h)
+    var pe windows.ProcessEntry32
+    pe.Size = uint32(unsafe.Sizeof(pe))
+    if err := windows.Process32First(h, &pe); err != nil { return false }
+    for {
+        pname := windows.UTF16ToString(pe.ExeFile[:])
+        if strings.EqualFold(pname, name) {
+            if pe.ProcessID != uint32(os.Getpid()) {
+                return true
+            }
+        }
+        if err := windows.Process32Next(h, &pe); err != nil { break }
+    }
+    return false
 }
 
 func KillProcessByName(name string) {
-	// 获取进程快照
-	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
-	if err != nil {
-		return
-	}
-	defer windows.CloseHandle(snapshot)
+    snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+    if err != nil {
+        return
+    }
+    defer windows.CloseHandle(snapshot)
+    var pe windows.ProcessEntry32
+    pe.Size = uint32(unsafe.Sizeof(pe))
+    if err := windows.Process32First(snapshot, &pe); err != nil {
+        return
+    }
+    for {
+        pname := windows.UTF16ToString(pe.ExeFile[:])
+        if strings.EqualFold(pname, name) {
+            if pe.ProcessID != uint32(os.Getpid()) {
+                hProcess, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, pe.ProcessID)
+                if err == nil {
+                    err = windows.TerminateProcess(hProcess, 9) 
+                    windows.CloseHandle(hProcess)
+                }
+            }
+        }
+        if err := windows.Process32Next(snapshot, &pe); err != nil {
+            break
+        }
+    }
+}
 
-	var pe windows.ProcessEntry32
-	pe.Size = uint32(unsafe.Sizeof(pe))
-
-	if err := windows.Process32First(snapshot, &pe); err != nil {
-		return
-	}
-
-	for {
-		pname := windows.UTF16ToString(pe.ExeFile[:])
-		if strings.EqualFold(pname, name) {
-			if pe.ProcessID != uint32(os.Getpid()) {
-				// 尝试获取终止权限
-				hProcess, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, pe.ProcessID)
-				if err == nil {
-					// 强制终止：第二个参数是退出码，通常给 0 或 1
-					err = windows.TerminateProcess(hProcess, 9) 
-					windows.CloseHandle(hProcess)
-					if err == nil {
-						fmt.Printf("[Native] 成功秒杀残留进程: %s (PID: %d)\n", pname, pe.ProcessID)
-					}
-				}
-			}
-		}
-		if err := windows.Process32Next(snapshot, &pe); err != nil {
-			break
-		}
-	}
+func updateIconByState(state int) {
+    files := []string{"stop.ico", "error.ico", "tun.ico", "proxy.ico", "default.ico"}
+    if state < 0 || state >= len(files) { return }
+    b, err := iconFs.ReadFile("icons/" + files[state])
+    if err == nil { systray.SetIcon(b) }
 }
