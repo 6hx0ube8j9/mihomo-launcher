@@ -74,12 +74,10 @@ func isAdmin() bool {
 
 func runAsAdmin() {
     verb, _ := syscall.UTF16PtrFromString("runas")
-    // 使用 filepath.Clean 确保路径格式标准
     path, _ := filepath.Abs(exePath)
     exe, _ := syscall.UTF16PtrFromString(path)
     cwd, _ := syscall.UTF16PtrFromString(baseDir)
     
-    // SW_HIDE 可以让提权过程更“安静”一点，但 SW_SHOWNORMAL 最稳
     _ = windows.ShellExecute(0, verb, exe, nil, cwd, windows.SW_SHOWNORMAL)
 }
 
@@ -802,7 +800,7 @@ func onExit() {
 }
 
 func main() {
-    // 1. 路径初始化与工作目录锁定 (获取自身身份，为提权做准备)
+    // 1. 基础初始化
     var err error
     exePath, err = os.Executable()
     if err != nil {
@@ -811,16 +809,16 @@ func main() {
     baseDir = filepath.Dir(exePath)
     _ = os.Chdir(baseDir)
 
-    // 2. 权限判定与提权 (第一优先级)
-    // 如果没有管理员权限，立即启动高权限副本并退出当前进程
+    // 2. 权限判定：如果是普通用户，拉起管理员后必须“立刻”结束自己
     if !isAdmin() {
         runAsAdmin()
-        return // 必须 return，确保低权限进程立刻自杀
+        os.Exit(0) // 核心修复：这里绝对不能留活口，必须立刻退出
     }
 
-    // 3. 单实例互斥锁 (确保全局只有一个高权限实例在运行)
+    // 3. 此时已是管理员，再尝试加锁
     mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
     h, err := windows.CreateMutex(nil, false, mName)
+    // 注意：如果是管理员模式下报已存在，说明真的开着一个，才退出
     if err != nil || windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
         if h != 0 {
             windows.CloseHandle(h)
