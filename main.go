@@ -1,27 +1,27 @@
 package main
 
 import (
-	"bytes"
-	"embed"
-	"encoding/json"
-	"fmt"
-	"io"
-	"net"
-	"net/http"
-	"os"
-	"os/exec"
-	"os/signal"
-	"path/filepath"
-	"strings"
-	"sync"
-	"sync/atomic"
-	"syscall"
-	"time"
-	"unsafe"
+    "bytes"
+    "embed"
+    "encoding/json"
+    "fmt"
+    "io"
+    "net"
+    "net/http"
+    "os"
+    "os/exec"
+    "os/signal"
+    "path/filepath"
+    "strings"
+    "sync"
+    "sync/atomic"
+    "syscall"
+    "time"
+    "unsafe"
 
-	"github.com/getlantern/systray"
-	"golang.org/x/sys/windows"
-	"golang.org/x/sys/windows/registry"
+    "github.com/getlantern/systray"
+    "golang.org/x/sys/windows"
+    "golang.org/x/sys/windows/registry"
 )
 
 //go:embed icons/*.ico
@@ -115,9 +115,54 @@ func main() {
 	}()
 
 	systray.Run(onReady, onExit)
-	onExit()
 }
 
+
+func isPanelAlreadyRunning() bool {
+    // 获取系统进程快照
+    h, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+    if err != nil {
+        return false
+    }
+    defer windows.CloseHandle(h)
+
+    var pe windows.ProcessEntry32
+    pe.Size = uint32(unsafe.Sizeof(pe))
+    if err := windows.Process32First(h, &pe); err != nil {
+        return false
+    }
+
+    for {
+        exeName := windows.UTF16ToString(pe.ExeFile[:])
+        // 检查进程名是否为 msedge.exe
+        if strings.EqualFold(exeName, "msedge.exe") {
+            // 关键：检查该进程的命令行中是否包含我们定义的缓存目录关键字
+            // 这样可以防止误判用户自己平时打开的普通 Edge 浏览器
+            if checkProcessCmdline(pe.ProcessID, "EdgeAppCache") {
+                return true
+            }
+        }
+        if err := windows.Process32Next(h, &pe); err != nil {
+            break
+        }
+    }
+    return false
+}
+
+
+func checkProcessCmdline(pid uint32, keyword string) bool {
+    // 执行 wmic 获取命令行
+    cmd := exec.Command("wmic", "process", "where", fmt.Sprintf("ProcessId=%d", pid), "get", "CommandLine")
+    // 隐藏命令行窗口
+    cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+    
+    out, err := cmd.Output()
+    if err != nil {
+        return false
+    }
+    // 检查输出结果中是否包含关键字（如 EdgeAppCache）
+    return strings.Contains(string(out), keyword)
+}
 func onReady() {
 	saveIniConfig("startup_enabled", fmt.Sprint(checkAutoStartStatus()))
 	ensureDefaultConfig()
@@ -152,48 +197,54 @@ func onReady() {
     for {
 		select {
         case <-mWeb.ClickedCh:
-            if isPanelAlreadyRunning() {
-                edgePath := `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`
-                userDataDir := filepath.Join(os.Getenv("TEMP"), "EdgeAppCache")
-                tempCmd := exec.Command(edgePath, "--user-data-dir="+userDataDir)
-                tempCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-                _ = tempCmd.Start()
-                
-                continue // 重要：拦截在此，不执行下面的新建逻辑
-            }
+			// 1. 检查面板是否已在运行
+			if isPanelAlreadyRunning() {
+				// 如果已运行，发送一个唤醒指令给 Edge
+				// Edge 探测到目录占用时会自动将已有的窗口置顶
+				edgePath := `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`
+				if _, err := os.Stat(edgePath); err != nil {
+				    edgePath = "msedge"
+				}
+				userDataDir := filepath.Join(os.Getenv("TEMP"), "EdgeAppCache")
+				tempCmd := exec.Command(edgePath, "--user-data-dir="+userDataDir)
+				tempCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+				_ = tempCmd.Start()
+				
+				continue // 关键：拦截在此，不再执行下方的启动逻辑
+			}
 
-            apiAddr := getIniConfig("external-controller")
-            secret := getIniConfig("secret")
-            proxyAddr := getIniConfig("proxy_address")
+			// 2. 正常启动逻辑
+			apiAddr := getIniConfig("external-controller")
+			secret := getIniConfig("secret")
+			proxyAddr := getIniConfig("proxy_address")
 
-            cleanAddr := strings.TrimPrefix(strings.TrimPrefix(apiAddr, "http://"), "https://")
-            host, port := "127.0.0.1", "9090"
-            if parts := strings.Split(cleanAddr, ":"); len(parts) == 2 {
-                host, port = parts[0], parts[1]
-            }
+			cleanAddr := strings.TrimPrefix(strings.TrimPrefix(apiAddr, "http://"), "https://")
+			host, port := "127.0.0.1", "9090"
+			if parts := strings.Split(cleanAddr, ":"); len(parts) == 2 {
+				host, port = parts[0], parts[1]
+			}
 
-            finalURL := fmt.Sprintf("%s/ui/#/setup?hostname=%s&port=%s&secret=%s", apiAddr, host, port, secret)
-            userDataDir := filepath.Join(os.Getenv("TEMP"), "EdgeAppCache")
+			finalURL := fmt.Sprintf("%s/ui/#/setup?hostname=%s&port=%s&secret=%s", apiAddr, host, port, secret)
+			userDataDir := filepath.Join(os.Getenv("TEMP"), "EdgeAppCache")
 
-            args := []string{
-                "--app=" + finalURL,
-                "--window-size=1280,768",
-                "--user-data-dir=" + userDataDir,
-                "--proxy-server=" + proxyAddr,
-                "--no-first-run",
-            }
+			args := []string{
+				"--app=" + finalURL,
+				"--window-size=1280,768",
+				"--user-data-dir=" + userDataDir,
+				"--proxy-server=" + proxyAddr,
+				"--no-first-run",
+			}
 
-            edgePath := `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`
+			edgePath := `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`
+			var cmd *exec.Cmd
+			if _, err := os.Stat(edgePath); err == nil {
+				cmd = exec.Command(edgePath, args...)
+			} else {
+				cmd = exec.Command("cmd", append([]string{"/c", "start", "msedge"}, args...)...)
+			}
 
-            var cmd *exec.Cmd
-            if _, err := os.Stat(edgePath); err == nil {
-                cmd = exec.Command(edgePath, args...)
-            } else {
-                cmd = exec.Command("cmd", append([]string{"/c", "start", "msedge"}, args...)...)
-            }
-
-            cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-            _ = cmd.Start()
+			cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+			_ = cmd.Start()
 		case <-mReload.ClickedCh:
 			sniffAndSolidifyConfig()
 			reloadConfigFile()
