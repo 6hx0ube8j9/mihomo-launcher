@@ -799,61 +799,62 @@ func onExit() {
 
 func main() {
     // 1. 基础环境初始化
-    exePath, _ = os.Executable()
+    var err error
+    exePath, err = os.Executable()
+    if err != nil {
+        return
+    }
     baseDir = filepath.Dir(exePath)
     _ = os.Chdir(baseDir)
 
     // 2. 【核心修复】先判定权限，不要在这里拿锁！
+    // 如果不是管理员，直接拉起新进程并退出，不产生任何锁占用
     if !isAdmin() {
         runAsAdmin()
-        // 这里直接退出，因为此时还没创建锁，不会干扰新进程
         os.Exit(0) 
     }
 
-    // 3. 此时已经是管理员权限了，再去申请单实例锁
+    // 3. 此时已确认是管理员权限，再去申请单实例互斥锁
     mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
     h, err := windows.CreateMutex(nil, false, mName)
     
-    // 如果锁已被占用，说明真的有一个程序在运行
+    // 只有真正的管理员实例在抢锁
     if err != nil || windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
         if h != 0 {
             windows.CloseHandle(h)
         }
-        return // 静默退出
+        return // 如果真的已经有一个管理员实例在跑，才退出
     }
     hMutex = h
-    // 确保程序崩溃或意外退出时能释放锁（虽然系统会回收，但显式关闭更好）
-    defer windows.CloseHandle(hMutex)
 
-    // 4. 环境初始化
+    // 4. 环境自愈
     ensureDefaultConfig()
     
-    // 5. 恢复代理状态
+    // 5. 恢复代理意图
     lastProxyState := getIniConfig("system_proxy_enabled") == "true"
     setProxyRegistry(lastProxyState)
 
-    // 6. 信号监听 (改为异步并在退出时正确触发 systray 停止)
+    // 6. 系统信号监听
     go func() {
         sigCh := make(chan os.Signal, 1)
         signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
         <-sigCh
-        // 不要在这里直接 os.Exit，而是让 systray 退出，从而走统一的 onExit
+        // 优雅退出，交给 systray 处理
         systray.Quit()
     }()
 
-    // 7. 清理并预热
+    // 7. 清理旧残留
     KillProcessByName("mihomo.exe")
-    time.Sleep(200 * time.Millisecond) // 给系统回收资源一点时间
+    time.Sleep(200 * time.Millisecond) // 给系统一点喘息时间
     sniffAndSolidifyConfig()
     initJobObject()
 
-    // 8. 启动守护逻辑
+    // 8. 启动后台守护
     go monitorKernelDaemon()
     go monitorIconState()
     go watchTunState()
 
-    // 9. 进入事件循环
-    // 注意：onExit 会在这里作为回调被 systray 自动调用
+    // 9. 启动托盘 (onExit 内部已包含 exitOnce 保护)
     systray.Run(onReady, onExit)
 }
 
