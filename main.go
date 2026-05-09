@@ -279,20 +279,26 @@ func setTunMode(enable bool) {
 }
 
 func setProxyRegistry(enable bool) {
-	if !isReallyExiting {
-		saveIniConfig("system_proxy_enabled", fmt.Sprint(enable))
-	}
-	key, err := registry.OpenKey(registry.CURRENT_USER, REG_PROXY, registry.SET_VALUE)
-	if err != nil {
-		return
-	}
-	defer key.Close()
-	if enable {
-		_ = key.SetDWordValue("ProxyEnable", 1)
-		_ = key.SetStringValue("ProxyServer", getIniConfig("proxy_address"))
-	} else {
-		_ = key.SetDWordValue("ProxyEnable", 0)
-	}
+    // 关键修复：只有在非退出状态下，才认为这是用户的手动意图，并写入配置文件
+    if !isReallyExiting {
+        saveIniConfig("system_proxy_enabled", fmt.Sprint(enable))
+    }
+
+    // 无论是否退出，都要执行注册表物理操作，确保上网安全
+    key, err := registry.OpenKey(registry.CURRENT_USER, REG_PROXY, registry.SET_VALUE)
+    if err != nil {
+        return
+    }
+    defer key.Close()
+
+    if enable {
+        // 开启代理：设置开关为 1，并指定服务器地址
+        _ = key.SetDWordValue("ProxyEnable", 1)
+        _ = key.SetStringValue("ProxyServer", getIniConfig("proxy_address"))
+    } else {
+        // 关闭代理：仅需将开关设为 0
+        _ = key.SetDWordValue("ProxyEnable", 0)
+    }
 }
 
 func reloadConfigFile() {
@@ -754,94 +760,89 @@ func onReady() {
 
 
 func onExit() {
-	exitOnce.Do(func() {
-		// 优先标记正在退出，阻断后台协程的所有写操作
-		isReallyExiting = true
+    exitOnce.Do(func() {
+        // 1. 优先标记正在退出，这会告诉 setProxyRegistry 不要弄脏配置文件
+        isReallyExiting = true
 
-		// 无论权限，立刻恢复注册表，确保网络不断开
-		setProxyRegistry(false)
+        // 2. 执行注册表清理：此时只会关掉 Windows 代理开关，INI 里的状态依然是 true
+        setProxyRegistry(false)
 
-		// 留出物理时间让注册表写入完成
-		time.Sleep(100 * time.Millisecond)
+        // 3. 留出物理时间让注册表写入完成
+        time.Sleep(100 * time.Millisecond)
 
-		// 关闭 Job 对象会自动让 mihomo.exe 随之退出
-		if hJob != 0 {
-			windows.CloseHandle(hJob)
-		}
-		// 释放锁
-		if hMutex != 0 {
-			windows.CloseHandle(hMutex)
-		}
-	})
+        // 4. 关闭 Job 对象，利用 Windows 内核特性自动收割 mihomo.exe 进程
+        if hJob != 0 {
+            windows.CloseHandle(hJob)
+        }
+        
+        // 5. 释放单实例互斥锁
+        if hMutex != 0 {
+            windows.CloseHandle(hMutex)
+        }
+    })
 }
 
 func main() {
-	// 1. 路径初始化与工作目录锁定
-	// 确保程序在任何位置运行（如快捷方式、开机启动），都能正确找到同目录下的内核和图标
-	var err error
-	exePath, err = os.Executable()
-	if err != nil {
-		return
-	}
-	baseDir = filepath.Dir(exePath)
-	_ = os.Chdir(baseDir)
+    // 1. 路径初始化与工作目录锁定
+    var err error
+    exePath, err = os.Executable()
+    if err != nil {
+        return
+    }
+    baseDir = filepath.Dir(exePath)
+    _ = os.Chdir(baseDir)
 
-	// 2. 初始环境自愈
-	// 防止程序上次崩溃残留了代理设置导致无法上网
-	setProxyRegistry(false)
+    // 2. 环境自愈与状态恢复
+    // 首先确保加载了配置文件
+    ensureDefaultConfig()
+    // 读取上次保存的意图：如果是 true，启动时会自动把注册表勾选上
+    lastProxyState := getIniConfig("system_proxy_enabled") == "true"
+    setProxyRegistry(lastProxyState)
 
-	// 3. 权限判定与提权
-	// TUN 模式必须以管理员权限运行
-	if !isAdmin() {
-		runAsAdmin()
-		return
-	}
+    // 3. 权限判定与提权
+    if !isAdmin() {
+        runAsAdmin()
+        return
+    }
 
-	// 4. 单实例互斥锁
-	// 防止用户多次运行程序导致内核端口冲突
-	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
-	h, err := windows.CreateMutex(nil, false, mName)
-	if err != nil || windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
-		if h != 0 {
-			windows.CloseHandle(h)
-		}
-		return
-	}
-	hMutex = h
+    // 4. 单实例互斥锁
+    mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
+    h, err := windows.CreateMutex(nil, false, mName)
+    if err != nil || windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
+        if h != 0 {
+            windows.CloseHandle(h)
+        }
+        return
+    }
+    hMutex = h
 
-	// 5. 系统信号监听 (保镖协程)
-	// 捕获 Ctrl+C (SIGINT)、关机请求 (SIGTERM)
-	go func() {
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-		<-sigCh
-		onExit()
-		os.Exit(0)
-	}()
+    // 5. 系统信号监听
+    go func() {
+        sigCh := make(chan os.Signal, 1)
+        signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+        <-sigCh
+        onExit()
+        os.Exit(0)
+    }()
 
-	// 6. 强制清理残留进程
-	// 在提权后立即执行，确保 7890/9090 端口完全释放
-	_ = exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe").Run()
-	time.Sleep(200 * time.Millisecond)
+    // 6. 强制清理残留进程 (内核层清理)
+    _ = exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe").Run()
+    time.Sleep(200 * time.Millisecond)
 
-	// 7. 配置预热
-	// 确保 .ini 文件存在且已经同步了 config.yaml 里的端口和密钥
-	ensureDefaultConfig()
-	sniffAndSolidifyConfig()
+    // 7. 配置预热
+    sniffAndSolidifyConfig()
 
-	// 8. 初始化 Windows 作业对象 (Job Object)
-	// 这是实现“Launcher 退出，内核必退出”的最底层保险
-	initJobObject()
+    // 8. 初始化 Windows 作业对象
+    initJobObject()
 
-	// 9. 启动后台守护协程
-	go monitorKernelDaemon() // 负责拉起内核、绑定 JobObject、维护 isKernelActive 状态
-	go monitorIconState()   // 负责根据 API 连通性切换托盘图标
-	go watchTunState()      // 负责监听网卡变动，实现配置与硬件同步
+    // 9. 启动后台守护协程
+    go monitorKernelDaemon()
+    go monitorIconState()
+    go watchTunState()
 
-	// 10. 启动托盘界面 (进入 GUI 消息循环，此行会阻塞)
-	// systray.Run 内部会调用 onReady
-	systray.Run(onReady, onExit)
+    // 10. 启动托盘界面
+    systray.Run(onReady, onExit)
 
-	// 11. 正常退出流程
-	onExit()
+    // 11. 正常退出流程
+    onExit()
 }
