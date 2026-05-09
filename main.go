@@ -798,7 +798,7 @@ func onExit() {
 }
 
 func main() {
-    // 1. 基础环境初始化
+    // 1. 基础环境初始化（最快速度完成）
     var err error
     exePath, err = os.Executable()
     if err != nil {
@@ -807,55 +807,76 @@ func main() {
     baseDir = filepath.Dir(exePath)
     _ = os.Chdir(baseDir)
 
-    // 2. 【核心修复】先判定权限，不要在这里拿锁！
-    // 如果不是管理员，直接拉起新进程并退出，不产生任何锁占用
+    // 2. 权限判定：必须放在拿锁之前
+    // 如果勾选了“以管理员身份运行”，这里会直接通过
     if !isAdmin() {
         runAsAdmin()
-        os.Exit(0) 
+        os.Exit(0) // 必须立刻退出，释放当前进程占用的所有资源
     }
 
-    // 3. 此时已确认是管理员权限，再去申请单实例互斥锁
+    // 3. 互斥锁检测（带重试逻辑，解决连点问题）
     mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
-    h, err := windows.CreateMutex(nil, false, mName)
+    var h windows.Handle
     
-    // 只有真正的管理员实例在抢锁
-    if err != nil || windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
+    // 尝试 3 次拿锁，应对系统回收句柄的微小延迟
+    for i := 0; i < 3; i++ {
+        h, err = windows.CreateMutex(nil, false, mName)
+        if err == nil && windows.GetLastError() != windows.ERROR_ALREADY_EXISTS {
+            break // 成功拿锁
+        }
+        
+        // 如果拿不到，先关闭当前尝试产生的句柄（如果有的话）
         if h != 0 {
             windows.CloseHandle(h)
         }
-        return // 如果真的已经有一个管理员实例在跑，才退出
+
+        // 如果已经到最后一次尝试还是拿不到，说明真的有另一个程序在运行
+        if i == 2 {
+            return 
+        }
+        
+        // 等待 100ms 再试，通常足以解决“连点”产生的残留干扰
+        time.Sleep(100 * time.Millisecond)
     }
     hMutex = h
 
-    // 4. 环境自愈
+    // 4. 环境自愈与配置加载
     ensureDefaultConfig()
     
-    // 5. 恢复代理意图
+    // 恢复用户上次关闭时的代理意图
     lastProxyState := getIniConfig("system_proxy_enabled") == "true"
     setProxyRegistry(lastProxyState)
 
-    // 6. 系统信号监听
+    // 5. 系统信号监听（优雅退出处理）
     go func() {
         sigCh := make(chan os.Signal, 1)
         signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
         <-sigCh
-        // 优雅退出，交给 systray 处理
+        // 通知托盘退出，从而触发统一的 onExit 逻辑
         systray.Quit()
     }()
 
-    // 7. 清理旧残留
+    // 6. 清理旧残留并预热配置
+    // 注意：有了管理员权限，这步操作会非常干脆
     KillProcessByName("mihomo.exe")
-    time.Sleep(200 * time.Millisecond) // 给系统一点喘息时间
+    time.Sleep(200 * time.Millisecond)
     sniffAndSolidifyConfig()
+
+    // 7. 初始化 Windows 作业对象 (Job Object)
     initJobObject()
 
-    // 8. 启动后台守护
-    go monitorKernelDaemon()
-    go monitorIconState()
-    go watchTunState()
+    // 8. 启动后台守护协程
+    go monitorKernelDaemon() // 守护内核进程
+    go monitorIconState()    // 监控托盘图标
+    go watchTunState()       // 监控网卡状态，防止手动修改冲突
 
-    // 9. 启动托盘 (onExit 内部已包含 exitOnce 保护)
+    // 9. 启动托盘界面逻辑
+    // systray.Run 会阻塞在这里，直到调用 systray.Quit()
+    // 退出时会自动调用我们定义的 onExit
     systray.Run(onReady, onExit)
+
+    // 10. 兜底退出
+    onExit()
 }
 
 func KillProcessByName(name string) {
