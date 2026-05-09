@@ -156,36 +156,45 @@ func onReady() {
 			secret := getIniConfig("secret")
 			proxyAddr := getIniConfig("proxy_address")
 
-			// 动态解析 Host 和 Port
+			// 1. 动态解析 Host 和 Port
 			cleanAddr := strings.TrimPrefix(strings.TrimPrefix(apiAddr, "http://"), "https://")
 			host, port := "127.0.0.1", "9090"
 			if parts := strings.Split(cleanAddr, ":"); len(parts) == 2 {
 				host, port = parts[0], parts[1]
 			}
 
-			// 组装自动登录 URL
+			// 2. 组装自动登录 URL (保持固定，避免因为动态参数导致 Edge 开新标签)
 			finalURL := fmt.Sprintf("%s/ui/#/setup?hostname=%s&port=%s&secret=%s", apiAddr, host, port, secret)
 
-			// 准备 Edge 启动参数
+			// 3. 准备 Edge 启动参数
+			// 固定 userDataDir 是实现“唤醒旧窗口”而不“多开”的核心
 			userDataDir := filepath.Join(os.Getenv("TEMP"), "EdgeAppCache")
+			
 			args := []string{
 				"--app=" + finalURL,
 				"--window-size=1280,768",
 				"--user-data-dir=" + userDataDir,
 				"--proxy-server=" + proxyAddr,
+				"--no-first-run",           // 跳过初次运行引导
+				"--no-default-browser-check", // 跳过默认浏览器检查
 			}
 
-			// 尝试定位 Edge 路径启动，失败则回退到系统环境变量启动
+			// 4. 执行启动逻辑
+			// 提示：Edge 发现目录冲突时会自动置顶已有窗口，完全不会伤及用户正常的 Edge 进程
 			edgePath := `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`
-			cmd := exec.Command(edgePath, args...)
-			cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-			if err := cmd.Start(); err != nil {
-				// Fallback: 使用 cmd start 自动搜寻 msedge
-				fallbackArgs := append([]string{"/c", "start", "msedge"}, args...)
-				retryCmd := exec.Command("cmd", fallbackArgs...)
-				retryCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-				_ = retryCmd.Start()
+			
+			// 我们统一使用 cmd /c start 方式，因为它处理“唤醒”逻辑在 Windows 上最稳
+			fallbackArgs := append([]string{"/c", "start", `""`, edgePath}, args...)
+			
+			// 如果路径不存在，尝试直接用 msedge 关键字
+			if _, err := os.Stat(edgePath); err != nil {
+				fallbackArgs = append([]string{"/c", "start", `""`, "msedge"}, args...)
 			}
+
+			cmd := exec.Command("cmd", fallbackArgs...)
+			cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+			_ = cmd.Start()
+
 		case <-mReload.ClickedCh:
 			sniffAndSolidifyConfig()
 			reloadConfigFile()
