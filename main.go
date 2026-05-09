@@ -151,47 +151,49 @@ func onReady() {
 
     for {
 		select {
-		case <-mWeb.ClickedCh:
-			if isPanelAlreadyRunning() {
-				edgePath := `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`
-				userDataDir := filepath.Join(os.Getenv("TEMP"), "EdgeAppCache")
-				tempCmd := exec.Command(edgePath, "--user-data-dir="+userDataDir)
-				tempCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-				_ = tempCmd.Start()				
-			}
+        case <-mWeb.ClickedCh:
+            if isPanelAlreadyRunning() {
+                edgePath := `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`
+                userDataDir := filepath.Join(os.Getenv("TEMP"), "EdgeAppCache")
+                tempCmd := exec.Command(edgePath, "--user-data-dir="+userDataDir)
+                tempCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+                _ = tempCmd.Start()
+                
+                continue // 重要：拦截在此，不执行下面的新建逻辑
+            }
 
-			apiAddr := getIniConfig("external-controller")
-			secret := getIniConfig("secret")
-			proxyAddr := getIniConfig("proxy_address")
+            apiAddr := getIniConfig("external-controller")
+            secret := getIniConfig("secret")
+            proxyAddr := getIniConfig("proxy_address")
 
-			cleanAddr := strings.TrimPrefix(strings.TrimPrefix(apiAddr, "http://"), "https://")
-			host, port := "127.0.0.1", "9090"
-			if parts := strings.Split(cleanAddr, ":"); len(parts) == 2 {
-				host, port = parts[0], parts[1]
-			}
+            cleanAddr := strings.TrimPrefix(strings.TrimPrefix(apiAddr, "http://"), "https://")
+            host, port := "127.0.0.1", "9090"
+            if parts := strings.Split(cleanAddr, ":"); len(parts) == 2 {
+                host, port = parts[0], parts[1]
+            }
 
-			finalURL := fmt.Sprintf("%s/ui/#/setup?hostname=%s&port=%s&secret=%s", apiAddr, host, port, secret)
-			userDataDir := filepath.Join(os.Getenv("TEMP"), "EdgeAppCache")
+            finalURL := fmt.Sprintf("%s/ui/#/setup?hostname=%s&port=%s&secret=%s", apiAddr, host, port, secret)
+            userDataDir := filepath.Join(os.Getenv("TEMP"), "EdgeAppCache")
 
-			args := []string{
-				"--app=" + finalURL,
-				"--window-size=1280,768",
-				"--user-data-dir=" + userDataDir,
-				"--proxy-server=" + proxyAddr,
-				"--no-first-run",
-			}
+            args := []string{
+                "--app=" + finalURL,
+                "--window-size=1280,768",
+                "--user-data-dir=" + userDataDir,
+                "--proxy-server=" + proxyAddr,
+                "--no-first-run",
+            }
 
-			edgePath := `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`
+            edgePath := `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`
 
-			var cmd *exec.Cmd
-			if _, err := os.Stat(edgePath); err == nil {
-				cmd = exec.Command(edgePath, args...)
-			} else {
-				cmd = exec.Command("cmd", append([]string{"/c", "start", "msedge"}, args...)...)
-			}
+            var cmd *exec.Cmd
+            if _, err := os.Stat(edgePath); err == nil {
+                cmd = exec.Command(edgePath, args...)
+            } else {
+                cmd = exec.Command("cmd", append([]string{"/c", "start", "msedge"}, args...)...)
+            }
 
-			cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-			_ = cmd.Start()
+            cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+            _ = cmd.Start()
 		case <-mReload.ClickedCh:
 			sniffAndSolidifyConfig()
 			reloadConfigFile()
