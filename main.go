@@ -381,7 +381,7 @@ func checkAutoStartStatus() bool {
 
 func monitorKernelDaemon() {
     target := filepath.Join(baseDir, "mihomo.exe")
-    absBaseDir, _ := filepath.Abs(baseDir)
+    absBaseDir, _ := filepath.Abs(baseDir) // 强制使用绝对路径
 
     for {
         if isReallyExiting { return }
@@ -389,18 +389,15 @@ func monitorKernelDaemon() {
         if !isProcessRunning("mihomo.exe") {
             onceSync = sync.Once{}
             
-            // 彻底清理残留
+            // 杀掉可能的残留进程树
             exec.Command("taskkill", "/F", "/IM", "mihomo.exe", "/T").Run()
             time.Sleep(500 * time.Millisecond)
 
+            // 核心修复：-d 指定配置目录，且 cmd.Dir 锁定工作目录
             cmd := exec.Command(target, "-d", ".")
             cmd.Dir = absBaseDir 
-            
-            // --- 这里的参数是关键 ---
             cmd.SysProcAttr = &windows.SysProcAttr{
-                CreationFlags: windows.CREATE_NO_WINDOW | 
-                               0x00000008 | // DETACHED_PROCESS: 彻底脱离控制台
-                               windows.CREATE_BREAKAWAY_FROM_JOB,
+                CreationFlags: windows.CREATE_NO_WINDOW | windows.CREATE_BREAKAWAY_FROM_JOB,
             }
             
             if err := cmd.Start(); err == nil {
