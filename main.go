@@ -794,79 +794,113 @@ func onExit() {
         // 5. 释放单实例互斥锁
         if hMutex != 0 {
             windows.CloseHandle(hMutex)
+			hMutex = 0
         }
+		time.Sleep(100 * time.Millisecond)
+		os.Exit(0)
     })
 }
 
 func main() {
-	// 1. 基础路径初始化
-	var err error
-	exePath, err = os.Executable()
-	if err != nil {
-		return
-	}
-	baseDir = filepath.Dir(exePath)
-	_ = os.Chdir(baseDir)
+    // 1. 基础环境初始化
+    setupBasePath()
 
-	// 2. 权限校验（必须在最前面）
-	if !isAdmin() {
-		runAsAdmin() // 这里会触发 UAC，点击后当前进程就结束了
-		return
-	}
+    // 锁名称建议增加 Global\ 前缀，实现跨会话唯一
+    mutexName := "Global\\" + APP_MUTEX
+    mName, _ := windows.UTF16PtrFromString(mutexName)
 
-	// 3. 核心修复：带重试机制的互斥锁获取
-	var h windows.Handle
-	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
-	
-	// 尝试 10 次获取锁，总计等待 1 秒，解决“第一次点击失效”
-	success := false
-	for i := 0; i < 10; i++ {
-		h, err = windows.CreateMutex(nil, false, mName)
-		if err == nil && windows.GetLastError() != windows.ERROR_ALREADY_EXISTS {
-			success = true
-			break
-		}
-		if h != 0 {
-			windows.CloseHandle(h)
-		}
-		// 如果锁被占用，等待 100ms 再试，可能旧进程正在关闭
-		time.Sleep(100 * time.Millisecond)
-	}
+    // 2. 第一轮预检：尝试获取锁
+    // 这一步是为了让“重复开启”的普通进程在触发 UAC 之前就静默退出
+    h, err := windows.CreateMutex(nil, false, mName)
+    lastErr := windows.GetLastError()
 
-	// 如果 1 秒后还是拿不到锁，说明真的有一个活跃的程序在运行
-	if !success {
-		// 这里的逻辑：如果已经有一个在跑了，就不要再开了
-		return 
-	}
-	hMutex = h
-	defer windows.CloseHandle(hMutex)
+    // 如果发现锁已存在，或者是由于管理员已占坑导致“拒绝访问”
+    if lastErr == windows.ERROR_ALREADY_EXISTS || lastErr == windows.ERROR_ACCESS_DENIED {
+        if h != 0 {
+            windows.CloseHandle(h)
+        }
+        // 直接退出，不闪现 UAC，不弹任何提示
+        return 
+    }
 
-	// 4. 只有拿到锁的“唯一合法进程”才能操作文件
-	ensureDefaultConfig()
-	
-	// 5. 启动前的清理：确保没有残留的内核
-	KillProcessByName("mihomo.exe")
-	
-	// 6. 注册退出清理信号
-	go func() {
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-		<-sigCh
-		onExit()
-		os.Exit(0)
-	}()
+    // 3. 权限判定与提权接力
+    if !isAdmin() {
+        // 我是第一个运行的进程，但我权限不够
+        // 必须先释放刚刚拿到的临时锁，否则提权后的新进程拿不到锁
+        if h != 0 {
+            windows.CloseHandle(h)
+        }
+        
+        // 触发 UAC 提权
+        err := runAsAdmin()
+        if err != nil {
+            // 如果用户点击了“取消”，则彻底退出
+            return
+        }
+        // 提权成功后，原普通进程使命完成，直接退出
+        return
+    }
 
-	// 7. 初始化组件
-	sniffAndSolidifyConfig()
-	initJobObject()
+    // 4. 管理员进程正式占坑（带微弱重试机制）
+    // 解决“真空期”：等待刚才那个关锁的普通进程彻底退出
+    success := false
+    var finalHandle windows.Handle
+    
+    // 如果刚才已经拿到了锁且我是 Admin，直接复用；否则重试
+    if h != 0 && lastErr != windows.ERROR_ALREADY_EXISTS {
+        finalHandle = h
+        success = true
+    } else {
+        for i := 0; i < 15; i++ {
+            finalHandle, err = windows.CreateMutex(nil, false, mName)
+            if err == nil && windows.GetLastError() != windows.ERROR_ALREADY_EXISTS {
+                success = true
+                break
+            }
+            if finalHandle != 0 {
+                windows.CloseHandle(finalHandle)
+            }
+            time.Sleep(100 * time.Millisecond)
+        }
+    }
 
-	// 8. 启动后台监控
-	go monitorKernelDaemon()
-	go monitorIconState()
-	go watchTunState()
+    if !success {
+        // 理论上由于前面有权限隔离，这里几乎不会失败
+        return
+    }
 
-	// 9. 进入托盘循环
-	systray.Run(onReady, onExit)
+    // 将句柄存入全局变量，以便在 onExit 中 CloseHandle
+    hMutex = finalHandle
+
+    // ---------------------------------------------------------
+    // 5. 核心业务初始化（此时已锁定单实例且具备管理员权限）
+    // ---------------------------------------------------------
+
+    // 初始化配置文件（单实例下操作文件是安全的）
+    ensureDefaultConfig()
+
+    // 环境自愈：恢复上次保存的代理状态
+    lastProxyState := getIniConfig("system_proxy_enabled") == "true"
+    setProxyRegistry(lastProxyState)
+
+    // 清理残留：强制重启内核
+    KillProcessByName("mihomo.exe")
+    time.Sleep(300 * time.Millisecond) // 给操作系统回收端口的时间
+
+    // 初始化作业对象 (Job Object)，确保主程序挂了内核跟着死
+    initJobObject()
+
+    // 6. 启动后台守护协程
+    go monitorKernelDaemon()
+    go monitorIconState()
+    go watchTunState()
+
+    // 7. 进入托盘循环
+    // 注意：onExit 内部必须包含 windows.CloseHandle(hMutex)
+    systray.Run(onReady, onExit)
+    
+    // 二层保险：如果托盘由于异常退出，确保清理逻辑被触发
+    onExit()
 }
 
 func KillProcessByName(name string) {
