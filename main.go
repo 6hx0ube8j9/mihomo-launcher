@@ -799,7 +799,7 @@ func onExit() {
 }
 
 func main() {
-	// 1. 基础环境初始化
+	// 1. 基础路径初始化
 	var err error
 	exePath, err = os.Executable()
 	if err != nil {
@@ -808,49 +808,46 @@ func main() {
 	baseDir = filepath.Dir(exePath)
 	_ = os.Chdir(baseDir)
 
-	// 2. 【核心修复 A】权限判定必须置顶
-	// 如果不是管理员，立即叫起管理员进程并退出
-	// 这样普通进程就不会去占坑（Mutex）或锁死配置文件（INI）
+	// 2. 权限校验（必须在最前面）
 	if !isAdmin() {
-		runAsAdmin()
-		return 
+		runAsAdmin() // 这里会触发 UAC，点击后当前进程就结束了
+		return
 	}
 
-	// 3. 【核心修复 B】带重试机制的单实例互斥锁
-	// 当管理员进程被叫起时，普通进程可能还没来得及完全退出
-	// 我们给它 1 秒钟（100ms * 10）的“交接时间”
+	// 3. 核心修复：带重试机制的互斥锁获取
 	var h windows.Handle
 	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
 	
+	// 尝试 10 次获取锁，总计等待 1 秒，解决“第一次点击失效”
+	success := false
 	for i := 0; i < 10; i++ {
 		h, err = windows.CreateMutex(nil, false, mName)
-		// 如果成功创建且系统没报错“已存在”，说明拿到了唯一的锁
 		if err == nil && windows.GetLastError() != windows.ERROR_ALREADY_EXISTS {
-			break 
+			success = true
+			break
 		}
-		
-		// 如果没拿到，记得关闭这次尝试产生的句柄，等 100ms 再试
 		if h != 0 {
 			windows.CloseHandle(h)
 		}
+		// 如果锁被占用，等待 100ms 再试，可能旧进程正在关闭
 		time.Sleep(100 * time.Millisecond)
 	}
 
-	// 最终还是拿不到锁，说明真的有另一个程序在运行
-	if h == 0 || windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
-		return
+	// 如果 1 秒后还是拿不到锁，说明真的有一个活跃的程序在运行
+	if !success {
+		// 这里的逻辑：如果已经有一个在跑了，就不要再开了
+		return 
 	}
 	hMutex = h
+	defer windows.CloseHandle(hMutex)
 
-	// 4. 【现在我是唯一的管理员进程】开始处理配置自愈
-	// 这时再写 INI 文件，绝对不会和刚才退出的普通进程冲突
+	// 4. 只有拿到锁的“唯一合法进程”才能操作文件
 	ensureDefaultConfig()
 	
-	// 读取用户之前的代理意图，并应用到注册表
-	lastProxyState := getIniConfig("system_proxy_enabled") == "true"
-	setProxyRegistry(lastProxyState)
-
-	// 5. 设置系统信号监听（处理 Ctrl+C 或 关机信号）
+	// 5. 启动前的清理：确保没有残留的内核
+	KillProcessByName("mihomo.exe")
+	
+	// 6. 注册退出清理信号
 	go func() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -859,26 +856,17 @@ func main() {
 		os.Exit(0)
 	}()
 
-	// 6. 清理可能残留的内核进程
-	KillProcessByName("mihomo.exe")
-	time.Sleep(200 * time.Millisecond)
-
-	// 7. 配置预热：从 config.yaml 提取最新的端口、密钥等信息同步到 INI
+	// 7. 初始化组件
 	sniffAndSolidifyConfig()
-
-	// 8. 初始化 Windows 作业对象（确保 Launcher 挂了内核也跟着挂）
 	initJobObject()
 
-	// 9. 启动后台守护协程
-	go monitorKernelDaemon() // 负责拉起并监控 mihomo.exe
-	go monitorIconState()   // 负责定时更新托盘图标
-	go watchTunState()      // 负责监听网络环境变动
+	// 8. 启动后台监控
+	go monitorKernelDaemon()
+	go monitorIconState()
+	go watchTunState()
 
-	// 10. 启动托盘界面（阻塞运行）
+	// 9. 进入托盘循环
 	systray.Run(onReady, onExit)
-
-	// 11. 正常退出逻辑（虽然 systray.Run 内部也会调 onExit，这里做二次保险）
-	onExit()
 }
 
 func KillProcessByName(name string) {
