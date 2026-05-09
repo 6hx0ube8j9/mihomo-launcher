@@ -809,17 +809,25 @@ func main() {
     baseDir = filepath.Dir(exePath)
     _ = os.Chdir(baseDir)
 
-    // 2. 权限判定：如果是普通用户，拉起管理员后必须“立刻”结束自己
+    // 2. 权限判定与提权
     if !isAdmin() {
         runAsAdmin()
-        os.Exit(0) // 核心修复：这里绝对不能留活口，必须立刻退出
+        // 提权后，普通进程必须立刻消失
+        os.Exit(0) 
     }
 
-    // 3. 此时已是管理员，再尝试加锁
+    // --- 此时已是管理员身份 ---
+
+    // 3. 【解决锁死逻辑】先清理可能存在的僵尸进程
+    // 如果是因为之前的进程挂了导致的锁死，先尝试强杀除了自己以外的所有同名进程
+    // 这能有效解决“打不开”的问题
+    killOtherInstances()
+
+    // 4. 尝试加锁
     mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
     h, err := windows.CreateMutex(nil, false, mName)
-    // 注意：如果是管理员模式下报已存在，说明真的开着一个，才退出
     if err != nil || windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
+        // 如果还是报已存在，说明真的有一个正在运行的有效实例
         if h != 0 {
             windows.CloseHandle(h)
         }
@@ -827,75 +835,53 @@ func main() {
     }
     hMutex = h
 
-    // 4. 环境自愈与配置加载 (此时已有高权限，操作 100% 成功)
+    // 5. 剩余初始化逻辑
     ensureDefaultConfig()
-    
-    // 恢复用户上次关闭时的代理意图
+    sniffAndSolidifyConfig()
+
+    // 恢复代理状态
     lastProxyState := getIniConfig("system_proxy_enabled") == "true"
     setProxyRegistry(lastProxyState)
 
-    // 5. 系统信号监听 (优雅退出处理)
-    go func() {
-        sigCh := make(chan os.Signal, 1)
-        signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-        <-sigCh
-        onExit()
-        os.Exit(0)
-    }()
-
-    // 6. 清理旧残留并预热配置
-    KillProcessByName("mihomo.exe")
-    time.Sleep(200 * time.Millisecond)
-    sniffAndSolidifyConfig()
-
-    // 7. 初始化 Windows 作业对象 (确保主程序退出时内核随之关闭)
+    // 后台守护逻辑
     initJobObject()
+    KillProcessByName("mihomo.exe") // 清理残留内核
+    
+    go monitorKernelDaemon()
+    go monitorIconState()
+    go watchTunState()
 
-    // 8. 启动后台守护协程
-    go monitorKernelDaemon() // 守护 mihomo.exe
-    go monitorIconState()    // 监控托盘图标
-    go watchTunState()       // 监控网卡状态
-
-    // 9. 启动托盘界面逻辑 (进入事件循环)
     systray.Run(onReady, onExit)
-
-    // 10. 正常退出流程 (兜底)
-    onExit()
 }
 
-func KillProcessByName(name string) {
-	// 获取进程快照
-	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
-	if err != nil {
-		return
-	}
-	defer windows.CloseHandle(snapshot)
+// 新增：清理其他 launcher 实例的函数
+func killOtherInstances() {
+    myPid := uint32(os.Getpid())
+    myName := filepath.Base(exePath)
+    
+    snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+    if err != nil {
+        return
+    }
+    defer windows.CloseHandle(snapshot)
 
-	var pe windows.ProcessEntry32
-	pe.Size = uint32(unsafe.Sizeof(pe))
+    var pe windows.ProcessEntry32
+    pe.Size = uint32(unsafe.Sizeof(pe))
 
-	if err := windows.Process32First(snapshot, &pe); err != nil {
-		return
-	}
-
-	for {
-		pname := windows.UTF16ToString(pe.ExeFile[:])
-		if strings.EqualFold(pname, name) {
-			if pe.ProcessID != uint32(os.Getpid()) {
-				// 尝试获取终止权限
-				hProcess, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, pe.ProcessID)
-				if err == nil {
-					// 强制终止：第二个参数是退出码，通常给 0 或 1
-					err = windows.TerminateProcess(hProcess, 9) 
-					windows.CloseHandle(hProcess)
-					if err == nil {
-						fmt.Printf("[Native] 成功秒杀残留进程: %s (PID: %d)\n", pname, pe.ProcessID)
-					}
-				}
-			}
-		}
-		if err := windows.Process32Next(snapshot, &pe); err != nil {
-			break
-		}
-	}
+    if err := windows.Process32First(snapshot, &pe); err == nil {
+        for {
+            pname := windows.UTF16ToString(pe.ExeFile[:])
+            // 如果名字相同但 PID 不同，说明是残留的僵尸进程
+            if strings.EqualFold(pname, myName) && pe.ProcessID != myPid {
+                hProcess, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, pe.ProcessID)
+                if err == nil {
+                    _ = windows.TerminateProcess(hProcess, 0)
+                    windows.CloseHandle(hProcess)
+                }
+            }
+            if err := windows.Process32Next(snapshot, &pe); err != nil {
+                break
+            }
+        }
+    }
 }
