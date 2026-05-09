@@ -384,38 +384,22 @@ func monitorKernelDaemon() {
 		}
 
 		// 1. 检查内核进程是否存活
-		if !isProcessRunning("mihomo.exe") {
-			// 状态重置：发现内核丢失，重置 Once 对象以便新进程拉起后同步配置
-			onceSync = sync.Once{}
-			
-			// 锁定系统状态：进入初始化锁定，防止 watchTunState 等协程逻辑冲突
-			isSystemInitializing = true
-			atomic.StoreInt32(&isKernelActive, 0)
-
-			fmt.Println("[Daemon] 内核未运行，正在尝试拉起...")
-
-			// 2. 强力清理残留：确保端口占用和僵尸进程被彻底清除
-			killCmd := exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe")
-			killCmd.SysProcAttr = &windows.SysProcAttr{
-				CreationFlags: windows.CREATE_NO_WINDOW | 0x00000008,
-			}
-			_ = killCmd.Run()
-			time.Sleep(500 * time.Millisecond)
-
-			// 3. 构造启动指令
-			cmd := exec.Command(target, "-d", ".")
-			cmd.Dir = absBaseDir
-
-			// 4. 重要：丢弃输出流
-			// 如果不设置，子进程日志会发送到父进程管道，若不及时读取会导致子进程挂起
+       if !isProcessRunning("mihomo.exe") {
+            // 状态重置：发现内核丢失，重置 Once 对象以便新进程拉起后同步配置
+            onceSync = sync.Once{}
+            
+            // 锁定系统状态：进入初始化锁定，防止 watchTunState 等协程逻辑冲突
+            isSystemInitializing = true
+            atomic.StoreInt32(&isKernelActive, 0)
+            KillProcessByName("mihomo.exe")
+            time.Sleep(500 * time.Millisecond)
+            cmd := exec.Command(target, "-d", ".")
+            cmd.Dir = absBaseDir
 			cmd.Stdout = nil
 			cmd.Stderr = nil
 
 			// 5. Windows 专用属性设置
 			cmd.SysProcAttr = &windows.SysProcAttr{
-				// CREATE_NO_WINDOW: 隐藏黑框
-				// CREATE_BREAKAWAY_FROM_JOB: 允许脱离父级 Job 以便我们手动将其加入 hJob
-				// 0x00000008: DETACHED_PROCESS 完全分离
 				CreationFlags: windows.CREATE_NO_WINDOW | 
 							   windows.CREATE_BREAKAWAY_FROM_JOB | 
 							   0x00000008,
@@ -437,7 +421,7 @@ func monitorKernelDaemon() {
 						uint32(cmd.Process.Pid),
 					)
 					if err == nil {
-						_, _ = windows.AssignProcessToJobObject(hJob, hp)
+						_ = windows.AssignProcessToJobObject(hJob, hp)
 						_ = windows.CloseHandle(hp)
 					}
 				}
@@ -760,10 +744,8 @@ func onReady() {
             
         case <-mRestart.ClickedCh:
             isSystemInitializing = true
-            onceSync = sync.Once{}           
-            killCmd := exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe")
-			killCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-			_ = killCmd.Run()
+            onceSync = sync.Once{}
+            KillProcessByName("mihomo.exe")
 		case <-mExit.ClickedCh:
 			isReallyExiting = true
 			systray.Quit()
@@ -840,10 +822,7 @@ func main() {
         os.Exit(0)
     }()
 
-    // 6. 强制清理残留进程 (内核层清理)
-    killCmd := exec.Command("taskkill", "/F", "/T", "/IM", "mihomo.exe")
-	killCmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-	_ = killCmd.Run()	
+	KillProcessByName("mihomo.exe")
     time.Sleep(200 * time.Millisecond)
 
     // 7. 配置预热
@@ -862,4 +841,41 @@ func main() {
 
     // 11. 正常退出流程
     onExit()
+}
+
+func KillProcessByName(name string) {
+	// 获取进程快照
+	snapshot, err := windows.CreateToolhelp32Snapshot(windows.TH32CS_SNAPPROCESS, 0)
+	if err != nil {
+		return
+	}
+	defer windows.CloseHandle(snapshot)
+
+	var pe windows.ProcessEntry32
+	pe.Size = uint32(unsafe.Sizeof(pe))
+
+	if err := windows.Process32First(snapshot, &pe); err != nil {
+		return
+	}
+
+	for {
+		pname := windows.UTF16ToString(pe.ExeFile[:])
+		if strings.EqualFold(pname, name) {
+			if pe.ProcessID != uint32(os.Getpid()) {
+				// 尝试获取终止权限
+				hProcess, err := windows.OpenProcess(windows.PROCESS_TERMINATE, false, pe.ProcessID)
+				if err == nil {
+					// 强制终止：第二个参数是退出码，通常给 0 或 1
+					err = windows.TerminateProcess(hProcess, 9) 
+					windows.CloseHandle(hProcess)
+					if err == nil {
+						fmt.Printf("[Native] 成功秒杀残留进程: %s (PID: %d)\n", pname, pe.ProcessID)
+					}
+				}
+			}
+		}
+		if err := windows.Process32Next(snapshot, &pe); err != nil {
+			break
+		}
+	}
 }
