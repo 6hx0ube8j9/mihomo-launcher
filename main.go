@@ -802,77 +802,85 @@ func onExit() {
 }
 
 func main() {
-	// 1. 初始化基础路径
-	// 确保程序在双击或自启动时，工作目录始终指向 exe 所在目录
-	exePath, err := os.Executable()
-	if err == nil {
-		baseDir = filepath.Dir(exePath)
-		_ = os.Chdir(baseDir)
-	}
+	setupBasePath()
 
-	// 2. 互斥锁检测 (处理单实例与跨权限逻辑)
-	// 使用 Global\ 前缀确保锁在所有用户会话中唯一
+	// 1. 定义全局锁名称
 	mName, _ := windows.UTF16PtrFromString("Global\\" + APP_MUTEX)
+	
+	// 2. 尝试创建/获取互斥锁
 	h, err := windows.CreateMutex(nil, false, mName)
 	lastErr := windows.GetLastError()
 
-	// 情况 A: 如果报错“已存在”或“拒绝访问”，说明已经有实例在运行
-	// 管理员创建的锁，普通进程访问会报 ERROR_ACCESS_DENIED
+	// --- 场景 A：管理员进程已经存在 ---
+	// 普通进程访问管理员创建的锁会报 Access Denied (5)
+	// 或者另一个管理员进程访问会报 Already Exists (183)
 	if lastErr == windows.ERROR_ALREADY_EXISTS || lastErr == windows.ERROR_ACCESS_DENIED {
 		if h != 0 {
 			windows.CloseHandle(h)
 		}
-		return // 发现重复，直接退出，不弹 UAC
+		// 静默离场：说明后台已经有一个正在运行的高权限实例了
+		return 
 	}
 
-	// 3. 权限交接逻辑
+	// --- 场景 B：当前是普通权限，且拿到了锁 ---
 	if !isAdmin() {
-		// 我是普通权限，但我拿到了锁（说明目前没有管理员实例）
-		// 释放锁，以便接下来的管理员进程可以成功获取它
+		// 记录我们拿到了锁，准备提权
+		// 这里不关锁！而是带着锁去提权。
+		runAsAdmin()
+
+		// 【核心修复：占位延迟】
+		// 发起提权后，让普通进程睡眠 1 秒再退出并释放锁。
+		// 这样在用户“疯狂双击”时，后续的点击会因为锁还在而进入“场景 A”直接退出。
+		time.Sleep(1 * time.Second)
+		
 		if h != 0 {
 			windows.CloseHandle(h)
 		}
-		
-		// 立即触发 UAC 提权并退出当前进程
-		runAsAdmin()
 		return
 	}
 
-	// 情况 B: 我是管理员，且我成功拿到了锁
-	hMutex = h
-	// 注意：此处不使用 defer，锁的生命周期由 onExit 控制
+	// --- 场景 C：当前是提权后的管理员进程 ---
+	// 此时可能面临普通进程还没睡醒、没放锁的情况
+	// 我们需要“排队”等待锁释放，而不是发现有锁就直接自杀
+	if lastErr == windows.ERROR_ALREADY_EXISTS {
+		success := false
+		for i := 0; i < 20; i++ { // 最多等 2 秒 (100ms * 20)
+			time.Sleep(100 * time.Millisecond)
+			// 再次尝试拿锁
+			h, _ = windows.CreateMutex(nil, false, mName)
+			if windows.GetLastError() != windows.ERROR_ALREADY_EXISTS {
+				success = true
+				break
+			}
+		}
+		if !success {
+			// 如果等了 2 秒锁还没放，说明真的有另一个管理员实例在跑
+			return 
+		}
+	}
 
-	// 4. 环境自愈与配置加载
-	// 只有拿到锁的唯一合法进程才有权初始化配置
+	// 成功上位，接管互斥锁句柄
+	hMutex = h
+
+	// 3. 执行唯一的初始化逻辑
 	ensureDefaultConfig()
 	
-	// 根据配置文件恢复系统代理状态
-	isProxyEnabled := getIniConfig("system_proxy_enabled") == "true"
-	setProxyRegistry(isProxyEnabled)
+	// 恢复代理状态
+	isProxy := getIniConfig("system_proxy_enabled") == "true"
+	setProxyRegistry(isProxy)
 
-	// 5. 注册系统信号，确保异常关闭时也能释放资源
-	go func() {
-		sigCh := make(chan os.Signal, 1)
-		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-		<-sigCh
-		onExit()
-		os.Exit(0)
-	}()
-
-	// 6. 清理残余内核并初始化 Job Object
-	// 确保没有上一次意外残留的进程
+	// 清理并启动内核
 	KillProcessByName("mihomo.exe")
 	time.Sleep(200 * time.Millisecond)
 	
-	sniffAndSolidifyConfig() // 自动从 config.yaml 同步端口和密钥
-	initJobObject()         // 绑定内核进程，实现随主程序自动销毁
+	sniffAndSolidifyConfig()
+	initJobObject()
 
-	// 7. 启动后台监控协程
-	go monitorKernelDaemon() // 守护内核
-	go monitorIconState()    // 更新托盘图标状态
-	go watchTunState()       // 监听网卡变化
+	// 启动监控和托盘
+	go monitorKernelDaemon()
+	go monitorIconState()
+	go watchTunState()
 
-	// 8. 启动托盘图形界面 (此函数是阻塞的)
 	systray.Run(onReady, onExit)
 }
 
