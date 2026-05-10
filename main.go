@@ -95,6 +95,7 @@ const (
     
     // 动作组合标志位: NOSIZE(1) | NOMOVE(2) | SHOWWINDOW(64) = 0x0043
     SWP_SILKY      = 0x0043 
+	debugPort = "52719"
 )
 
 func main() {
@@ -198,8 +199,6 @@ func focusWindowSilky(targetHwnd uintptr) {
 }
 
 func launchWebUI() {
-    debugPort := "52719"
-    // 假设 getIniConfig 是你读取配置的函数
     apiAddr := getIniConfig("external-controller")
     secret := getIniConfig("secret")
     proxyAddr := getIniConfig("proxy_address")
@@ -385,18 +384,36 @@ func onReady() {
 func onExit() {
     exitOnce.Do(func() {
         isReallyExiting = true
-        // 彻底关闭系统代理
+
+        // 1. 【高级清理】先通过 CDP 优雅关闭浏览器窗口
+        client := &http.Client{Timeout: 200 * time.Millisecond}
+        apiURL := fmt.Sprintf("http://127.0.0.1:%s/json", debugPort)
+        if resp, err := client.Get(apiURL); err == nil {
+            var targets []map[string]interface{}
+            if json.NewDecoder(resp.Body).Decode(&targets) == nil {
+                for _, t := range targets {
+                    if id, ok := t["id"].(string); ok {
+                        _, _ = client.Get(fmt.Sprintf("http://127.0.0.1:%s/json/close/%s", debugPort, id))
+                    }
+                }
+            }
+            resp.Body.Close()
+        }
+
+        // 2. 【系统恢复】恢复代理设置和图标
         setProxyRegistry(false)
-        
-        // 停止托盘图标
-        systray.Quit() 
-        
-        // 给 100ms 让协程收到 isReallyExiting 信号并退出
+        systray.Quit()
+
+        // 3. 【关键停顿】给 100ms 让信号传递
         time.Sleep(100 * time.Millisecond)
-        
+
+        // 4. 【强制兜底】即便 CDP 失败了，这行也能确保子进程（浏览器/内核）彻底消失
         if hJob != 0 { windows.CloseHandle(hJob) }
-        if hMutex != 0 { windows.CloseHandle(hMutex) }
         
+        // 5. 【门锁释放】确保下次启动不会提示“程序已在运行”
+        if hMutex != 0 { windows.CloseHandle(hMutex) }
+
+        // 6. 【彻底退出】
         os.Exit(0)
     })
 }
