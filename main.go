@@ -41,24 +41,33 @@ const (
 )
 
 var (
-	hJob                 windows.Handle
-	hMutex               windows.Handle
-	httpClient           = &http.Client{Timeout: 1 * time.Second}
-	exePath, _           = os.Executable()
-	baseDir              = filepath.Dir(exePath)
-	isSystemInitializing = true
-	isSyncing            int32
-	isReallyExiting      bool
-	hasFirstSynced       int32
-	exitOnce             sync.Once
-	configMu             sync.RWMutex
-	configData           = make(map[string]string)
-	lastState            = -1
-	tunErrorCounter      = 0
-	mTun                 *systray.MenuItem
-	isKernelActive       int32
+    hJob                 windows.Handle
+    user32               = windows.NewLazySystemDLL("user32.dll")
+    procSetWindowPos     = user32.NewProc("SetWindowPos")
+    procFindWindow       = user32.NewProc("FindWindowW")
+    hMutex               windows.Handle
+    httpClient           = &http.Client{Timeout: 1 * time.Second}
+    exePath, _           = os.Executable()
+    baseDir              = filepath.Dir(exePath)
+    isSystemInitializing = true
+    isSyncing            int32
+    isReallyExiting      bool
+    hasFirstSynced       int32
+    exitOnce             sync.Once
+    configMu             sync.RWMutex
+    configData           = make(map[string]string)
+    lastState            = -1
+    tunErrorCounter      = 0
+    mTun                 *systray.MenuItem
+    isKernelActive       int32
 )
 
+const (
+    HWND_TOPMOST   = ^uintptr(0) // -1，强力置顶
+    SWP_NOSIZE     = 0x0001      // 保持原有窗口大小
+    SWP_NOMOVE     = 0x0002      // 保持原有窗口位置
+    SWP_SHOWWINDOW = 0x0040      // 强制显示窗口
+)
 func main() {
 	var err error
 	exePath, err = os.Executable()
@@ -146,33 +155,54 @@ func launchWebUI() {
 		baseUI, host, port, secret)
 
 	// 3. 探测与激活逻辑 (单实例检测 & 强行置顶)
-	fastClient := &http.Client{Timeout: 400 * time.Millisecond}
-	resp, err := fastClient.Get(fmt.Sprintf("http://127.0.0.1:%s/json", debugPort))
-	if err == nil {
-		defer resp.Body.Close()
-		var targets []map[string]interface{}
-		if err := json.NewDecoder(resp.Body).Decode(&targets); err == nil {
-			for _, t := range targets {
-				pURL, _ := t["url"].(string)
-				pType, _ := t["type"].(string)
-				// 匹配正在运行的 UI 页面（包含 /ui/ 或 setup 字样）
-				if pType == "page" && (strings.Contains(pURL, "/ui/") || strings.Contains(pURL, "setup")) {
-					if id, ok := t["id"].(string); ok {
-						// A. 内部激活：通知 Edge 切换到该标签页
-						_, _ = fastClient.Get(fmt.Sprintf("http://127.0.0.1:%s/json/activate/%s", debugPort, id))
-						
-						// B. 外部强推：使用 PowerShell 强制将窗口推到最前
-						// 这里的 "msedge" 是通用进程名，如果想更精确，可以换成你网页的 Title 关键词
-						psCmd := `$wshell = New-Object -ComObject WScript.Shell; $wshell.AppActivate("msedge")`
-						_ = exec.Command("powershell", "-Command", psCmd).Run()
-						
-						return // 成功唤醒，直接返回，不再执行启动逻辑
-					}
-				}
-			}
-		}
-	}
+    fastClient := &http.Client{Timeout: 400 * time.Millisecond}
+    
+    // 1. 尝试探测现有的 Edge 调试接口
+    if resp, err := fastClient.Get(fmt.Sprintf("http://127.0.0.1:%s/json", debugPort)); err == nil {
+        defer resp.Body.Close()
+        var targets []map[string]interface{}
+        if err := json.NewDecoder(resp.Body).Decode(&targets); err == nil {
+            for _, t := range targets {
+                pURL, _ := t["url"].(string)
+                
+                // 判断是否是我们要找的 UI 界面
+                if strings.Contains(pURL, "/ui/") || strings.Contains(pURL, "setup") {
+                    if id, ok := t["id"].(string); ok {
+                        
+                        // --- 这里开始插入你的置顶逻辑 ---
+                        
+                        // 先通过 API 激活那个标签页
+                        fastClient.Get(fmt.Sprintf("http://127.0.0.1:%s/json/activate/%s", debugPort, id))
 
+                        // 使用 PowerShell 尝试唤醒窗口焦点
+                        psCmd := `$wshell = New-Object -ComObject WScript.Shell; $wshell.AppActivate("msedge")`
+                        _ = exec.Command("powershell", "-Command", psCmd).Run()
+
+                        // 执行你提供的 Win32 物理置顶协程
+                        go func() {
+                            time.Sleep(200 * time.Millisecond) 
+                            className, _ := windows.UTF16PtrFromString("Chrome_WidgetWin_1")
+                            hwnd, _, _ := procFindWindow.Call(uintptr(unsafe.Pointer(className)), 0)
+                            
+                            if hwnd != 0 {
+                                // 物理强制置顶
+                                procSetWindowPos.Call(
+                                    hwnd,
+                                    HWND_TOPMOST,
+                                    0, 0, 0, 0,
+                                    SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW,
+                                )
+                            }
+                        }()
+
+                        // --- 手术结束 ---
+                        
+                        return // 重要：处理完已存在的实例，直接返回，不再新开窗口
+                    }
+                }
+            }
+        }
+    }
 	// 4. 定位 Edge 路径
 	var edgePath string
 	potentialPaths := []string{
