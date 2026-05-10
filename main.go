@@ -317,12 +317,13 @@ func onReady() {
 	mRestart := mMoreRoot.AddSubMenuItem("重启内核", "")
 	mReload := mMoreRoot.AddSubMenuItem("重载配置文件", "")
 	systray.AddSeparator()
-
+    systray.SetIcon(iconData)  
+    systray.SetTitle("Mihomo Launcher")
 	mExit := systray.AddMenuItem("关闭程序", "")
 
 	for {
 		select {
-		case <-systray.GetWindowIconClickedChan():
+		case <-systray.ClickedCh:
 		    go launchWebUI()
         case <-mWeb.ClickedCh:
             go launchWebUI()
