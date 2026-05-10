@@ -18,8 +18,9 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
-
-	"github.com/getlantern/systray"
+	
+    "github.com/pkg/browser"
+	"github.com/energye/systray"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
@@ -295,6 +296,9 @@ func onReady() {
 	sniffAndSolidifyConfig()
 	setProxyRegistry(getIniConfig("system_proxy_enabled") == "true")
 	updateIconByState(StateStop)
+    systray.SetOnClick(func(menu systray.IMenu) {
+        go launchWebUI()
+    })	
 
 	mWeb := systray.AddMenuItem("进入 Web 面板", "")
 	systray.AddSeparator()
