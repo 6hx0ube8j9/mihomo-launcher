@@ -123,6 +123,7 @@ func launchWebUI() {
 	apiAddr := getIniConfig("external-controller")
 	secret := getIniConfig("secret")
 	proxyAddr := getIniConfig("proxy_address")
+	baseDir, _ := os.Getwd() // 确保 baseDir 有定义，通常为当前运行目录
 
 	// 2. 稳健的 URL 构造
 	baseUI := strings.TrimRight(apiAddr, "/")
@@ -140,10 +141,11 @@ func launchWebUI() {
 		}
 	}
 
+	// 构造最终进入的 URL
 	finalURL := fmt.Sprintf("%s/ui/?hostname=%s&port=%s&secret=%s#/proxies",
 		baseUI, host, port, secret)
 
-	// 3. 探测与激活逻辑 (单实例检测)
+	// 3. 探测与激活逻辑 (单实例检测 & 强行置顶)
 	fastClient := &http.Client{Timeout: 400 * time.Millisecond}
 	resp, err := fastClient.Get(fmt.Sprintf("http://127.0.0.1:%s/json", debugPort))
 	if err == nil {
@@ -153,22 +155,31 @@ func launchWebUI() {
 			for _, t := range targets {
 				pURL, _ := t["url"].(string)
 				pType, _ := t["type"].(string)
+				// 匹配正在运行的 UI 页面（包含 /ui/ 或 setup 字样）
 				if pType == "page" && (strings.Contains(pURL, "/ui/") || strings.Contains(pURL, "setup")) {
 					if id, ok := t["id"].(string); ok {
+						// A. 内部激活：通知 Edge 切换到该标签页
 						_, _ = fastClient.Get(fmt.Sprintf("http://127.0.0.1:%s/json/activate/%s", debugPort, id))
-						_ = exec.Command("cmd", "/c", "start", "", finalURL).Run()
-						return
+						
+						// B. 外部强推：使用 PowerShell 强制将窗口推到最前
+						// 这里的 "msedge" 是通用进程名，如果想更精确，可以换成你网页的 Title 关键词
+						psCmd := `$wshell = New-Object -ComObject WScript.Shell; $wshell.AppActivate("msedge")`
+						_ = exec.Command("powershell", "-Command", psCmd).Run()
+						
+						return // 成功唤醒，直接返回，不再执行启动逻辑
 					}
 				}
 			}
 		}
 	}
 
-	// 4. 在函数内直接定位 Edge 路径（修复 undefined 错误）
+	// 4. 定位 Edge 路径
 	var edgePath string
 	potentialPaths := []string{
 		`C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`,
 		`C:\Program Files\Microsoft\Edge\Application\msedge.exe`,
+		os.Getenv("ProgramFiles(x86)") + `\Microsoft\Edge\Application\msedge.exe`,
+		os.Getenv("ProgramFiles") + `\Microsoft\Edge\Application\msedge.exe`,
 	}
 	for _, p := range potentialPaths {
 		if _, err := os.Stat(p); err == nil {
@@ -181,7 +192,7 @@ func launchWebUI() {
 	userDataDir := filepath.Join(baseDir, "EdgeAppCache")
 
 	if edgePath != "" {
-		// 【方案 A】检测到 Edge: 启动“独立 App 模式”
+		// 【方案 A】检测到 Edge: 启动独立 App 模式
 		_ = os.MkdirAll(userDataDir, 0755)
 		args := []string{
 			"--app=" + finalURL,
@@ -194,10 +205,11 @@ func launchWebUI() {
 		}
 		cmd := exec.Command(edgePath, args...)
 		if err := cmd.Start(); err != nil {
+			// 如果启动失败，退回到默认浏览器
 			_ = exec.Command("cmd", "/c", "start", "", finalURL).Start()
 		}
 	} else {
-		// 【方案 B】未找到 Edge: 使用系统默认浏览器打开
+		// 【方案 B】未找到 Edge: 直接用系统默认浏览器打开
 		_ = exec.Command("cmd", "/c", "start", "", finalURL).Start()
 	}
 }
