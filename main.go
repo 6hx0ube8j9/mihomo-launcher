@@ -322,53 +322,44 @@ func onReady() {
 
 	mExit := systray.AddMenuItem("关闭程序", "")
 
-	for {
-		select {
-        case <-mWeb.ClickChan():
+    for {
+        select {
+        // 使用 ClickedCh() 方法获取通道
+        case <-mWeb.ClickedCh():
             go launchWebUI()
-		case <-mReload.ClickChan():
-			sniffAndSolidifyConfig()
-			reloadConfigFile()
-		case <-modeMenus["rule"].ClickChan():
-			setMihomoMode("rule")
-			modeMenus["rule"].Check()
-			modeMenus["global"].Uncheck()
-			modeMenus["direct"].Uncheck()
-		case <-modeMenus["global"].ClickChan():
-			setMihomoMode("global")
-			modeMenus["rule"].Uncheck()
-			modeMenus["global"].Check()
-			modeMenus["direct"].Uncheck()
-		case <-modeMenus["direct"].ClickChan():
-			setMihomoMode("direct")
-			modeMenus["rule"].Uncheck()
-			modeMenus["global"].Uncheck()
-			modeMenus["direct"].Check()
-		case <-mTun.ClickChan():
-			next := !mTun.Checked()
-			if next { mTun.Check() } else { mTun.Uncheck() }
-			go setTunMode(next)
-		case <-mProxy.ClickChan():
-			next := !mProxy.Checked()
-			saveIniConfig("system_proxy_enabled", fmt.Sprint(next))
-			setProxyRegistry(next)
-			if next { mProxy.Check() } else { mProxy.Uncheck() }
-		case <-mAuto.ClickChan():
-			next := !mAuto.Checked()
-			toggleAutoStart(next)
-			if next { mAuto.Check() } else { mAuto.Uncheck() }
-		case <-mDir.ClickChan():
-			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
-		case <-mRestart.ClickChan():
-			isSystemInitializing = true
-			atomic.StoreInt32(&hasFirstSynced, 0)
-			KillProcessByName("mihomo.exe")
-		case <-mExit.ClickChan():
-			isReallyExiting = true
-			systray.Quit()
-			return
-		}
-	}
+        case <-mReload.ClickedCh():
+            sniffAndSolidifyConfig()
+            reloadConfigFile()
+        case <-modeMenus["rule"].ClickedCh():
+            setMihomoMode("rule")
+            modeMenus["rule"].Check()
+            modeMenus["global"].Uncheck()
+            modeMenus["direct"].Uncheck()
+        case <-mTun.ClickedCh():
+            next := !mTun.Checked()
+            if next { mTun.Check() } else { mTun.Uncheck() }
+            go setTunMode(next)
+        case <-mProxy.ClickedCh():
+            next := !mProxy.Checked()
+            saveIniConfig("system_proxy_enabled", fmt.Sprint(next))
+            setProxyRegistry(next)
+            if next { mProxy.Check() } else { mProxy.Uncheck() }
+        case <-mAuto.ClickedCh():
+            next := !mAuto.Checked()
+            toggleAutoStart(next)
+            if next { mAuto.Check() } else { mAuto.Uncheck() }
+        case <-mDir.ClickedCh():
+            windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
+        case <-mRestart.ClickedCh():
+            isSystemInitializing = true
+            atomic.StoreInt32(&hasFirstSynced, 0)
+            KillProcessByName("mihomo.exe")
+        case <-mExit.ClickedCh():
+            isReallyExiting = true
+            systray.Quit()
+            return
+        }
+    }
 }
 
 func onExit() {
