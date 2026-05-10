@@ -1,27 +1,27 @@
 package main
 
 import (
-    "bytes"
-    "embed"
-    "encoding/json"
-    "fmt"
-    "io"
-    "net"
-    "net/http"
-    "os"
-    "os/exec"
-    "os/signal"
-    "path/filepath"
-    "strings"
-    "sync"
-    "sync/atomic"
-    "syscall"
-    "time"
-    "unsafe"
+	"bytes"
+	"embed"
+	"encoding/json"
+	"fmt"
+	"io"
+	"net"
+	"net/http"
+	"os"
+	"os/exec"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"sync"
+	"sync/atomic"
+	"syscall"
+	"time"
+	"unsafe"
 
-    "fyne.io/systray" 
-    "golang.org/x/sys/windows"
-    "golang.org/x/sys/windows/registry"
+	"github.com/energye/systray"
+	"golang.org/x/sys/windows"
+	"golang.org/x/sys/windows/registry"
 )
 
 //go:embed icons/*.ico
@@ -295,7 +295,9 @@ func onReady() {
 	sniffAndSolidifyConfig()
 	setProxyRegistry(getIniConfig("system_proxy_enabled") == "true")
 	updateIconByState(StateStop)
-
+    systray.SetOnClick(func() {
+	    go launchWebUI()
+	})	
 	mWeb := systray.AddMenuItem("进入 Web 面板", "")
 	systray.AddSeparator()
 
@@ -317,14 +319,11 @@ func onReady() {
 	mRestart := mMoreRoot.AddSubMenuItem("重启内核", "")
 	mReload := mMoreRoot.AddSubMenuItem("重载配置文件", "")
 	systray.AddSeparator()
-    systray.SetIcon(iconData)  
-    systray.SetTitle("Mihomo Launcher")
+
 	mExit := systray.AddMenuItem("关闭程序", "")
 
 	for {
 		select {
-		case <-systray.ClickedCh:
-		    go launchWebUI()
         case <-mWeb.ClickedCh:
             go launchWebUI()
 		case <-mReload.ClickedCh:
