@@ -324,46 +324,46 @@ func onReady() {
 
 	for {
 		select {
-        case <-mWeb.ClickChan:
+        case <-mWeb.ClickedChan():
             go launchWebUI()
-		case <-mReload.ClickChan:
+		case <-mReload.ClickedChan():
 			sniffAndSolidifyConfig()
 			reloadConfigFile()
-		case <-modeMenus["rule"].ClickChan:
+		case <-modeMenus["rule"].ClickedChan():
 			setMihomoMode("rule")
 			modeMenus["rule"].Check()
 			modeMenus["global"].Uncheck()
 			modeMenus["direct"].Uncheck()
-		case <-modeMenus["global"].ClickChan:
+		case <-modeMenus["global"].ClickedChan():
 			setMihomoMode("global")
 			modeMenus["rule"].Uncheck()
 			modeMenus["global"].Check()
 			modeMenus["direct"].Uncheck()
-		case <-modeMenus["direct"].ClickChan:
+		case <-modeMenus["direct"].ClickedChan():
 			setMihomoMode("direct")
 			modeMenus["rule"].Uncheck()
 			modeMenus["global"].Uncheck()
 			modeMenus["direct"].Check()
-		case <-mTun.ClickChan:
+		case <-mTun.ClickedChan():
 			next := !mTun.Checked()
 			if next { mTun.Check() } else { mTun.Uncheck() }
 			go setTunMode(next)
-		case <-mProxy.ClickChan:
+		case <-mProxy.ClickedChan():
 			next := !mProxy.Checked()
 			saveIniConfig("system_proxy_enabled", fmt.Sprint(next))
 			setProxyRegistry(next)
 			if next { mProxy.Check() } else { mProxy.Uncheck() }
-		case <-mAuto.ClickChan:
+		case <-mAuto.ClickedChan():
 			next := !mAuto.Checked()
 			toggleAutoStart(next)
 			if next { mAuto.Check() } else { mAuto.Uncheck() }
-		case <-mDir.ClickChan:
+		case <-mDir.ClickedChan():
 			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
-		case <-mRestart.ClickChan:
+		case <-mRestart.ClickedChan():
 			isSystemInitializing = true
 			atomic.StoreInt32(&hasFirstSynced, 0)
 			KillProcessByName("mihomo.exe")
-		case <-mExit.ClickChan:
+		case <-mExit.ClickedChan():
 			isReallyExiting = true
 			systray.Quit()
 			return
