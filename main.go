@@ -393,10 +393,9 @@ func onReady() {
 
 func onExit() {
     exitOnce.Do(func() {
-        atomic.StoreInt32(&isReallyExiting, 1)
+        isReallyExiting = true
 
-        // 1. 尝试优雅关闭浏览器标签 (CDP)
-        // 只要是 --app 模式启动的，这一步通常能生效
+        // 1. 【高级清理】先通过 CDP 优雅关闭浏览器窗口
         client := &http.Client{Timeout: 200 * time.Millisecond}
         apiURL := fmt.Sprintf("http://127.0.0.1:%s/json", debugPort)
         if resp, err := client.Get(apiURL); err == nil {
@@ -411,22 +410,20 @@ func onExit() {
             resp.Body.Close()
         }
 
-        // 2. 关键：先撤代理，再退程序
+        // 2. 【系统恢复】恢复代理设置和图标
         setProxyRegistry(false)
-
-        // 3. 退出托盘图标
         systray.Quit()
 
-        // 4. 关闭 Job Object 句柄
-        // 这一步会瞬间触发内核强杀还在运行的 mihomo.exe 和 --app 浏览器进程
-        if hJob != 0 {
-            windows.CloseHandle(hJob)
-        }
-        
-        if hMutex != 0 {
-            windows.CloseHandle(hMutex)
-        }
+        // 3. 【关键停顿】给 100ms 让信号传递
+        time.Sleep(100 * time.Millisecond)
 
+        // 4. 【强制兜底】即便 CDP 失败了，这行也能确保子进程（浏览器/内核）彻底消失
+        if hJob != 0 { windows.CloseHandle(hJob) }
+        
+        // 5. 【门锁释放】确保下次启动不会提示“程序已在运行”
+        if hMutex != 0 { windows.CloseHandle(hMutex) }
+
+        // 6. 【彻底退出】
         os.Exit(0)
     })
 }
