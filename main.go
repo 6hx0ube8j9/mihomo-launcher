@@ -295,7 +295,7 @@ func onReady() {
 	sniffAndSolidifyConfig()
 	setProxyRegistry(getIniConfig("system_proxy_enabled") == "true")
 	updateIconByState(StateStop)
-    systray.SetOnClick(func() {
+    systray.SetOnClick(func(menu systray.IMenu) {
 	    go launchWebUI()
 	})	
 	mWeb := systray.AddMenuItem("进入 Web 面板", "")
@@ -324,46 +324,46 @@ func onReady() {
 
 	for {
 		select {
-        case <-mWeb.ClickedCh:
+        case <-mWeb.ClickChan:
             go launchWebUI()
-		case <-mReload.ClickedCh:
+		case <-mReload.ClickChan:
 			sniffAndSolidifyConfig()
 			reloadConfigFile()
-		case <-modeMenus["rule"].ClickedCh:
+		case <-modeMenus["rule"].ClickChan:
 			setMihomoMode("rule")
 			modeMenus["rule"].Check()
 			modeMenus["global"].Uncheck()
 			modeMenus["direct"].Uncheck()
-		case <-modeMenus["global"].ClickedCh:
+		case <-modeMenus["global"].ClickChan:
 			setMihomoMode("global")
 			modeMenus["rule"].Uncheck()
 			modeMenus["global"].Check()
 			modeMenus["direct"].Uncheck()
-		case <-modeMenus["direct"].ClickedCh:
+		case <-modeMenus["direct"].ClickChan:
 			setMihomoMode("direct")
 			modeMenus["rule"].Uncheck()
 			modeMenus["global"].Uncheck()
 			modeMenus["direct"].Check()
-		case <-mTun.ClickedCh:
+		case <-mTun.ClickChan:
 			next := !mTun.Checked()
 			if next { mTun.Check() } else { mTun.Uncheck() }
 			go setTunMode(next)
-		case <-mProxy.ClickedCh:
+		case <-mProxy.ClickChan:
 			next := !mProxy.Checked()
 			saveIniConfig("system_proxy_enabled", fmt.Sprint(next))
 			setProxyRegistry(next)
 			if next { mProxy.Check() } else { mProxy.Uncheck() }
-		case <-mAuto.ClickedCh:
+		case <-mAuto.ClickChan:
 			next := !mAuto.Checked()
 			toggleAutoStart(next)
 			if next { mAuto.Check() } else { mAuto.Uncheck() }
-		case <-mDir.ClickedCh:
+		case <-mDir.ClickChan:
 			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
-		case <-mRestart.ClickedCh:
+		case <-mRestart.ClickChan:
 			isSystemInitializing = true
 			atomic.StoreInt32(&hasFirstSynced, 0)
 			KillProcessByName("mihomo.exe")
-		case <-mExit.ClickedCh:
+		case <-mExit.ClickChan:
 			isReallyExiting = true
 			systray.Quit()
 			return
