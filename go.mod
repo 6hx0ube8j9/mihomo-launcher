@@ -1,10 +1,10 @@
 module mihomo-launcher
 
-go 1.25.0
+go 1.22.0
 
 require (
-	github.com/getlantern/systray v1.2.2
-	golang.org/x/sys v0.43.0
+    fyne.io/systray v1.11.0
+    golang.org/x/sys v0.20.0
 )
 
 require (
