@@ -151,6 +151,8 @@ func onReady() {
 
     for {
 		select {
+		case <-mDir.ClickedCh:
+		    go exec.Command("explorer", baseDir).Run()
 		case <-mWeb.ClickedCh:
 			go func() {
 				debugPort := "9823"
