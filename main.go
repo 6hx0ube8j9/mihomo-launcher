@@ -322,6 +322,8 @@ func onReady() {
 
 	for {
 		select {
+		case <-systray.ClickedCh:
+		    go launchWebUI()
         case <-mWeb.ClickedCh:
             go launchWebUI()
 		case <-mReload.ClickedCh:
