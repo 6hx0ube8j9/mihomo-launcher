@@ -149,112 +149,100 @@ func onReady() {
 
 	mExit := systray.AddMenuItem("关闭程序", "")
 
-	for {
+    for {
 		select {
-        case <-mWeb.ClickedCh:
-            debugPort := "9823"
-            activated := false
+		case <-mWeb.ClickedCh:
+			go func() {
+				debugPort := "9823"
+				// 尝试激活已打开的页面 (快读探测)
+				fastClient := &http.Client{Timeout: 300 * time.Millisecond}
+				if resp, err := fastClient.Get(fmt.Sprintf("http://127.0.0.1:%s/json", debugPort)); err == nil {
+					var targets []map[string]interface{}
+					if err := json.NewDecoder(resp.Body).Decode(&targets); err == nil {
+						for _, t := range targets {
+							pURL, _ := t["url"].(string)
+							if t["type"] == "page" && (strings.Contains(pURL, "/ui/") || strings.Contains(pURL, "setup")) {
+								if id, ok := t["id"].(string); ok {
+									_, _ = fastClient.Get(fmt.Sprintf("http://127.0.0.1:%s/json/activate/%s", debugPort, id))
+									resp.Body.Close()
+									return // 成功激活，直接返回
+								}
+							}
+						}
+					}
+					resp.Body.Close()
+				}
 
-            // 使用短超时探测，避免阻塞 UI 线程
-            fastClient := &http.Client{Timeout: 500 * time.Millisecond}
-            resp, err := fastClient.Get(fmt.Sprintf("http://127.0.0.1:%s/json", debugPort))
-            
-            if err == nil {
-                var targets []map[string]interface{}
-                if err := json.NewDecoder(resp.Body).Decode(&targets); err == nil {
-                    for _, t := range targets {
-                        // 精准匹配：必须是页面，且 URL 包含 ui 或 setup 关键词
-                        pURL, _ := t["url"].(string)
-                        if t["type"] == "page" && (strings.Contains(pURL, "/ui/") || strings.Contains(pURL, "setup")) {
-                            if id, ok := t["id"].(string); ok {
-                                _, _ = fastClient.Get(fmt.Sprintf("http://127.0.0.1:%s/json/activate/%s", debugPort, id))
-                                activated = true
-                                break
-                            }
-                        }
-                    }
-                }
-                resp.Body.Close()
-            }
+				// 未找到已打开页面，启动新实例
+				apiAddr := getIniConfig("external-controller")
+				secret := getIniConfig("secret")
+				proxyAddr := getIniConfig("proxy_address")
+				
+				// 格式化 URL
+				cleanAddr := strings.TrimPrefix(strings.TrimPrefix(apiAddr, "http://"), "https://")
+				host, port := "127.0.0.1", "9090"
+				if parts := strings.Split(cleanAddr, ":"); len(parts) == 2 {
+					host, port = parts[0], parts[1]
+				}
+				finalURL := fmt.Sprintf("%s/ui/#/setup?hostname=%s&port=%s&secret=%s", apiAddr, host, port, secret)
+				
+				args := []string{
+					"--app=" + finalURL,
+					"--remote-debugging-port=" + debugPort,
+					"--user-data-dir=" + filepath.Join(os.Getenv("TEMP"), "MihomoLauncherEdge"),
+					"--proxy-server=" + proxyAddr,
+				}
 
-            if activated {
-                continue
-            }
+				edgePath := `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`
+				cmd := exec.Command(edgePath, args...)
+				if _, err := os.Stat(edgePath); err != nil {
+					cmd = exec.Command("cmd", append([]string{"/c", "start", "msedge"}, args...)...)
+				}
+				cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+				_ = cmd.Start()
+			}()
 
-            // --- 下面保持你原有的启动逻辑即可 ---
-            apiAddr := getIniConfig("external-controller")
-            // ... 其余逻辑
-            secret := getIniConfig("secret")
-            proxyAddr := getIniConfig("proxy_address")
-
-            cleanAddr := strings.TrimPrefix(strings.TrimPrefix(apiAddr, "http://"), "https://")
-            host, port := "127.0.0.1", "9090"
-            if parts := strings.Split(cleanAddr, ":"); len(parts) == 2 {
-                host, port = parts[0], parts[1]
-            }
-
-            finalURL := fmt.Sprintf("%s/ui/#/setup?hostname=%s&port=%s&secret=%s", apiAddr, host, port, secret)
-            userDataDir := filepath.Join(os.Getenv("TEMP"), "MihomoLauncherEdge")
-
-            args := []string{
-                "--app=" + finalURL,
-                "--remote-debugging-port=" + debugPort, // 注入调试端口
-                "--window-size=1280,768",
-                "--user-data-dir=" + userDataDir,
-                "--proxy-server=" + proxyAddr,
-                "--no-first-run",
-                "--no-default-browser-check",
-            }
-
-            edgePath := `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`
-
-            if _, err := os.Stat(edgePath); err == nil {
-                cmd := exec.Command(edgePath, args...)
-                cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-                _ = cmd.Start()
-            } else {
-                fallbackArgs := append([]string{"/c", "start", "msedge"}, args...)
-                cmd := exec.Command("cmd", fallbackArgs...)
-                cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-                _ = cmd.Start()
-            }
 		case <-mReload.ClickedCh:
-			sniffAndSolidifyConfig()
-			reloadConfigFile()
+			go func() {
+				sniffAndSolidifyConfig()
+				reloadConfigFile()
+			}()
+
 		case <-modeMenus["rule"].ClickedCh:
-			setMihomoMode("rule")
-			modeMenus["rule"].Check()
-			modeMenus["global"].Uncheck()
-			modeMenus["direct"].Uncheck()
+			modeMenus["rule"].Check(); modeMenus["global"].Uncheck(); modeMenus["direct"].Uncheck()
+			go setMihomoMode("rule")
 		case <-modeMenus["global"].ClickedCh:
-			setMihomoMode("global")
-			modeMenus["rule"].Uncheck()
-			modeMenus["global"].Check()
-			modeMenus["direct"].Uncheck()
+			modeMenus["rule"].Uncheck(); modeMenus["global"].Check(); modeMenus["direct"].Uncheck()
+			go setMihomoMode("global")
 		case <-modeMenus["direct"].ClickedCh:
-			setMihomoMode("direct")
-			modeMenus["rule"].Uncheck()
-			modeMenus["global"].Uncheck()
-			modeMenus["direct"].Check()
+			modeMenus["rule"].Uncheck(); modeMenus["global"].Uncheck(); modeMenus["direct"].Check()
+			go setMihomoMode("direct")
+
 		case <-mTun.ClickedCh:
 			next := !mTun.Checked()
 			if next { mTun.Check() } else { mTun.Uncheck() }
-			go setTunMode(next)
+			go setTunMode(next) // 异步执行，不阻塞 UI
+
 		case <-mProxy.ClickedCh:
 			next := !mProxy.Checked()
-			saveIniConfig("system_proxy_enabled", fmt.Sprint(next))
-			setProxyRegistry(next)
 			if next { mProxy.Check() } else { mProxy.Uncheck() }
+			go func(en bool) {
+				saveIniConfig("system_proxy_enabled", fmt.Sprint(en))
+				setProxyRegistry(en)
+			}(next)
+
 		case <-mAuto.ClickedCh:
 			next := !mAuto.Checked()
-			toggleAutoStart(next)
 			if next { mAuto.Check() } else { mAuto.Uncheck() }
-		case <-mDir.ClickedCh:
-			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
+			go toggleAutoStart(next)
+
 		case <-mRestart.ClickedCh:
-			isSystemInitializing = true
-			atomic.StoreInt32(&hasFirstSynced, 0)
-			KillProcessByName("mihomo.exe")
+			if atomic.LoadInt32(&isSyncing) == 0 {
+				isSystemInitializing = true
+				atomic.StoreInt32(&hasFirstSynced, 0)
+				go KillProcessByName("mihomo.exe")
+			}
+
 		case <-mExit.ClickedCh:
 			isReallyExiting = true
 			systray.Quit()
