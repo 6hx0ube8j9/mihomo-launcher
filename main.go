@@ -156,6 +156,7 @@ func launchWebUI() {
 				if pType == "page" && (strings.Contains(pURL, "/ui/") || strings.Contains(pURL, "setup")) {
 					if id, ok := t["id"].(string); ok {
 						_, _ = fastClient.Get(fmt.Sprintf("http://127.0.0.1:%s/json/activate/%s", debugPort, id))
+						_ = exec.Command("cmd", "/c", "start", "", finalURL).Run()
 						return
 					}
 				}
