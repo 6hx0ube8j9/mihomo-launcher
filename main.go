@@ -59,32 +59,42 @@ var (
 	isKernelActive       int32
     user32           = windows.NewLazySystemDLL("user32.dll")
     kernel32         = windows.NewLazySystemDLL("kernel32.dll")
+    // 动态库载入
+    u32 = windows.NewLazySystemDLL("user32.dll")
+    k32 = windows.NewLazySystemDLL("kernel32.dll")
+
+    // 1. 窗口寻找与属性 (用于在桌面上“揪”出浏览器)
+    procEnumWindows      = u32.NewProc("EnumWindows")
+    procGetClassName     = u32.NewProc("GetClassNameW")
+    procIsWindowVisible  = u32.NewProc("IsWindowVisible")
+    procGetWindowThread  = u32.NewProc("GetWindowThreadProcessId")
     
-    // 窗口寻找与属性
-    procEnumWindows      = user32.NewProc("EnumWindows")
-    procGetClassName     = user32.NewProc("GetClassNameW")
-    procIsWindowVisible  = user32.NewProc("IsWindowVisible")
-    procGetWindowThread  = user32.NewProc("GetWindowThreadProcessId")
+    // 2. 焦点与状态夺取 (置顶的核心手术刀)
+    procSetWindowPos     = u32.NewProc("SetWindowPos")
+    procShowWindow        = u32.NewProc("ShowWindow")
+    procSetForeground    = u32.NewProc("SetForegroundWindow")
+    procBringToTop       = u32.NewProc("BringWindowToTop")
+    procGetForeground    = u32.NewProc("GetForegroundWindow")
+    procAttachThread     = u32.NewProc("AttachThreadInput")
+    procGetCurrentThread = k32.NewProc("GetCurrentThreadId")
     
-    // 焦点与状态夺取
-    procSetWindowPos     = user32.NewProc("SetWindowPos")
-    procShowWindow       = user32.NewProc("ShowWindow")
-    procSetForeground    = user32.NewProc("SetForegroundWindow")
-    procBringToTop       = user32.NewProc("BringWindowToTop")
-    procGetForeground    = user32.NewProc("GetForegroundWindow")
-    procAttachThread     = user32.NewProc("AttachThreadInput")
-    procGetCurrentThread = kernel32.NewProc("GetCurrentThreadId")
-    
-    // 黑魔法：模拟按键
-    procKeybdEvent       = user32.NewProc("keybd_event")	
+    // 3. 辅助黑魔法 (刷新焦点)
+    procKeybdEvent       = u32.NewProc("keybd_event")
+
+    // 4. 状态控制 (防止疯狂连点)
+    isFocusing           int32 
 )
+
 const (
-    HWND_TOPMOST   = ^uintptr(0) // -1
-    HWND_NOTOPMOST = ^uintptr(1) // -2
-    SWP_NOSIZE     = 0x0001
-    SWP_NOMOVE     = 0x0002
-    SWP_SHOWWINDOW = 0x0040
-    SW_RESTORE     = 9
+    // 物理层级常量
+    HWND_TOPMOST   = ^uintptr(0) // -1: 强制置顶
+    HWND_NOTOPMOST = ^uintptr(1) // -2: 解除置顶
+
+    // 状态常量
+    SW_RESTORE     = 9           // 恢复窗口（最小化时有效）
+    
+    // 动作组合标志位: NOSIZE(1) | NOMOVE(2) | SHOWWINDOW(64) = 0x0043
+    SWP_SILKY      = 0x0043 
 )
 
 func main() {
@@ -145,124 +155,126 @@ func main() {
 	systray.Run(onReady, onExit)
 	onExit()
 }
+func focusWindowSilky(targetHwnd uintptr) {
+    // 1. 原子锁控制，防止短时间内多次触发导致置顶冲突
+    if !atomic.CompareAndSwapInt32(&isFocusing, 0, 1) {
+        return
+    }
+    defer atomic.StoreInt32(&isFocusing, 0)
+
+    // 获取当前、前台以及目标窗口的线程 ID
+    currT, _, _ := procGetCurrentThread.Call()
+    foreH, _, _ := procGetForeground.Call()
+    foreT, _, _ := procGetWindowThread.Call(foreH, 0)
+    targT, _, _ := procGetWindowThread.Call(targetHwnd, 0)
+
+    // 2. 线程关联（黑魔法）：让当前进程拥有前台权限
+    if foreT != currT {
+        procAttachThread.Call(foreT, currT, 1)
+    }
+    procAttachThread.Call(currT, targT, 1)
+
+    // 3. 执行窗口唤醒组合拳
+    procShowWindow.Call(targetHwnd, SW_RESTORE)
+    procSetForeground.Call(targetHwnd)
+    procBringToTop.Call(targetHwnd)
+    // 物理置顶：设置为 HWND_TOPMOST
+    procSetWindowPos.Call(targetHwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_SILKY)
+
+    // 4. 解除线程关联
+    procAttachThread.Call(currT, targT, 0)
+    if foreT != currT {
+        procAttachThread.Call(foreT, currT, 0)
+    }
+
+    // 5. 模拟 Alt 键：强制 Windows 刷新输入焦点到目标窗口
+    procKeybdEvent.Call(0x12, 0, 0, 0) // Alt down
+    procKeybdEvent.Call(0x12, 0, 2, 0) // Alt up
+
+    // 6. 延时解除物理置顶，防止窗口“流氓”，允许用户切走
+    time.AfterFunc(400*time.Millisecond, func() {
+        procSetWindowPos.Call(targetHwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_SILKY)
+    })
+}
+
 func launchWebUI() {
     debugPort := "52719"
+    // 假设 getIniConfig 是你读取配置的函数
     apiAddr := getIniConfig("external-controller")
     secret := getIniConfig("secret")
     proxyAddr := getIniConfig("proxy_address")
     
-    // 1. 构造最终进入的 URL
+    // URL 构造
     baseUI := strings.TrimRight(apiAddr, "/")
     if !strings.HasPrefix(baseUI, "http") {
         baseUI = "http://" + baseUI
     }
-    cleanAddr := strings.TrimPrefix(strings.TrimPrefix(baseUI, "http://"), "https://")
-    host, port, err := net.SplitHostPort(cleanAddr)
-    if err != nil {
-        if parts := strings.Split(cleanAddr, ":"); len(parts) == 2 {
-            host, port = parts[0], parts[1]
-        } else {
-            host, port = "127.0.0.1", "9090"
-        }
-    }
+    host, port, _ := net.SplitHostPort(strings.TrimPrefix(strings.TrimPrefix(baseUI, "http://"), "https://"))
+    if port == "" { host, port = "127.0.0.1", "9090" }
     finalURL := fmt.Sprintf("%s/ui/?hostname=%s&port=%s&secret=%s#/proxies", baseUI, host, port, secret)
 
-    // 2. 探测与激活逻辑 (单实例检测)
-    fastClient := &http.Client{Timeout: 400 * time.Millisecond}
-    if resp, err := fastClient.Get(fmt.Sprintf("http://127.0.0.1:%s/json", debugPort)); err == nil {
+    // 1. 探测阶段：通过 CDP 端口寻找是否已经有打开的 UI
+    client := &http.Client{Timeout: 300 * time.Millisecond}
+    if resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%s/json", debugPort)); err == nil {
         defer resp.Body.Close()
         var targets []map[string]interface{}
         if err := json.NewDecoder(resp.Body).Decode(&targets); err == nil {
             for _, t := range targets {
                 pURL, _ := t["url"].(string)
+                // 识别特征：URL 中包含 /ui/ 或 setup
                 if strings.Contains(pURL, "/ui/") || strings.Contains(pURL, "setup") {
-                    if id, ok := t["id"].(string); ok {
-                        
-                        // A. 内部激活标签页
-                        _, _ = fastClient.Get(fmt.Sprintf("http://127.0.0.1:%s/json/activate/%s", debugPort, id))
-
-                        // B. PowerShell 尝试获取焦点
-                        psCmd := `$wshell = New-Object -ComObject WScript.Shell; $wshell.AppActivate("msedge")`
-                        _ = exec.Command("powershell", "-Command", psCmd).Run()
-
-                        // C. 暴力 Win32 强推置顶
-                        go func() {
-                            time.Sleep(250 * time.Millisecond)
-                            var targetHwnd uintptr
-                            
-                            // 枚举查找可见的 Edge 窗口
-                            cb := windows.NewCallback(func(hwnd uintptr, lparam uintptr) uintptr {
-                                var buf [256]uint16
-                                procGetClassName.Call(hwnd, uintptr(unsafe.Pointer(&buf[0])), uintptr(len(buf)))
-                                if windows.UTF16ToString(buf[:]) == "Chrome_WidgetWin_1" {
-                                    if vis, _, _ := procIsWindowVisible.Call(hwnd); vis != 0 {
-                                        targetHwnd = hwnd
-                                        return 0 
-                                    }
+                    id, _ := t["id"].(string)
+                    // 激活该标签页（前端跳转）
+                    client.Get(fmt.Sprintf("http://127.0.0.1:%s/json/activate/%s", debugPort, id))
+                    
+                    // 异步置顶窗口（后台寻找 HWND）
+                    go func() {
+                        time.Sleep(100 * time.Millisecond)
+                        var targetHwnd uintptr
+                        procEnumWindows.Call(windows.NewCallback(func(hwnd uintptr, _ uintptr) uintptr {
+                            var buf [256]uint16
+                            procGetClassName.Call(hwnd, uintptr(unsafe.Pointer(&buf[0])), 256)
+                            if windows.UTF16ToString(buf[:]) == "Chrome_WidgetWin_1" {
+                                if vis, _, _ := procIsWindowVisible.Call(hwnd); vis != 0 {
+                                    targetHwnd = hwnd
+                                    return 0 // 找到即停止
                                 }
-                                return 1
-                            })
-                            procEnumWindows.Call(cb, 0)
-
-                            if targetHwnd != 0 {
-                                // 1. 线程输入关联 (破解前台锁定)
-                                foregroundHwnd, _, _ := procGetForeground.Call()
-                                targetThread, _, _ := procGetWindowThread.Call(targetHwnd, 0)
-                                foregroundThread, _, _ := procGetWindowThread.Call(foregroundHwnd, 0)
-                                currentThread, _, _ := procGetCurrentThread.Call()
-
-                                if foregroundThread != currentThread {
-                                    procAttachThread.Call(foregroundThread, currentThread, 1)
-                                }
-                                procAttachThread.Call(currentThread, targetThread, 1)
-
-                                // 2. 强行拉起并推向最前
-                                procShowWindow.Call(targetHwnd, SW_RESTORE)
-                                procSetForeground.Call(targetHwnd)
-                                procBringToTop.Call(targetHwnd)
-                                procSetWindowPos.Call(targetHwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW)
-
-                                // 3. 释放关联
-                                procAttachThread.Call(currentThread, targetThread, 0)
-                                if foregroundThread != currentThread {
-                                    procAttachThread.Call(foregroundThread, currentThread, 0)
-                                }
-
-                                // 4. 模拟 ALT 键触发系统强制重绘焦点 (防止窗口虽然置顶但不亮起)
-                                procKeybdEvent.Call(0x12, 0, 0, 0) // Alt Down
-                                procKeybdEvent.Call(0x12, 0, 2, 0) // Alt Up
-                                
-                                // 5. 半秒后解除置顶锁定，使其变回普通窗口但保持在最前
-                                time.Sleep(500 * time.Millisecond)
-                                procSetWindowPos.Call(targetHwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_NOMOVE|SWP_NOSIZE)
                             }
-                        }()
-                        return 
-                    }
+                            return 1
+                        }), 0)
+                        if targetHwnd != 0 {
+                            focusWindowSilky(targetHwnd)
+                        }
+                    }()
+                    return // 激活成功，直接退出函数
                 }
             }
         }
     }
 
-    // 3. 没找到实例，启动新实例
-    var edgePath string
+    // 2. 查找可用浏览器阶段
+    var browserPath string
     potentialPaths := []string{
-        `C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`,
-        `C:\Program Files\Microsoft\Edge\Application\msedge.exe`,
-        os.Getenv("ProgramFiles(x86)") + `\Microsoft\Edge\Application\msedge.exe`,
-        os.Getenv("ProgramFiles") + `\Microsoft\Edge\Application\msedge.exe`,
+        filepath.Join(os.Getenv("ProgramFiles(x86)"), `Microsoft\Edge\Application\msedge.exe`),
+        filepath.Join(os.Getenv("ProgramFiles"), `Microsoft\Edge\Application\msedge.exe`),
+        filepath.Join(os.Getenv("ProgramFiles(x86)"), `Google\Chrome\Application\chrome.exe`),
+        filepath.Join(os.Getenv("ProgramFiles"), `Google\Chrome\Application\chrome.exe`),
+        filepath.Join(os.Getenv("LocalAppData"), `Google\Chrome\Application\chrome.exe`),
     }
+
     for _, p := range potentialPaths {
         if _, err := os.Stat(p); err == nil {
-            edgePath = p
+            browserPath = p
             break
         }
     }
 
-    userDataDir := filepath.Join(baseDir, "EdgeAppCache")
-    _ = os.MkdirAll(userDataDir, 0755)
+    // 3. 启动执行阶段
+    if browserPath != "" {
+        // 使用独立的用户数据目录，防止污染用户日常使用的浏览器
+        userDataDir := filepath.Join(baseDir, "AppCache") // 建议通用命名
+        _ = os.MkdirAll(userDataDir, 0755)
 
-    if edgePath != "" {
         args := []string{
             "--app=" + finalURL,
             "--remote-debugging-port=" + debugPort,
@@ -271,8 +283,9 @@ func launchWebUI() {
             "--proxy-server=" + proxyAddr,
             "--no-first-run",
         }
-        _ = exec.Command(edgePath, args...).Start()
+        _ = exec.Command(browserPath, args...).Start()
     } else {
+        // 兜底：用系统默认浏览器直接打开
         _ = exec.Command("cmd", "/c", "start", "", finalURL).Start()
     }
 }
