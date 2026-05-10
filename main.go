@@ -940,15 +940,28 @@ func getIniConfig(key string) string {
 }
 
 func saveIniConfig(key, val string) {
-	configMu.Lock()
-	if key != "" { configData[key] = val }
-	keys := []string{"mode", "tun_enabled", "system_proxy_enabled", "startup_enabled", "proxy_address", "tun_device_name", "external-controller", "secret"}
-	var buf bytes.Buffer
-	for _, k := range keys {
-		if v, ok := configData[k]; ok { buf.WriteString(fmt.Sprintf("%s = %s\n", k, v)) }
-	}
-	configMu.Unlock()
-	_ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), buf.Bytes(), 0644)
+    configMu.Lock()
+    // 1. 变化检测：如果不动，则不写
+    if old, ok := configData[key]; ok && old == val && key != "" {
+        configMu.Unlock()
+        return
+    }
+    if key != "" {
+        configData[key] = val
+    }
+
+    // 2. 准备数据（在锁内快速完成或拷贝）
+    keys := []string{"mode", "tun_enabled", "system_proxy_enabled", "startup_enabled", "proxy_address", "tun_device_name", "external-controller", "secret"}
+    var buf bytes.Buffer
+    for _, k := range keys {
+        if v, ok := configData[k]; ok {
+            buf.WriteString(k + " = " + v + "\n") // 使用字符串拼接比 Sprintf 更快
+        }
+    }
+    configMu.Unlock() // 尽早释放锁，不要带着锁去写磁盘
+
+    // 3. 磁盘 IO（锁外执行）
+    _ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), buf.Bytes(), 0644)
 }
 
 func isTunInterfaceMatch(ifaceName string) bool {
