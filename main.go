@@ -452,9 +452,7 @@ func monitorKernelDaemon() {
 				if hJob != 0 {
 					hp, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
 					if err == nil {
-						err = windows.AssignProcessToJobObject(hJob, hp)
-						if err != nil {
-						}
+						_ = windows.AssignProcessToJobObject(hJob, hp)
 						_ = windows.CloseHandle(hp)
 					}
 				}
