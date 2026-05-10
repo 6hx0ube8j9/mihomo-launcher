@@ -19,7 +19,6 @@ import (
 	"time"
 	"unsafe"
 	
-    "github.com/pkg/browser"
 	"github.com/energye/systray"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
