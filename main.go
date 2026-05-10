@@ -19,7 +19,7 @@ import (
 	"time"
 	"unsafe"
 
-	"github.com/energye/systray"
+	"github.com/getlantern/systray"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
 )
@@ -290,123 +290,83 @@ func launchWebUI() {
     }
 }
 func onReady() {
-    saveIniConfig("startup_enabled", fmt.Sprint(checkAutoStartStatus()))
-    ensureDefaultConfig()
-    sniffAndSolidifyConfig()
-    setProxyRegistry(getIniConfig("system_proxy_enabled") == "true")
-    updateIconByState(StateStop)
+	saveIniConfig("startup_enabled", fmt.Sprint(checkAutoStartStatus()))
+	ensureDefaultConfig()
+	sniffAndSolidifyConfig()
+	setProxyRegistry(getIniConfig("system_proxy_enabled") == "true")
+	updateIconByState(StateStop)
 
-    // 1. 核心新增：左键直接点击托盘图标
-    systray.SetOnClick(func(menu systray.IMenu) {
-        go launchWebUI()
-    })
+	mWeb := systray.AddMenuItem("进入 Web 面板", "")
+	systray.AddSeparator()
 
-    // --- 以下为保持原有 select 逻辑的兼容处理 ---
-    
-    // 定义一个辅助函数，用来把 energye 的 OnAction 回调转回你的 select 通道
-    bindChan := func(item *systray.MenuItem) <-chan struct{} {
-        ch := make(chan struct{})
-        item.OnAction(func(menu systray.IMenu) {
-            ch <- struct{}{}
-        })
-        return ch
-    }
+	mProxy := systray.AddMenuItemCheckbox("系统代理", "", getIniConfig("system_proxy_enabled") == "true")
+	mTun = systray.AddMenuItemCheckbox("虚拟网卡 (TUN)", "", getIniConfig("tun_enabled") == "true")
+	systray.AddSeparator()
 
-    mWeb := systray.AddMenuItem("进入 Web 面板", "")
-    mWebChan := bindChan(mWeb) // 模拟原有的 ClickChan
-    
-    systray.AddSeparator()
+	mModeRoot := systray.AddMenuItem("模式切换", "")
+	curMode := getIniConfig("mode")
+	modeMenus := make(map[string]*systray.MenuItem)
+	modeMenus["rule"] = mModeRoot.AddSubMenuItemCheckbox("规则模式", "", curMode == "rule")
+	modeMenus["global"] = mModeRoot.AddSubMenuItemCheckbox("全局模式", "", curMode == "global")
+	modeMenus["direct"] = mModeRoot.AddSubMenuItemCheckbox("直连模式", "", curMode == "direct")
+	systray.AddSeparator()
 
-    mProxy := systray.AddMenuItemCheckbox("系统代理", "", getIniConfig("system_proxy_enabled") == "true")
-    mProxyChan := bindChan(mProxy)
+	mDir := systray.AddMenuItem("打开目录", "")
+	mMoreRoot := systray.AddMenuItem("更多", "")
+	mAuto := mMoreRoot.AddSubMenuItemCheckbox("开机自启动", "", checkAutoStartStatus())
+	mRestart := mMoreRoot.AddSubMenuItem("重启内核", "")
+	mReload := mMoreRoot.AddSubMenuItem("重载配置文件", "")
+	systray.AddSeparator()
 
-    mTun = systray.AddMenuItemCheckbox("虚拟网卡 (TUN)", "", getIniConfig("tun_enabled") == "true")
-    mTunChan := bindChan(mTun)
+	mExit := systray.AddMenuItem("关闭程序", "")
 
-    systray.AddSeparator()
-
-    mModeRoot := systray.AddMenuItem("模式切换", "")
-    curMode := getIniConfig("mode")
-    modeMenus := make(map[string]*systray.MenuItem)
-    modeChans := make(map[string]<-chan struct{})
-
-    modeMenus["rule"] = mModeRoot.AddSubMenuItemCheckbox("规则模式", "", curMode == "rule")
-    modeChans["rule"] = bindChan(modeMenus["rule"])
-
-    modeMenus["global"] = mModeRoot.AddSubMenuItemCheckbox("全局模式", "", curMode == "global")
-    modeChans["global"] = bindChan(modeMenus["global"])
-
-    modeMenus["direct"] = mModeRoot.AddSubMenuItemCheckbox("直连模式", "", curMode == "direct")
-    modeChans["direct"] = bindChan(modeMenus["direct"])
-
-    systray.AddSeparator()
-
-    mDir := systray.AddMenuItem("打开目录", "")
-    mDirChan := bindChan(mDir)
-
-    mMoreRoot := systray.AddMenuItem("更多", "")
-    mAuto := mMoreRoot.AddSubMenuItemCheckbox("开机自启动", "", checkAutoStartStatus())
-    mAutoChan := bindChan(mAuto)
-
-    mRestart := mMoreRoot.AddSubMenuItem("重启内核", "")
-    mRestartChan := bindChan(mRestart)
-
-    mReload := mMoreRoot.AddSubMenuItem("重载配置文件", "")
-    mReloadChan := bindChan(mReload)
-
-    systray.AddSeparator()
-
-    mExit := systray.AddMenuItem("关闭程序", "")
-    mExitChan := bindChan(mExit)
-
-    // --- 逻辑完全保留，只需将原来的 .ClickChan() 替换为我们绑定的管道变量 ---
-    for {
-        select {
-        case <-mWebChan:
+	for {
+		select {
+        case <-mWeb.ClickedCh:
             go launchWebUI()
-        case <-mReloadChan:
-            sniffAndSolidifyConfig()
-            reloadConfigFile()
-        case <-modeChans["rule"]:
-            setMihomoMode("rule")
-            modeMenus["rule"].Check()
-            modeMenus["global"].Uncheck()
-            modeMenus["direct"].Uncheck()
-        case <-modeChans["global"]:
-            setMihomoMode("global")
-            modeMenus["rule"].Uncheck()
-            modeMenus["global"].Check()
-            modeMenus["direct"].Uncheck()
-        case <-modeChans["direct"]:
-            setMihomoMode("direct")
-            modeMenus["rule"].Uncheck()
-            modeMenus["global"].Uncheck()
-            modeMenus["direct"].Check()
-        case <-mTunChan:
-            next := !mTun.Checked()
-            if next { mTun.Check() } else { mTun.Uncheck() }
-            go setTunMode(next)
-        case <-mProxyChan:
-            next := !mProxy.Checked()
-            saveIniConfig("system_proxy_enabled", fmt.Sprint(next))
-            setProxyRegistry(next)
-            if next { mProxy.Check() } else { mProxy.Uncheck() }
-        case <-mAutoChan:
-            next := !mAuto.Checked()
-            toggleAutoStart(next)
-            if next { mAuto.Check() } else { mAuto.Uncheck() }
-        case <-mDirChan:
-            windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
-        case <-mRestartChan:
-            isSystemInitializing = true
-            atomic.StoreInt32(&hasFirstSynced, 0)
-            KillProcessByName("mihomo.exe")
-        case <-mExitChan:
-            isReallyExiting = true
-            systray.Quit()
-            return
-        }
-    }
+		case <-mReload.ClickedCh:
+			sniffAndSolidifyConfig()
+			reloadConfigFile()
+		case <-modeMenus["rule"].ClickedCh:
+			setMihomoMode("rule")
+			modeMenus["rule"].Check()
+			modeMenus["global"].Uncheck()
+			modeMenus["direct"].Uncheck()
+		case <-modeMenus["global"].ClickedCh:
+			setMihomoMode("global")
+			modeMenus["rule"].Uncheck()
+			modeMenus["global"].Check()
+			modeMenus["direct"].Uncheck()
+		case <-modeMenus["direct"].ClickedCh:
+			setMihomoMode("direct")
+			modeMenus["rule"].Uncheck()
+			modeMenus["global"].Uncheck()
+			modeMenus["direct"].Check()
+		case <-mTun.ClickedCh:
+			next := !mTun.Checked()
+			if next { mTun.Check() } else { mTun.Uncheck() }
+			go setTunMode(next)
+		case <-mProxy.ClickedCh:
+			next := !mProxy.Checked()
+			saveIniConfig("system_proxy_enabled", fmt.Sprint(next))
+			setProxyRegistry(next)
+			if next { mProxy.Check() } else { mProxy.Uncheck() }
+		case <-mAuto.ClickedCh:
+			next := !mAuto.Checked()
+			toggleAutoStart(next)
+			if next { mAuto.Check() } else { mAuto.Uncheck() }
+		case <-mDir.ClickedCh:
+			windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
+		case <-mRestart.ClickedCh:
+			isSystemInitializing = true
+			atomic.StoreInt32(&hasFirstSynced, 0)
+			KillProcessByName("mihomo.exe")
+		case <-mExit.ClickedCh:
+			isReallyExiting = true
+			systray.Quit()
+			return
+		}
+	}
 }
 
 func onExit() {
