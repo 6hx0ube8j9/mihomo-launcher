@@ -21,6 +21,8 @@ jobs:
       - name: Install dependencies
         run: |
           if (!(Test-Path "go.mod")) { go mod init mihomo-launcher }
+          go get github.com/energye/systray@latest
+          go get github.com/pkg/browser@latest
           go mod tidy
 
       - name: Prepare Windows Resources
@@ -36,7 +38,7 @@ jobs:
         shell: pwsh
         run: |
           $env:CGO_ENABLED="1"
-          go build -ldflags("-s -w -H windowsgui") -o mihomo-launcher.exe .
+          go build -ldflags="-s -w -H=windowsgui" -o mihomo-launcher.exe .
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
