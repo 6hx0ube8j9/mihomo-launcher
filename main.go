@@ -290,76 +290,101 @@ func launchWebUI() {
     }
 }
 func onReady() {
-	saveIniConfig("startup_enabled", fmt.Sprint(checkAutoStartStatus()))
-	ensureDefaultConfig()
-	sniffAndSolidifyConfig()
-	setProxyRegistry(getIniConfig("system_proxy_enabled") == "true")
-	updateIconByState(StateStop)
+    saveIniConfig("startup_enabled", fmt.Sprint(checkAutoStartStatus()))
+    ensureDefaultConfig()
+    sniffAndSolidifyConfig()
+    setProxyRegistry(getIniConfig("system_proxy_enabled") == "true")
+    updateIconByState(StateStop)
+
+    // 1. 处理左键点击
     systray.SetOnClick(func(menu systray.IMenu) {
-	    go launchWebUI()
-	})	
-	mWeb := systray.AddMenuItem("进入 Web 面板", "")
-	systray.AddSeparator()
+        go launchWebUI()
+    })
 
-	mProxy := systray.AddMenuItemCheckbox("系统代理", "", getIniConfig("system_proxy_enabled") == "true")
-	mTun = systray.AddMenuItemCheckbox("虚拟网卡 (TUN)", "", getIniConfig("tun_enabled") == "true")
-	systray.AddSeparator()
+    // 2. 创建菜单并直接绑定点击事件
+    mWeb := systray.AddMenuItem("进入 Web 面板", "")
+    mWeb.OnAction(func(menu systray.IMenu) {
+        go launchWebUI()
+    })
 
-	mModeRoot := systray.AddMenuItem("模式切换", "")
-	curMode := getIniConfig("mode")
-	modeMenus := make(map[string]*systray.MenuItem)
-	modeMenus["rule"] = mModeRoot.AddSubMenuItemCheckbox("规则模式", "", curMode == "rule")
-	modeMenus["global"] = mModeRoot.AddSubMenuItemCheckbox("全局模式", "", curMode == "global")
-	modeMenus["direct"] = mModeRoot.AddSubMenuItemCheckbox("直连模式", "", curMode == "direct")
-	systray.AddSeparator()
+    systray.AddSeparator()
 
-	mDir := systray.AddMenuItem("打开目录", "")
-	mMoreRoot := systray.AddMenuItem("更多", "")
-	mAuto := mMoreRoot.AddSubMenuItemCheckbox("开机自启动", "", checkAutoStartStatus())
-	mRestart := mMoreRoot.AddSubMenuItem("重启内核", "")
-	mReload := mMoreRoot.AddSubMenuItem("重载配置文件", "")
-	systray.AddSeparator()
+    mProxy := systray.AddMenuItemCheckbox("系统代理", "", getIniConfig("system_proxy_enabled") == "true")
+    mProxy.OnAction(func(menu systray.IMenu) {
+        next := !mProxy.Checked()
+        saveIniConfig("system_proxy_enabled", fmt.Sprint(next))
+        setProxyRegistry(next)
+        if next { mProxy.Check() } else { mProxy.Uncheck() }
+    })
 
-	mExit := systray.AddMenuItem("关闭程序", "")
+    mTun = systray.AddMenuItemCheckbox("虚拟网卡 (TUN)", "", getIniConfig("tun_enabled") == "true")
+    mTun.OnAction(func(menu systray.IMenu) {
+        next := !mTun.Checked()
+        if next { mTun.Check() } else { mTun.Uncheck() }
+        go setTunMode(next)
+    })
 
-    for {
-        select {
-        // 使用 ClickedCh() 方法获取通道
-        case <-mWeb.ClickedCh():
-            go launchWebUI()
-        case <-mReload.ClickedCh():
-            sniffAndSolidifyConfig()
-            reloadConfigFile()
-        case <-modeMenus["rule"].ClickedCh():
-            setMihomoMode("rule")
-            modeMenus["rule"].Check()
-            modeMenus["global"].Uncheck()
-            modeMenus["direct"].Uncheck()
-        case <-mTun.ClickedCh():
-            next := !mTun.Checked()
-            if next { mTun.Check() } else { mTun.Uncheck() }
-            go setTunMode(next)
-        case <-mProxy.ClickedCh():
-            next := !mProxy.Checked()
-            saveIniConfig("system_proxy_enabled", fmt.Sprint(next))
-            setProxyRegistry(next)
-            if next { mProxy.Check() } else { mProxy.Uncheck() }
-        case <-mAuto.ClickedCh():
-            next := !mAuto.Checked()
-            toggleAutoStart(next)
-            if next { mAuto.Check() } else { mAuto.Uncheck() }
-        case <-mDir.ClickedCh():
-            windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
-        case <-mRestart.ClickedCh():
-            isSystemInitializing = true
-            atomic.StoreInt32(&hasFirstSynced, 0)
-            KillProcessByName("mihomo.exe")
-        case <-mExit.ClickedCh():
-            isReallyExiting = true
-            systray.Quit()
-            return
-        }
-    }
+    systray.AddSeparator()
+
+    // 模式切换
+    mModeRoot := systray.AddMenuItem("模式切换", "")
+    curMode := getIniConfig("mode")
+    
+    mRule := mModeRoot.AddSubMenuItemCheckbox("规则模式", "", curMode == "rule")
+    mGlobal := mModeRoot.AddSubMenuItemCheckbox("全局模式", "", curMode == "global")
+    mDirect := mModeRoot.AddSubMenuItemCheckbox("直连模式", "", curMode == "direct")
+
+    mRule.OnAction(func(menu systray.IMenu) {
+        setMihomoMode("rule")
+        mRule.Check(); mGlobal.Uncheck(); mDirect.Uncheck()
+    })
+    mGlobal.OnAction(func(menu systray.IMenu) {
+        setMihomoMode("global")
+        mRule.Uncheck(); mGlobal.Check(); mDirect.Uncheck()
+    })
+    mDirect.OnAction(func(menu systray.IMenu) {
+        setMihomoMode("direct")
+        mRule.Uncheck(); mGlobal.Uncheck(); mDirect.Check()
+    })
+
+    systray.AddSeparator()
+
+    mDir := systray.AddMenuItem("打开目录", "")
+    mDir.OnAction(func(menu systray.IMenu) {
+        windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
+    })
+
+    mMoreRoot := systray.AddMenuItem("更多", "")
+    mAuto := mMoreRoot.AddSubMenuItemCheckbox("开机自启动", "", checkAutoStartStatus())
+    mAuto.OnAction(func(menu systray.IMenu) {
+        next := !mAuto.Checked()
+        toggleAutoStart(next)
+        if next { mAuto.Check() } else { mAuto.Uncheck() }
+    })
+
+    mRestart := mMoreRoot.AddSubMenuItem("重启内核", "")
+    mRestart.OnAction(func(menu systray.IMenu) {
+        isSystemInitializing = true
+        atomic.StoreInt32(&hasFirstSynced, 0)
+        KillProcessByName("mihomo.exe")
+    })
+
+    mReload := mMoreRoot.AddSubMenuItem("重载配置文件", "")
+    mReload.OnAction(func(menu systray.IMenu) {
+        sniffAndSolidifyConfig()
+        reloadConfigFile()
+    })
+
+    systray.AddSeparator()
+
+    mExit := systray.AddMenuItem("关闭程序", "")
+    mExit.OnAction(func(menu systray.IMenu) {
+        isReallyExiting = true
+        systray.Quit()
+    })
+
+    // 注意：因为使用了 OnAction 回调，原来的 for { select {} } 循环不再需要了！
+    // 如果你怕程序退出，可以加一个空的 select{} 或者让主协程等待
 }
 
 func onExit() {
