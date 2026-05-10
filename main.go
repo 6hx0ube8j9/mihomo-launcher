@@ -57,15 +57,6 @@ var (
 	tunErrorCounter      = 0
 	mTun                 *systray.MenuItem
 	isKernelActive       int32
-
-	// --- 唤醒 UI 专用的原生 API 句柄 ---
-	modUser32                = windows.NewLazySystemDLL("user32.dll")
-	procSetForegroundWindow  = modUser32.NewProc("SetForegroundWindow")
-	procShowWindow           = modUser32.NewProc("ShowWindow")
-	procGetWindowThreadProcessId = modUser32.NewProc("GetWindowThreadProcessId")
-	procGetForegroundWindow  = modUser32.NewProc("GetForegroundWindow")
-	procAttachThreadInput    = modUser32.NewProc("AttachThreadInput")
-	procKeybdEvent           = modUser32.NewProc("keybd_event")
 )
 
 func main() {
@@ -126,19 +117,20 @@ func main() {
 	systray.Run(onReady, onExit)
 	onExit()
 }
-
 func launchWebUI() {
 	// 1. 基础配置获取
 	debugPort := "52719"
 	apiAddr := getIniConfig("external-controller")
 	secret := getIniConfig("secret")
 	proxyAddr := getIniConfig("proxy_address")
+	baseDir, _ := os.Getwd() // 确保 baseDir 有定义，通常为当前运行目录
 
-	// 2. 构造 URL
+	// 2. 稳健的 URL 构造
 	baseUI := strings.TrimRight(apiAddr, "/")
 	if !strings.HasPrefix(baseUI, "http") {
 		baseUI = "http://" + baseUI
 	}
+
 	cleanAddr := strings.TrimPrefix(strings.TrimPrefix(baseUI, "http://"), "https://")
 	host, port, err := net.SplitHostPort(cleanAddr)
 	if err != nil {
@@ -148,9 +140,12 @@ func launchWebUI() {
 			host, port = "127.0.0.1", "9090"
 		}
 	}
-	finalURL := fmt.Sprintf("%s/ui/?hostname=%s&port=%s&secret=%s#/proxies", baseUI, host, port, secret)
 
-	// 3. 探测与原生置顶逻辑
+	// 构造最终进入的 URL
+	finalURL := fmt.Sprintf("%s/ui/?hostname=%s&port=%s&secret=%s#/proxies",
+		baseUI, host, port, secret)
+
+	// 3. 探测与激活逻辑 (单实例检测 & 强行置顶)
 	fastClient := &http.Client{Timeout: 400 * time.Millisecond}
 	resp, err := fastClient.Get(fmt.Sprintf("http://127.0.0.1:%s/json", debugPort))
 	if err == nil {
@@ -160,83 +155,61 @@ func launchWebUI() {
 			for _, t := range targets {
 				pURL, _ := t["url"].(string)
 				pType, _ := t["type"].(string)
+				// 匹配正在运行的 UI 页面（包含 /ui/ 或 setup 字样）
 				if pType == "page" && (strings.Contains(pURL, "/ui/") || strings.Contains(pURL, "setup")) {
 					if id, ok := t["id"].(string); ok {
-						// 内部激活标签
+						// A. 内部激活：通知 Edge 切换到该标签页
 						_, _ = fastClient.Get(fmt.Sprintf("http://127.0.0.1:%s/json/activate/%s", debugPort, id))
-
-						// --- 修复后的 Win32 唤醒逻辑 ---
-						// 定义回调函数
-						enumCallback := func(hwnd windows.Handle, lparam uintptr) uintptr {
-							var processId uint32
-							procGetWindowThreadProcessId.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&processId)))
-
-							// 使用 procGetWindowTextW 获取标题 (修复 undefined: windows.GetWindowText)
-							var title [256]uint16
-							procGetWindowTextW.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&title[0])), uintptr(len(title)))
-							tStr := windows.UTF16ToString(title[:])
-
-							if strings.Contains(tStr, "Edge") || strings.Contains(tStr, "Dashboard") {
-								currThread := windows.GetCurrentThreadId()
-								
-								// 修复多返回值处理 (multiple-value Call() in single-value context)
-								fgWindow, _, _ := procGetForegroundWindow.Call()
-								foreThread, _, _ := procGetWindowThreadProcessId.Call(fgWindow, 0)
-
-								if currThread != uint32(foreThread) {
-									procAttachThreadInput.Call(uintptr(currThread), foreThread, 1)
-									procKeybdEvent.Call(0x12, 0, 0, 0)
-									procKeybdEvent.Call(0x12, 0, 2, 0)
-									procShowWindow.Call(uintptr(hwnd), 9)
-									procSetForegroundWindow.Call(uintptr(hwnd))
-									procAttachThreadInput.Call(uintptr(currThread), foreThread, 0)
-								} else {
-									procShowWindow.Call(uintptr(hwnd), 9)
-									procSetForegroundWindow.Call(uintptr(hwnd))
-								}
-								return 0 // 停止遍历
-							}
-							return 1 // 继续遍历
-						}
-
-						// 修复 EnumWindows 参数问题 (使用 windows.NewCallback)
-						windows.EnumWindows(windows.NewCallback(enumCallback), 0)
-						return
+						
+						// B. 外部强推：使用 PowerShell 强制将窗口推到最前
+						// 这里的 "msedge" 是通用进程名，如果想更精确，可以换成你网页的 Title 关键词
+						psCmd := `$wshell = New-Object -ComObject WScript.Shell; $wshell.AppActivate("msedge")`
+						_ = exec.Command("powershell", "-Command", psCmd).Run()
+						
+						return // 成功唤醒，直接返回，不再执行启动逻辑
 					}
 				}
 			}
 		}
 	}
 
-	// 4. 定位 Edge 路径并启动 (保持不变)
-	launchNewEdge(finalURL, debugPort, proxyAddr)
-}
-
-// 提取一个辅助函数让 launchWebUI 干净点
-func launchNewEdge(finalURL, debugPort, proxyAddr string) {
+	// 4. 定位 Edge 路径
 	var edgePath string
-	checkPaths := []string{
+	potentialPaths := []string{
 		`C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`,
 		`C:\Program Files\Microsoft\Edge\Application\msedge.exe`,
+		os.Getenv("ProgramFiles(x86)") + `\Microsoft\Edge\Application\msedge.exe`,
+		os.Getenv("ProgramFiles") + `\Microsoft\Edge\Application\msedge.exe`,
 	}
-	for _, p := range checkPaths {
+	for _, p := range potentialPaths {
 		if _, err := os.Stat(p); err == nil {
 			edgePath = p
 			break
 		}
 	}
 
+	// 5. 启动逻辑
 	userDataDir := filepath.Join(baseDir, "EdgeAppCache")
+
 	if edgePath != "" {
+		// 【方案 A】检测到 Edge: 启动独立 App 模式
 		_ = os.MkdirAll(userDataDir, 0755)
 		args := []string{
 			"--app=" + finalURL,
 			"--remote-debugging-port=" + debugPort,
 			"--user-data-dir=" + userDataDir,
+			"--window-size=1280,768",
 			"--proxy-server=" + proxyAddr,
+			"--no-first-run",
+			"--no-default-browser-check",
 		}
-		_ = exec.Command(edgePath, args...).Start()
+		cmd := exec.Command(edgePath, args...)
+		if err := cmd.Start(); err != nil {
+			// 如果启动失败，退回到默认浏览器
+			_ = exec.Command("cmd", "/c", "start", "", finalURL).Start()
+		}
 	} else {
+		// 【方案 B】未找到 Edge: 直接用系统默认浏览器打开
 		_ = exec.Command("cmd", "/c", "start", "", finalURL).Start()
 	}
 }
