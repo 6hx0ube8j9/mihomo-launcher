@@ -296,95 +296,117 @@ func onReady() {
     setProxyRegistry(getIniConfig("system_proxy_enabled") == "true")
     updateIconByState(StateStop)
 
-    // 1. 处理左键点击
+    // 1. 核心新增：左键直接点击托盘图标
     systray.SetOnClick(func(menu systray.IMenu) {
         go launchWebUI()
     })
 
-    // 2. 创建菜单并直接绑定点击事件
-    mWeb := systray.AddMenuItem("进入 Web 面板", "")
-    mWeb.OnAction(func(menu systray.IMenu) {
-        go launchWebUI()
-    })
+    // --- 以下为保持原有 select 逻辑的兼容处理 ---
+    
+    // 定义一个辅助函数，用来把 energye 的 OnAction 回调转回你的 select 通道
+    bindChan := func(item *systray.MenuItem) <-chan struct{} {
+        ch := make(chan struct{})
+        item.OnAction(func(menu systray.IMenu) {
+            ch <- struct{}{}
+        })
+        return ch
+    }
 
+    mWeb := systray.AddMenuItem("进入 Web 面板", "")
+    mWebChan := bindChan(mWeb) // 模拟原有的 ClickChan
+    
     systray.AddSeparator()
 
     mProxy := systray.AddMenuItemCheckbox("系统代理", "", getIniConfig("system_proxy_enabled") == "true")
-    mProxy.OnAction(func(menu systray.IMenu) {
-        next := !mProxy.Checked()
-        saveIniConfig("system_proxy_enabled", fmt.Sprint(next))
-        setProxyRegistry(next)
-        if next { mProxy.Check() } else { mProxy.Uncheck() }
-    })
+    mProxyChan := bindChan(mProxy)
 
     mTun = systray.AddMenuItemCheckbox("虚拟网卡 (TUN)", "", getIniConfig("tun_enabled") == "true")
-    mTun.OnAction(func(menu systray.IMenu) {
-        next := !mTun.Checked()
-        if next { mTun.Check() } else { mTun.Uncheck() }
-        go setTunMode(next)
-    })
+    mTunChan := bindChan(mTun)
 
     systray.AddSeparator()
 
-    // 模式切换
     mModeRoot := systray.AddMenuItem("模式切换", "")
     curMode := getIniConfig("mode")
-    
-    mRule := mModeRoot.AddSubMenuItemCheckbox("规则模式", "", curMode == "rule")
-    mGlobal := mModeRoot.AddSubMenuItemCheckbox("全局模式", "", curMode == "global")
-    mDirect := mModeRoot.AddSubMenuItemCheckbox("直连模式", "", curMode == "direct")
+    modeMenus := make(map[string]*systray.MenuItem)
+    modeChans := make(map[string]<-chan struct{})
 
-    mRule.OnAction(func(menu systray.IMenu) {
-        setMihomoMode("rule")
-        mRule.Check(); mGlobal.Uncheck(); mDirect.Uncheck()
-    })
-    mGlobal.OnAction(func(menu systray.IMenu) {
-        setMihomoMode("global")
-        mRule.Uncheck(); mGlobal.Check(); mDirect.Uncheck()
-    })
-    mDirect.OnAction(func(menu systray.IMenu) {
-        setMihomoMode("direct")
-        mRule.Uncheck(); mGlobal.Uncheck(); mDirect.Check()
-    })
+    modeMenus["rule"] = mModeRoot.AddSubMenuItemCheckbox("规则模式", "", curMode == "rule")
+    modeChans["rule"] = bindChan(modeMenus["rule"])
+
+    modeMenus["global"] = mModeRoot.AddSubMenuItemCheckbox("全局模式", "", curMode == "global")
+    modeChans["global"] = bindChan(modeMenus["global"])
+
+    modeMenus["direct"] = mModeRoot.AddSubMenuItemCheckbox("直连模式", "", curMode == "direct")
+    modeChans["direct"] = bindChan(modeMenus["direct"])
 
     systray.AddSeparator()
 
     mDir := systray.AddMenuItem("打开目录", "")
-    mDir.OnAction(func(menu systray.IMenu) {
-        windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
-    })
+    mDirChan := bindChan(mDir)
 
     mMoreRoot := systray.AddMenuItem("更多", "")
     mAuto := mMoreRoot.AddSubMenuItemCheckbox("开机自启动", "", checkAutoStartStatus())
-    mAuto.OnAction(func(menu systray.IMenu) {
-        next := !mAuto.Checked()
-        toggleAutoStart(next)
-        if next { mAuto.Check() } else { mAuto.Uncheck() }
-    })
+    mAutoChan := bindChan(mAuto)
 
     mRestart := mMoreRoot.AddSubMenuItem("重启内核", "")
-    mRestart.OnAction(func(menu systray.IMenu) {
-        isSystemInitializing = true
-        atomic.StoreInt32(&hasFirstSynced, 0)
-        KillProcessByName("mihomo.exe")
-    })
+    mRestartChan := bindChan(mRestart)
 
     mReload := mMoreRoot.AddSubMenuItem("重载配置文件", "")
-    mReload.OnAction(func(menu systray.IMenu) {
-        sniffAndSolidifyConfig()
-        reloadConfigFile()
-    })
+    mReloadChan := bindChan(mReload)
 
     systray.AddSeparator()
 
     mExit := systray.AddMenuItem("关闭程序", "")
-    mExit.OnAction(func(menu systray.IMenu) {
-        isReallyExiting = true
-        systray.Quit()
-    })
+    mExitChan := bindChan(mExit)
 
-    // 注意：因为使用了 OnAction 回调，原来的 for { select {} } 循环不再需要了！
-    // 如果你怕程序退出，可以加一个空的 select{} 或者让主协程等待
+    // --- 逻辑完全保留，只需将原来的 .ClickChan() 替换为我们绑定的管道变量 ---
+    for {
+        select {
+        case <-mWebChan:
+            go launchWebUI()
+        case <-mReloadChan:
+            sniffAndSolidifyConfig()
+            reloadConfigFile()
+        case <-modeChans["rule"]:
+            setMihomoMode("rule")
+            modeMenus["rule"].Check()
+            modeMenus["global"].Uncheck()
+            modeMenus["direct"].Uncheck()
+        case <-modeChans["global"]:
+            setMihomoMode("global")
+            modeMenus["rule"].Uncheck()
+            modeMenus["global"].Check()
+            modeMenus["direct"].Uncheck()
+        case <-modeChans["direct"]:
+            setMihomoMode("direct")
+            modeMenus["rule"].Uncheck()
+            modeMenus["global"].Uncheck()
+            modeMenus["direct"].Check()
+        case <-mTunChan:
+            next := !mTun.Checked()
+            if next { mTun.Check() } else { mTun.Uncheck() }
+            go setTunMode(next)
+        case <-mProxyChan:
+            next := !mProxy.Checked()
+            saveIniConfig("system_proxy_enabled", fmt.Sprint(next))
+            setProxyRegistry(next)
+            if next { mProxy.Check() } else { mProxy.Uncheck() }
+        case <-mAutoChan:
+            next := !mAuto.Checked()
+            toggleAutoStart(next)
+            if next { mAuto.Check() } else { mAuto.Uncheck() }
+        case <-mDirChan:
+            windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
+        case <-mRestartChan:
+            isSystemInitializing = true
+            atomic.StoreInt32(&hasFirstSynced, 0)
+            KillProcessByName("mihomo.exe")
+        case <-mExitChan:
+            isReallyExiting = true
+            systray.Quit()
+            return
+        }
+    }
 }
 
 func onExit() {
