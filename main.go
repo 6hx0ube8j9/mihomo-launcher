@@ -133,7 +133,7 @@ func launchWebUI() {
 	apiAddr := getIniConfig("external-controller")
 	secret := getIniConfig("secret")
 	proxyAddr := getIniConfig("proxy_address")
-	
+
 	// 2. 构造 URL
 	baseUI := strings.TrimRight(apiAddr, "/")
 	if !strings.HasPrefix(baseUI, "http") {
@@ -150,7 +150,7 @@ func launchWebUI() {
 	}
 	finalURL := fmt.Sprintf("%s/ui/?hostname=%s&port=%s&secret=%s#/proxies", baseUI, host, port, secret)
 
-	// 3. 探测与原生置顶逻辑 (直接使用全局 var 中的 proc 句柄)
+	// 3. 探测与原生置顶逻辑
 	fastClient := &http.Client{Timeout: 400 * time.Millisecond}
 	resp, err := fastClient.Get(fmt.Sprintf("http://127.0.0.1:%s/json", debugPort))
 	if err == nil {
@@ -162,63 +162,70 @@ func launchWebUI() {
 				pType, _ := t["type"].(string)
 				if pType == "page" && (strings.Contains(pURL, "/ui/") || strings.Contains(pURL, "setup")) {
 					if id, ok := t["id"].(string); ok {
-						// A. 让 Edge 切换到该标签
+						// 内部激活标签
 						_, _ = fastClient.Get(fmt.Sprintf("http://127.0.0.1:%s/json/activate/%s", debugPort, id))
 
-						// B. 使用全局 Win32 句柄强推窗口
-						windows.EnumWindows(func(hwnd windows.Handle, lparam uintptr) bool {
+						// --- 修复后的 Win32 唤醒逻辑 ---
+						// 定义回调函数
+						enumCallback := func(hwnd windows.Handle, lparam uintptr) uintptr {
 							var processId uint32
 							procGetWindowThreadProcessId.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&processId)))
 
+							// 使用 procGetWindowTextW 获取标题 (修复 undefined: windows.GetWindowText)
 							var title [256]uint16
-							windows.GetWindowText(hwnd, &title[0], int32(len(title)))
+							procGetWindowTextW.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&title[0])), uintptr(len(title)))
 							tStr := windows.UTF16ToString(title[:])
 
-							// 匹配包含 Dashboard 或 Edge 的窗口标题
 							if strings.Contains(tStr, "Edge") || strings.Contains(tStr, "Dashboard") {
 								currThread := windows.GetCurrentThreadId()
-								foreThread, _, _ := procGetWindowThreadProcessId.Call(uintptr(procGetForegroundWindow.Call()[0]), 0)
+								
+								// 修复多返回值处理 (multiple-value Call() in single-value context)
+								fgWindow, _, _ := procGetForegroundWindow.Call()
+								foreThread, _, _ := procGetWindowThreadProcessId.Call(fgWindow, 0)
 
 								if currThread != uint32(foreThread) {
-									// 挂载线程输入
-									procAttachThreadInput.Call(uintptr(currThread), uintptr(foreThread), 1)
-									
-									// 模拟 ALT 键触发 (关键步骤：绕过焦点锁定)
-									procKeybdEvent.Call(0x12, 0, 0, 0) // Alt Down
-									procKeybdEvent.Call(0x12, 0, 2, 0) // Alt Up
-									
-									procShowWindow.Call(uintptr(hwnd), 9) // SW_RESTORE
+									procAttachThreadInput.Call(uintptr(currThread), foreThread, 1)
+									procKeybdEvent.Call(0x12, 0, 0, 0)
+									procKeybdEvent.Call(0x12, 0, 2, 0)
+									procShowWindow.Call(uintptr(hwnd), 9)
 									procSetForegroundWindow.Call(uintptr(hwnd))
-									
-									procAttachThreadInput.Call(uintptr(currThread), uintptr(foreThread), 0)
+									procAttachThreadInput.Call(uintptr(currThread), foreThread, 0)
+								} else {
+									procShowWindow.Call(uintptr(hwnd), 9)
+									procSetForegroundWindow.Call(uintptr(hwnd))
 								}
-								return false 
+								return 0 // 停止遍历
 							}
-							return true
-						}, 0)
-						return 
+							return 1 // 继续遍历
+						}
+
+						// 修复 EnumWindows 参数问题 (使用 windows.NewCallback)
+						windows.EnumWindows(windows.NewCallback(enumCallback), 0)
+						return
 					}
 				}
 			}
 		}
 	}
 
-	// 4. 定位 Edge 路径
+	// 4. 定位 Edge 路径并启动 (保持不变)
+	launchNewEdge(finalURL, debugPort, proxyAddr)
+}
+
+// 提取一个辅助函数让 launchWebUI 干净点
+func launchNewEdge(finalURL, debugPort, proxyAddr string) {
 	var edgePath string
-	potentialPaths := []string{
+	checkPaths := []string{
 		`C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`,
 		`C:\Program Files\Microsoft\Edge\Application\msedge.exe`,
-		os.Getenv("ProgramFiles(x86)") + `\Microsoft\Edge\Application\msedge.exe`,
-		os.Getenv("ProgramFiles") + `\Microsoft\Edge\Application\msedge.exe`,
 	}
-	for _, p := range potentialPaths {
+	for _, p := range checkPaths {
 		if _, err := os.Stat(p); err == nil {
 			edgePath = p
 			break
 		}
 	}
 
-	// 5. 启动逻辑
 	userDataDir := filepath.Join(baseDir, "EdgeAppCache")
 	if edgePath != "" {
 		_ = os.MkdirAll(userDataDir, 0755)
@@ -226,15 +233,9 @@ func launchWebUI() {
 			"--app=" + finalURL,
 			"--remote-debugging-port=" + debugPort,
 			"--user-data-dir=" + userDataDir,
-			"--window-size=1280,768",
 			"--proxy-server=" + proxyAddr,
-			"--no-first-run",
-			"--no-default-browser-check",
 		}
-		cmd := exec.Command(edgePath, args...)
-		if err := cmd.Start(); err != nil {
-			_ = exec.Command("cmd", "/c", "start", "", finalURL).Start()
-		}
+		_ = exec.Command(edgePath, args...).Start()
 	} else {
 		_ = exec.Command("cmd", "/c", "start", "", finalURL).Start()
 	}
