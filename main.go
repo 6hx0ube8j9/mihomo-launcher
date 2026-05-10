@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"sync/atomic"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -50,6 +51,7 @@ var (
 	isSyncing            int32
 	isReallyExiting      bool
 	hasFirstSynced       int32
+	globalOpID           int32
 	exitOnce             sync.Once
 	configMu             sync.RWMutex
 	configData           = make(map[string]string)
