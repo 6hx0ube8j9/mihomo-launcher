@@ -468,49 +468,43 @@ func monitorKernelDaemon() {
 }
 
 func monitorIconState() {
-	var apiFailCount int // 连续失败计数器
-	
-	for {
-		if isReallyExiting { return }
-		
-		// 1. 物理层判定：进程在吗？
-		isRunning := isProcessRunning("mihomo.exe")
-		
-		if !isRunning {
-			// 进程没了，这是真正的“归宿”，重置计数器，立即显示 STOP
-			apiFailCount = 0
-			if lastState != StateStop {
-				updateIconByState(StateStop)
-				lastState = StateStop
-			}
-		} else {
-			// 2. 逻辑层判定：API 和网卡状态
-			curr := checkSystemState()
-			
-			if curr == StateStop {
-				// 说明 API 暂时连不上或者 TUN 网卡还没出来
-				apiFailCount++
-				
-				// 阈值设为 4：如果巡检是 1秒/次，那么它会允许 4秒 的“真空期”
-				// 在这 4秒 内，图标维持原状 (lastState)，完全跳过灰色闪烁
-				if apiFailCount > 4 {
-					// 超过 4次 还是连不上，说明内核可能僵死了，显示 ERROR 而不是 STOP
-					if lastState != StateError {
-						updateIconByState(StateError)
-						lastState = StateError
-					}
-				}
-			} else {
-				// 只要有一次成功，计数器立即归零
-				apiFailCount = 0
-				if curr != lastState {
-					updateIconByState(curr)
-					lastState = curr
-				}
-			}
-		}
-		time.Sleep(1 * time.Second)
-	}
+    var failCount int 
+    
+    for {
+        if isReallyExiting { return }
+        
+        isRunning := isProcessRunning("mihomo.exe")
+        
+        if !isRunning {
+            failCount = 0
+            if lastState != StateStop {
+                updateIconByState(StateStop)
+                lastState = StateStop
+            }
+        } else {
+            curr := checkSystemState()
+            
+            if curr == StateStop {
+                // checkSystemState 连不上 API，发出异常信号
+                failCount++
+                
+                if failCount > 5 {
+                    if lastState != StateError {
+                        updateIconByState(StateError)
+                        lastState = StateError
+                    }
+                } else {
+                }
+            } else {
+                failCount = 0 // 只要通一次，计数器立即重置
+                if curr != lastState {
+                    updateIconByState(curr)
+                    lastState = curr
+                }
+            }
+        }
+        time.Sleep(1 * time.Second)
+    }
 }
 
 func watchTunState() {
