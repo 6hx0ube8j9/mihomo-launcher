@@ -1007,27 +1007,20 @@ func isTunInterfaceMatch(ifaceName string) bool {
 }
 
 func initJobObject() {
-    h, err := windows.CreateJobObject(nil, nil)
-    if err != nil {
-        return
-    }
-    
-    // 设置：当 Job Object 句柄关闭时，自动杀掉所有关联进程
-    info := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{
-        BasicLimitInformation: windows.JOBOBJECT_BASIC_LIMIT_INFORMATION{
-            LimitFlags: windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
-        },
-    }
-    
-    _, err = windows.SetInformationJobObject(
-        h,
-        windows.JobObjectExtendedLimitInformation,
-        uintptr(unsafe.Pointer(&info)),
-        uint32(unsafe.Sizeof(info)),
-    )
-    if err != nil {
-        windows.CloseHandle(h)
-        return
-    }
-    hJob = h
+	h, err := windows.CreateJobObject(nil, nil)
+	if err != nil {
+		return
+	}
+	info := windows.JOBOBJECT_EXTENDED_LIMIT_INFORMATION{
+		BasicLimitInformation: windows.JOBOBJECT_BASIC_LIMIT_INFORMATION{
+			LimitFlags: windows.JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+		},
+	}
+	_, _, _ = k32.NewProc("SetInformationJobObject").Call(
+		uintptr(h),
+		9, // JobObjectExtendedLimitInformation
+		uintptr(unsafe.Pointer(&info)),
+		uintptr(uint32(unsafe.Sizeof(info))),
+	)
+	hJob = h
 }
