@@ -322,7 +322,7 @@ func onReady() {
 
 	for {
 		select {
-		case <-systray.ClickedCh:
+		case <-systray.GetWindowIconClickedChan():
 		    go launchWebUI()
         case <-mWeb.ClickedCh:
             go launchWebUI()
