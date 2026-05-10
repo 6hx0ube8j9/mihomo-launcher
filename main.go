@@ -468,17 +468,46 @@ func monitorKernelDaemon() {
 }
 
 func monitorIconState() {
+	var apiFailCount int // 连续失败计数器
+	
 	for {
 		if isReallyExiting { return }
-		var curr int
-		if !isProcessRunning("mihomo.exe") {
-			curr = StateStop
+		
+		// 1. 物理层判定：进程在吗？
+		isRunning := isProcessRunning("mihomo.exe")
+		
+		if !isRunning {
+			// 进程没了，这是真正的“归宿”，重置计数器，立即显示 STOP
+			apiFailCount = 0
+			if lastState != StateStop {
+				updateIconByState(StateStop)
+				lastState = StateStop
+			}
 		} else {
-			curr = checkSystemState()
-		}
-		if curr != lastState {
-			updateIconByState(curr)
-			lastState = curr
+			// 2. 逻辑层判定：API 和网卡状态
+			curr := checkSystemState()
+			
+			if curr == StateStop {
+				// 说明 API 暂时连不上或者 TUN 网卡还没出来
+				apiFailCount++
+				
+				// 阈值设为 4：如果巡检是 1秒/次，那么它会允许 4秒 的“真空期”
+				// 在这 4秒 内，图标维持原状 (lastState)，完全跳过灰色闪烁
+				if apiFailCount > 4 {
+					// 超过 4次 还是连不上，说明内核可能僵死了，显示 ERROR 而不是 STOP
+					if lastState != StateError {
+						updateIconByState(StateError)
+						lastState = StateError
+					}
+				}
+			} else {
+				// 只要有一次成功，计数器立即归零
+				apiFailCount = 0
+				if curr != lastState {
+					updateIconByState(curr)
+					lastState = curr
+				}
+			}
 		}
 		time.Sleep(1 * time.Second)
 	}
@@ -834,55 +863,46 @@ func reloadConfigFile() {
 }
 
 func checkSystemState() int {
-	// 1. 尝试连接内核 API
-	// 传入空 path 会触发 doAPIRequest 内部的 io.Discard 优化，不产生内存开销
-	_, err := doAPIRequest("GET", "", nil) 
-	if err != nil {
-		tunErrorCounter = 0
-		return StateStop // 连不上 API，内核可能在重启或已崩溃
-	}
+    // 1. 尝试连接内核 API
+    _, err := doAPIRequest("GET", "", nil) 
+    if err != nil {
+        return StateStop // 发出信号：API 暂时不可用
+    }
 
-	// 2. API 连接成功，确保初始化标志被重置
-	if isSystemInitializing {
-		isSystemInitializing = false
-	}
+    // 2. API 成功，重置逻辑锁
+    if isSystemInitializing {
+        isSystemInitializing = false
+    }
 
-	// 3. 核心修复：首次启动/重启内核后的第一次配置同步
-	// 使用 CompareAndSwap 保证全局只触发一次同步，且不会因为 onceSync 导致并发隐患
-	if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
-		go syncConfigToKernel()
-	}
+    // 3. 首次同步逻辑 (保持不变)
+    if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
+        go syncConfigToKernel()
+    }
 
-	// 4. 检查网卡/代理状态
-	if getIniConfig("tun_enabled") == "true" {
-		hasTun := false
-		ifaces, _ := net.Interfaces()
-		for _, i := range ifaces {
-			if isTunInterfaceMatch(i.Name) {
-				hasTun = true
-				break
-			}
-		}
+    // 4. 检查网卡
+    if getIniConfig("tun_enabled") == "true" {
+        hasTun := false
+        ifaces, _ := net.Interfaces()
+        for _, i := range ifaces {
+            if isTunInterfaceMatch(i.Name) {
+                hasTun = true
+                break
+            }
+        }
+        if hasTun {
+            return StateTun
+        }
+        
+        // 网卡还没出来时，我们也返回 StateStop 信号，交给外面的计数器去“等”
+        return StateStop 
+    }
 
-		if hasTun {
-			tunErrorCounter = 0
-			return StateTun // 正常：TUN 已开启且网卡存在
-		}
+    // 5. 检查系统代理
+    if getIniConfig("system_proxy_enabled") == "true" {
+        return StateProxy
+    }
 
-		// 容错缓冲：防止内核启动 TUN 时网卡创建太慢导致图标闪烁
-		tunErrorCounter++
-		if tunErrorCounter > 8 { 
-			return StateError // 超过 8 秒还没看到网卡，确实出错了
-		}
-		return StateStop // 缓冲中
-	}
-
-	// 5. 检查系统代理状态
-	if getIniConfig("system_proxy_enabled") == "true" {
-		return StateProxy
-	}
-
-	return StateDefault
+    return StateDefault
 }
 
 func isAdmin() bool {
