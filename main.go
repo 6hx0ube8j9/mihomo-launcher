@@ -468,43 +468,45 @@ func monitorKernelDaemon() {
 }
 
 func monitorIconState() {
-    var failCount int 
-    
-    for {
-        if isReallyExiting { return }
-        
-        isRunning := isProcessRunning("mihomo.exe")
-        
-        if !isRunning {
-            failCount = 0
-            if lastState != StateStop {
-                updateIconByState(StateStop)
-                lastState = StateStop
-            }
-        } else {
-            curr := checkSystemState()
-            
-            if curr == StateStop {
-                // checkSystemState 连不上 API，发出异常信号
-                failCount++
-                
-                if failCount > 5 {
-                    if lastState != StateError {
-                        updateIconByState(StateError)
-                        lastState = StateError
-                    }
-                } else {
-                }
-            } else {
-                failCount = 0 // 只要通一次，计数器立即重置
-                if curr != lastState {
-                    updateIconByState(curr)
-                    lastState = curr
-                }
-            }
-        }
-        time.Sleep(1 * time.Second)
-    }
+	var failCount int // 局部变量，用于记录连续失败次数
+
+	for {
+		if isReallyExiting { return }
+
+		// 1. 物理层判定：进程不在，直接灰色
+		if !isProcessRunning("mihomo.exe") {
+			failCount = 0
+			if lastState != StateStop {
+				updateIconByState(StateStop)
+				lastState = StateStop
+			}
+		} else {
+			// 2. 进程在，检查 API 信号
+			curr := checkSystemState()
+
+			if curr == StateStop { // checkSystemState 连不上 API 时返回 Stop
+				failCount++
+				// 连续失败 5 次以上（约 5 秒），判定为内核假死或异常
+				if failCount > 5 {
+					if lastState != StateError {
+						updateIconByState(StateError) // 显示错误/警告图标
+						lastState = StateError
+					}
+				}
+				// 5 次以内，我们保持图标现状（lastState），不乱闪烁
+			} else {
+				// API 正常，立即重置计数器
+				failCount = 0
+				// 只有状态真正发生变化时，才刷新 UI
+				if curr != lastState {
+					updateIconByState(curr)
+					lastState = curr
+				}
+			}
+		}
+		
+		time.Sleep(1 * time.Second)
+	}
 }
 
 func watchTunState() {
@@ -796,11 +798,58 @@ func setMihomoMode(mode string) {
 }
 
 func setTunMode(enable bool) {
+	// 1. 每次进入函数，流水号自增。newID 是本次操作的唯一身份证
+	newID := atomic.AddInt32(&globalOpID, 1)
+
+	// 2. 锁定 UI 状态，进入初始化保护模式
 	isSystemInitializing = true
 	saveIniConfig("tun_enabled", fmt.Sprint(enable))
-	_, _ = doAPIRequest("PATCH", "/configs", map[string]interface{}{"tun": map[string]bool{"enable": enable}})
-	time.Sleep(3 * time.Second)
-	isSystemInitializing = false
+
+	// 3. 异步处理：发送请求并盯着网卡状态
+	go func(opID int32) {
+		// A. 发送 API 请求给内核
+		_, err := doAPIRequest("PATCH", "/configs", map[string]interface{}{
+			"tun": map[string]bool{"enable": enable},
+		})
+
+		// 如果 API 报错，没必要探测了，直接尝试释放锁并退出
+		if err != nil {
+			if atomic.LoadInt32(&globalOpID) == opID {
+				isSystemInitializing = false
+			}
+			return
+		}
+
+		// B. 高频探测逻辑：每 200ms 检查一次网卡，最高检查 3 秒
+		for i := 0; i < 15; i++ {
+			// 【关键】每一轮都检查身份证：如果由于连续点击 ID 变了，本协程立刻退出
+			if atomic.LoadInt32(&globalOpID) != opID {
+				return
+			}
+
+			// 定义内部快速检查：开启时等网卡现身，关闭时等网卡消失
+			found := false
+			ifaces, _ := net.Interfaces()
+			for _, iface := range ifaces {
+				if isTunInterfaceMatch(iface.Name) { // 调用你原有的网卡名匹配函数
+					found = true
+					break
+				}
+			}
+
+			// 如果当前网卡状态 符合 我们的期望值(enable)，说明内核已准备好
+			if found == enable {
+				break
+			}
+
+			time.Sleep(200 * time.Millisecond)
+		}
+
+		// C. 只有最后一次操作对应的协程，才有资格释放全局初始化锁
+		if atomic.LoadInt32(&globalOpID) == opID {
+			isSystemInitializing = false
+		}
+	}(newID)
 }
 
 func setProxyRegistry(enable bool) {
