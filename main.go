@@ -41,33 +41,24 @@ const (
 )
 
 var (
-    hJob                 windows.Handle
-    user32               = windows.NewLazySystemDLL("user32.dll")
-    procSetWindowPos     = user32.NewProc("SetWindowPos")
-    procFindWindow       = user32.NewProc("FindWindowW")
-    hMutex               windows.Handle
-    httpClient           = &http.Client{Timeout: 1 * time.Second}
-    exePath, _           = os.Executable()
-    baseDir              = filepath.Dir(exePath)
-    isSystemInitializing = true
-    isSyncing            int32
-    isReallyExiting      bool
-    hasFirstSynced       int32
-    exitOnce             sync.Once
-    configMu             sync.RWMutex
-    configData           = make(map[string]string)
-    lastState            = -1
-    tunErrorCounter      = 0
-    mTun                 *systray.MenuItem
-    isKernelActive       int32
+	hJob                 windows.Handle
+	hMutex               windows.Handle
+	httpClient           = &http.Client{Timeout: 1 * time.Second}
+	exePath, _           = os.Executable()
+	baseDir              = filepath.Dir(exePath)
+	isSystemInitializing = true
+	isSyncing            int32
+	isReallyExiting      bool
+	hasFirstSynced       int32
+	exitOnce             sync.Once
+	configMu             sync.RWMutex
+	configData           = make(map[string]string)
+	lastState            = -1
+	tunErrorCounter      = 0
+	mTun                 *systray.MenuItem
+	isKernelActive       int32
 )
 
-const (
-    HWND_TOPMOST   = ^uintptr(0) // -1，强力置顶
-    SWP_NOSIZE     = 0x0001      // 保持原有窗口大小
-    SWP_NOMOVE     = 0x0002      // 保持原有窗口位置
-    SWP_SHOWWINDOW = 0x0040      // 强制显示窗口
-)
 func main() {
 	var err error
 	exePath, err = os.Executable()
@@ -132,7 +123,6 @@ func launchWebUI() {
 	apiAddr := getIniConfig("external-controller")
 	secret := getIniConfig("secret")
 	proxyAddr := getIniConfig("proxy_address")
-	baseDir, _ := os.Getwd() // 确保 baseDir 有定义，通常为当前运行目录
 
 	// 2. 稳健的 URL 构造
 	baseUI := strings.TrimRight(apiAddr, "/")
@@ -150,66 +140,34 @@ func launchWebUI() {
 		}
 	}
 
-	// 构造最终进入的 URL
 	finalURL := fmt.Sprintf("%s/ui/?hostname=%s&port=%s&secret=%s#/proxies",
 		baseUI, host, port, secret)
 
-	// 3. 探测与激活逻辑 (单实例检测 & 强行置顶)
-    fastClient := &http.Client{Timeout: 400 * time.Millisecond}
-    
-    // 1. 尝试探测现有的 Edge 调试接口
-    if resp, err := fastClient.Get(fmt.Sprintf("http://127.0.0.1:%s/json", debugPort)); err == nil {
-        defer resp.Body.Close()
-        var targets []map[string]interface{}
-        if err := json.NewDecoder(resp.Body).Decode(&targets); err == nil {
-            for _, t := range targets {
-                pURL, _ := t["url"].(string)
-                
-                // 判断是否是我们要找的 UI 界面
-                if strings.Contains(pURL, "/ui/") || strings.Contains(pURL, "setup") {
-                    if id, ok := t["id"].(string); ok {
-                        
-                        // --- 这里开始插入你的置顶逻辑 ---
-                        
-                        // 先通过 API 激活那个标签页
-                        fastClient.Get(fmt.Sprintf("http://127.0.0.1:%s/json/activate/%s", debugPort, id))
+	// 3. 探测与激活逻辑 (单实例检测)
+	fastClient := &http.Client{Timeout: 400 * time.Millisecond}
+	resp, err := fastClient.Get(fmt.Sprintf("http://127.0.0.1:%s/json", debugPort))
+	if err == nil {
+		defer resp.Body.Close()
+		var targets []map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&targets); err == nil {
+			for _, t := range targets {
+				pURL, _ := t["url"].(string)
+				pType, _ := t["type"].(string)
+				if pType == "page" && (strings.Contains(pURL, "/ui/") || strings.Contains(pURL, "setup")) {
+					if id, ok := t["id"].(string); ok {
+						_, _ = fastClient.Get(fmt.Sprintf("http://127.0.0.1:%s/json/activate/%s", debugPort, id))
+						return
+					}
+				}
+			}
+		}
+	}
 
-                        // 使用 PowerShell 尝试唤醒窗口焦点
-                        psCmd := `$wshell = New-Object -ComObject WScript.Shell; $wshell.AppActivate("msedge")`
-                        _ = exec.Command("powershell", "-Command", psCmd).Run()
-
-                        // 执行你提供的 Win32 物理置顶协程
-                        go func() {
-                            time.Sleep(200 * time.Millisecond) 
-                            className, _ := windows.UTF16PtrFromString("Chrome_WidgetWin_1")
-                            hwnd, _, _ := procFindWindow.Call(uintptr(unsafe.Pointer(className)), 0)
-                            
-                            if hwnd != 0 {
-                                // 物理强制置顶
-                                procSetWindowPos.Call(
-                                    hwnd,
-                                    HWND_TOPMOST,
-                                    0, 0, 0, 0,
-                                    SWP_NOMOVE|SWP_NOSIZE|SWP_SHOWWINDOW,
-                                )
-                            }
-                        }()
-
-                        // --- 手术结束 ---
-                        
-                        return // 重要：处理完已存在的实例，直接返回，不再新开窗口
-                    }
-                }
-            }
-        }
-    }
-	// 4. 定位 Edge 路径
+	// 4. 在函数内直接定位 Edge 路径（修复 undefined 错误）
 	var edgePath string
 	potentialPaths := []string{
 		`C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`,
 		`C:\Program Files\Microsoft\Edge\Application\msedge.exe`,
-		os.Getenv("ProgramFiles(x86)") + `\Microsoft\Edge\Application\msedge.exe`,
-		os.Getenv("ProgramFiles") + `\Microsoft\Edge\Application\msedge.exe`,
 	}
 	for _, p := range potentialPaths {
 		if _, err := os.Stat(p); err == nil {
@@ -222,7 +180,7 @@ func launchWebUI() {
 	userDataDir := filepath.Join(baseDir, "EdgeAppCache")
 
 	if edgePath != "" {
-		// 【方案 A】检测到 Edge: 启动独立 App 模式
+		// 【方案 A】检测到 Edge: 启动“独立 App 模式”
 		_ = os.MkdirAll(userDataDir, 0755)
 		args := []string{
 			"--app=" + finalURL,
@@ -235,11 +193,10 @@ func launchWebUI() {
 		}
 		cmd := exec.Command(edgePath, args...)
 		if err := cmd.Start(); err != nil {
-			// 如果启动失败，退回到默认浏览器
 			_ = exec.Command("cmd", "/c", "start", "", finalURL).Start()
 		}
 	} else {
-		// 【方案 B】未找到 Edge: 直接用系统默认浏览器打开
+		// 【方案 B】未找到 Edge: 使用系统默认浏览器打开
 		_ = exec.Command("cmd", "/c", "start", "", finalURL).Start()
 	}
 }
