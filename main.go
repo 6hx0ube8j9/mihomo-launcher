@@ -118,84 +118,79 @@ func main() {
 	onExit()
 }
 func launchWebUI() {
-    // 1. 基础配置获取
-    debugPort := "52719"
-    apiAddr := getIniConfig("external-controller")
-    secret := getIniConfig("secret")
-    proxyAddr := getIniConfig("proxy_address")
+	// 1. 获取配置
+	debugPort := "52719"
+	apiAddr := getIniConfig("external-controller")
+	secret := getIniConfig("secret")
+	proxyAddr := getIniConfig("proxy_address")
 
-    // 2. 稳健的 URL 构造
-    baseUI := strings.TrimRight(apiAddr, "/")
-    if !strings.HasPrefix(baseUI, "http") {
-        baseUI = "http://" + baseUI
-    }
+	// 2. 构造 UI 地址
+	baseUI := strings.TrimRight(apiAddr, "/")
+	if !strings.HasPrefix(baseUI, "http") {
+		baseUI = "http://" + baseUI
+	}
+	cleanAddr := strings.TrimPrefix(strings.TrimPrefix(baseUI, "http://"), "https://")
+	host, port, err := net.SplitHostPort(cleanAddr)
+	if err != nil {
+		host, port = "127.0.0.1", "9090"
+	}
+	finalURL := fmt.Sprintf("%s/ui/?hostname=%s&port=%s&secret=%s#/proxies", baseUI, host, port, secret)
 
-    cleanAddr := strings.TrimPrefix(strings.TrimPrefix(baseUI, "http://"), "https://")
-    host, port, err := net.SplitHostPort(cleanAddr)
-    if err != nil {
-        if parts := strings.Split(cleanAddr, ":"); len(parts) == 2 {
-            host, port = parts[0], parts[1]
-        } else {
-            host, port = "127.0.0.1", "9090"
-        }
-    }
+	// 3. 尝试激活已打开的 Edge 标签页 (单实例逻辑)
+	fastClient := &http.Client{Timeout: 400 * time.Millisecond}
+	if resp, err := fastClient.Get(fmt.Sprintf("http://127.0.0.1:%s/json", debugPort)); err == nil {
+		defer resp.Body.Close()
+		var targets []map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&targets); err == nil {
+			for _, t := range targets {
+				pURL, _ := t["url"].(string)
+				if strings.Contains(pURL, "/ui/") {
+					if id, ok := t["id"].(string); ok {
+						_, _ = fastClient.Get(fmt.Sprintf("http://127.0.0.1:%s/json/activate/%s", debugPort, id))
+						return
+					}
+				}
+			}
+		}
+	}
 
-    // 格式：参数在前自动登录，锚点在后直达代理页
-    finalURL := fmt.Sprintf("%s/ui/?hostname=%s&port=%s&secret=%s#/proxies",
-        baseUI, host, port, secret)
+	// 4. 【修复重点】直接在函数内硬编码探测 Edge 路径，不调用外部函数
+	edgePath := ""
+	checkPaths := []string{
+		`C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`,
+		`C:\Program Files\Microsoft\Edge\Application\msedge.exe`,
+		os.Getenv("ProgramFiles(x86)") + `\Microsoft\Edge\Application\msedge.exe`,
+		os.Getenv("ProgramFiles") + `\Microsoft\Edge\Application\msedge.exe`,
+	}
 
-    // 3. 探测与激活逻辑 (单实例检测)
-    fastClient := &http.Client{Timeout: 400 * time.Millisecond}
-    resp, err := fastClient.Get(fmt.Sprintf("http://127.0.0.1:%s/json", debugPort))
-    if err == nil {
-        defer resp.Body.Close()
-        var targets []map[string]interface{}
-        if err := json.NewDecoder(resp.Body).Decode(&targets); err == nil {
-            for _, t := range targets {
-                pURL, _ := t["url"].(string)
-                pType, _ := t["type"].(string)
-                if pType == "page" && (strings.Contains(pURL, "/ui/") || strings.Contains(pURL, "setup")) {
-                    if id, ok := t["id"].(string); ok {
-                        // 发现已打开的窗口，直接激活并退出
-                        _, _ = fastClient.Get(fmt.Sprintf("http://127.0.0.1:%s/json/activate/%s", debugPort, id))
-                        return 
-                    }
-                }
-            }
-        }
-    }
+	for _, p := range checkPaths {
+		if _, err := os.Stat(p); err == nil {
+			edgePath = p
+			break
+		}
+	}
 
-    // 4. 启动新窗口逻辑
-    edgePath := findEdgePath() // 假设你已有这个查找路径的函数
-    exePath, _ := os.Executable()
-    baseDir := filepath.Dir(exePath)
-    userDataDir := filepath.Join(baseDir, "EdgeAppCache")
-
-    if edgePath != "" {
-        // 【方案 A】检测到 Edge: 启动“独立 App 模式”
-        _ = os.MkdirAll(userDataDir, 0755)
-
-        args := []string{
-            "--app=" + finalURL,
-            "--remote-debugging-port=" + debugPort,
-            "--user-data-dir=" + userDataDir,
-            "--window-size=1280,768",
-            "--proxy-server=" + proxyAddr,
-            "--no-first-run",
-            "--no-default-browser-check",
-            "--disable-sync",
-        }
-
-        cmd := exec.Command(edgePath, args...)
-        if err := cmd.Start(); err != nil {
-            // 如果 Edge 启动失败，退回到系统默认浏览器
-            _ = exec.Command("cmd", "/c", "start", "", finalURL).Start()
-        }
-    } else {
-        // 【方案 B】未找到 Edge: 启动“通用兼容模式” (支持 Firefox/Chrome 等)
-        // 关键点：不带任何参数，只传 URL
-        _ = exec.Command("cmd", "/c", "start", "", finalURL).Start()
-    }
+	// 5. 启动逻辑
+	if edgePath != "" {
+		// 如果找到了 Edge，以 App 模式启动
+		userDataDir := filepath.Join(baseDir, "EdgeAppCache")
+		_ = os.MkdirAll(userDataDir, 0755)
+		
+		cmd := exec.Command(edgePath, 
+			"--app="+finalURL,
+			"--remote-debugging-port="+debugPort,
+			"--user-data-dir="+userDataDir,
+			"--proxy-server="+proxyAddr,
+			"--no-first-run",
+		)
+		if err := cmd.Start(); err != nil {
+			// 如果启动失败，退回到默认浏览器
+			_ = exec.Command("cmd", "/c", "start", "", finalURL).Start()
+		}
+	} else {
+		// 如果没找到 Edge，直接用系统默认浏览器打开
+		_ = exec.Command("cmd", "/c", "start", "", finalURL).Start()
+	}
 }
 func onReady() {
 	saveIniConfig("startup_enabled", fmt.Sprint(checkAutoStartStatus()))
