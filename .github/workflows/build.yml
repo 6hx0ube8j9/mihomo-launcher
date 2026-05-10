@@ -28,14 +28,15 @@ jobs:
         run: |
           go install github.com/akavel/rsrc@latest
           $GOBIN = "$(go env GOPATH)\bin"
-          if (!(Test-Path "main.manifest")) { exit 1 }
-          & "$GOBIN\rsrc.exe" -manifest main.manifest -o resource.syso
+          if (Test-Path "main.manifest") {
+            & "$GOBIN\rsrc.exe" -manifest main.manifest -o resource.syso
+          }
 
       - name: Build EXE
         shell: pwsh
         run: |
-          $env:CGO_ENABLED="0"
-          go build -ldflags="-s -w -H windowsgui" -o mihomo-launcher.exe .
+          $env:CGO_ENABLED="1"
+          go build -ldflags("-s -w -H windowsgui") -o mihomo-launcher.exe .
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
