@@ -543,75 +543,46 @@ func monitorIconState() {
 }
 
 func watchTunState() {
-	// 使用 Ticker 替代阻塞 API。每 3-5 秒检查一次网卡状态对性能几乎无影响
-	// 但能保证程序退出的灵活性
-	ticker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop()
+    ticker := time.NewTicker(3 * time.Second)
+    defer ticker.Stop()
+    var lastHasTun bool
 
-	var lastHasTun bool
+    // 初始化略...
 
-	// 初始化状态，先查一次防止漏掉启动时的状态
-	ifaces, _ := net.Interfaces()
-	for _, i := range ifaces {
-		if isTunInterfaceMatch(i.Name) {
-			lastHasTun = true
-			break
-		}
-	}
+    for {
+        select {
+        case <-ticker.C:
+            // --- 第一道防线：程序正在退出，立即停止一切侦察活动 ---
+            if isReallyExiting {
+                return 
+            }
+            if isSystemInitializing || atomic.LoadInt32(&isSyncing) == 1 {
+                continue
+            }
+            currentHasTun := checkTunInterfaceNow() // 假设你封装了刚才的 net.Interfaces 逻辑
 
-	for {
-		select {
-		case <-ticker.C:
-			// 1. 检查退出标志
-			if isReallyExiting {
-				return
-			}
-
-			// 2. 检查系统是否正在忙碌（初始化或正在同步中则跳过本次循环）
-			if isSystemInitializing || atomic.LoadInt32(&isSyncing) == 1 {
-				continue
-			}
-
-			// 3. 获取当前网卡列表，检查 TUN 是否存在
-			currentHasTun := false
-			currentIfaces, err := net.Interfaces()
-			if err != nil {
-				// 获取失败可能是系统繁忙，跳过本次等待下一次 ticker
-				continue
-			}
-
-			for _, i := range currentIfaces {
-				if isTunInterfaceMatch(i.Name) {
-					currentHasTun = true
-					break
-				}
-			}
-			
             if currentHasTun != lastHasTun {
-                lastHasTun = currentHasTun
+                if atomic.LoadInt32(&isKernelActive) == 1 && !isReallyExiting {
+                    lastHasTun = currentHasTun
+                    
+                    // 标记已经同步，防止 checkSystemState 触发老的 syncConfigToKernel
+                    atomic.StoreInt32(&hasFirstSynced, 1)
 
-                // 只有内核处于活动状态时，才去执行同步
-                if atomic.LoadInt32(&isKernelActive) == 1 {
+                    // 先持久化到 .ini
+                    saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
 
+                    // 立即修正状态，让 monitorIconState 这一秒不报黄
                     newState := checkSystemState()
-
                     updateIconByState(newState)
                     lastState = newState 
 
-                    saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
-
                     if mTun != nil {
-                        if currentHasTun {
-                            mTun.Check()
-                        } else {
-                            mTun.Uncheck()
-                        }
+                        if currentHasTun { mTun.Check() } else { mTun.Uncheck() }
                     }
                 }
             }
-			
-		}
-	}
+        }
+    }
 }
 func syncConfigToKernel() {
     if !atomic.CompareAndSwapInt32(&isSyncing, 0, 1) {
