@@ -524,70 +524,62 @@ func monitorIconState() {
     for {
         if atomic.LoadInt32(&isReallyExiting) == 1 { return }
 
-        // 1. 物理层判定：进程不在，直接灰色
+        var curr int // 当前循环锁定的状态
+
         if !isProcessRunning("mihomo.exe") {
+            curr = StateStop
             failCount = 0
-            if lastState != StateStop {
-                updateIconByState(StateStop)
-                lastState = StateStop
-            }
         } else {
-            // --- 第一步：执行联动函数 (查 /configs) ---
-            curr := checkSystemState()
-
-            // --- 第二步：获取 TUN 物理事实 ---
+            // 获取核心状态
+            curr = checkSystemState()
+            
+            // --- TUN 专项逻辑：处理 failCount ---
             isTunMode := (getIniConfig("tun_enabled") == "true")
-            hasTun := false
-            ifaces, _ := net.Interfaces()
-            for _, i := range ifaces {
-                if isTunInterfaceMatch(i.Name) {
-                    hasTun = true
-                    break
-                }
-            }
-
-            // --- 第三步：核心逻辑判定 ---
             if isTunMode {
-                if hasTun {
-                    failCount = 0 // 健康：有网卡
-                } else {
-                    // 亚健康/故障：模式开了但没网卡
-                    isBusy := atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1
-                    if isBusy {
-                        failCount++ 
-                    } else {
-                        failCount += 2 
+                hasTun := false
+                ifaces, _ := net.Interfaces()
+                for _, i := range ifaces {
+                    if isTunInterfaceMatch(i.Name) {
+                        hasTun = true
+                        break
                     }
+                }
 
+                if hasTun {
+                    failCount = 0
+                } else {
+                    // 没网卡时，根据忙碌状态累加 failCount
+                    isBusy := atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1
+                    if isBusy { failCount++ } else { failCount += 2 }
+
+                    // 如果还没到报错阈值，我们暂时维持 curr 为 StateTun 
+                    // 这样图标就不会在变色前闪烁
                     if failCount > 3 {
-                        if lastState != StateError {
-                            updateIconByState(StateError)
-                            lastState = StateError
-                        }
+                        curr = StateError
                     }
-                    // 注意：这里不再 continue，让它统一走底部的 Sleep
                 }
             } else {
-                // 非 TUN 模式下的原有逻辑：5秒容错
+                // 非 TUN 模式，如果 API 不通 (StateStop)，走 5 秒容错
                 if curr == StateStop {
                     failCount++
-                    if failCount > 5 {
-                        if lastState != StateError {
-                            updateIconByState(StateError)
-                            lastState = StateError
-                        }
-                    }
+                    if failCount > 5 { curr = StateError }
                 } else {
                     failCount = 0
-                    if curr != lastState {
-                        updateIconByState(curr)
-                        lastState = curr
-                    }
                 }
             }
         }
 
-        // 全局唯一心跳频率控制
+        // --- 核心修复：执行图标更新 (不被分支拦截) ---
+        if curr != lastState {
+            updateIconByState(curr)
+            lastState = curr
+            
+            // 确保菜单勾选也绝对同步
+            if mTun != nil {
+                if curr == StateTun { mTun.Check() } else { mTun.Uncheck() }
+            }
+        }
+
         time.Sleep(1 * time.Second)
     }
 }
