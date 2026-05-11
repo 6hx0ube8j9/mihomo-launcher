@@ -113,33 +113,41 @@ func checkSystemState() int {
         }
     }
 
-    // 2. 检查内核通信 (骨架：轻量级探测)
+    // 2. 检查内核通信
     resp, err := doAPIRequest("GET", "/configs", nil)
     if err != nil {
-        return StateStop // API不通直接返回停止信号
+        return StateStop 
     }
 
-    // 3. 强权纠偏逻辑 (从第一份注入：解决配置与现实不符)
+    // 3. 强权纠偏逻辑
     isBusy := atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1
     if !isBusy {
         respStr := string(resp)
         kernelTunEnabled := strings.Contains(respStr, `"tun":`) && strings.Contains(respStr, `"enable":true`)
         localTunConfig := (getIniConfig("tun_enabled") == "true")
 
-        // 场景：配置要开，但内核没开
+        // 纠偏：配置要开，但内核没开
         if localTunConfig && !kernelTunEnabled {
             if !hasTunOnSystem {
-                go syncConfigToKernel() // 自动修复：异步推回配置
-                return StateError      // 亮红灯：提示修复中
+                go syncConfigToKernel() 
+                return StateError      
             }
         }
     }
 
-    // 4. UI 最终判定逻辑
+    // 4. UI 最终判定逻辑 (修正点：不仅返回状态，还要确保 globalLastHasTun 同步)
     currentTunPlan := (getIniConfig("tun_enabled") == "true")
+    
+    // 【关键同步】确保全局变量与物理事实一致
+    // 这样当这个函数被 monitorKernelDaemon 调用时，能顺便修正 watchTunState 的参考值
+    globalLastHasTun = hasTunOnSystem 
+
     if currentTunPlan {
-        if hasTunOnSystem { return StateTun }
-        return StateError // 意图开启但网卡没出
+        if hasTunOnSystem { 
+            return StateTun 
+        }
+        // 如果 API 通了但网卡还没出来，返回 Error 亮红灯
+        return StateError 
     }
 
     if getIniConfig("system_proxy_enabled") == "true" {
@@ -503,19 +511,23 @@ func monitorKernelDaemon() {
     absBaseDir, _ := filepath.Abs(baseDir)
 
     for {
+        // 1. 退出检查
         if atomic.LoadInt32(&isReallyExiting) == 1 {
             return
         }
 
+        // 2. 检查内核进程是否存活
         if !isProcessRunning("mihomo.exe") {
             // --- A. 启动保护区 ---
             atomic.StoreInt32(&isSystemInitializing, 1)
             atomic.StoreInt32(&hasFirstSynced, 0)
             atomic.StoreInt32(&isKernelActive, 0)
 
+            // 清理残留进程
             KillProcessByName("mihomo.exe")
             time.Sleep(500 * time.Millisecond)
 
+            // 3. 构造启动命令
             cmd := exec.Command(target, "-d", ".")
             cmd.Dir = absBaseDir
             cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
@@ -523,7 +535,7 @@ func monitorKernelDaemon() {
             if err := cmd.Start(); err == nil {
                 atomic.StoreInt32(&isKernelActive, 1)
 
-                // --- B. 资源绑定 (Job Object) ---
+                // --- B. 资源绑定 (防止内核孤儿化) ---
                 if hJob != 0 {
                     hp, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
                     if err == nil {
@@ -532,27 +544,27 @@ func monitorKernelDaemon() {
                     }
                 }
 
-                // --- C. 核心自愈与同步逻辑 ---
+                // --- C. 核心自愈与 UI 强同步逻辑 ---
                 go func() {
                     success := false
                     // 给予 6 秒启动窗口 (500ms * 12)
                     for i := 0; i < 12; i++ {
                         time.Sleep(500 * time.Millisecond)
                         
-                        // 探针检测 API
+                        // 探测内核 API 是否响应
                         resp, err := doAPIRequest("GET", "/configs", nil)
                         if err == nil && len(resp) > 200 {
-                            // 1. 立即灌入配置事实
+                            // 1. 立即灌入 INI 配置到内核
                             syncConfigToKernel()
                             
-                            // 2. 获取当前判定状态
+                            // 2. 获取当前系统真实状态
                             state := checkSystemState()
                             
-                            // 3. 【关键修复】同步全局变量，防止 watchTunState 产生逻辑跳过导致不打勾
-                            // 这里强制让 watchTunState 知道网卡现在的真实状态
-                            lastHasTun = (state == StateTun)
+                            // 3. 【关键修复】更新全局变量 globalLastHasTun
+                            // 确保 watchTunState 在解锁后不会因为“没察觉到变化”而不打勾
+                            globalLastHasTun = (state == StateTun)
 
-                            // 4. 【强制刷新】执行 UI 变色和菜单打勾
+                            // 4. 【强制刷新】执行菜单打勾和图标变色
                             syncUIAppearance(state)
                             
                             success = true
@@ -560,25 +572,27 @@ func monitorKernelDaemon() {
                         }
                     }
 
-                    // 5. 无论成功与否，最终必须解锁，允许 checkSystemState 恢复正常接管
+                    // 5. 任务完成或超时，解除锁定
                     atomic.StoreInt32(&isSystemInitializing, 0)
                     
-                    // 6. 如果内核没起来，强制刷一次 UI（通常会显示灰灯或报错）
+                    // 6. 兜底处理：如果内核启动失败，UI 也要归位
                     if !success {
                         syncUIAppearance(checkSystemState())
                     }
                 }()
 
-                // 进程退出监听
+                // 4. 监听内核进程退出
                 go func(c *exec.Cmd) {
                     _ = c.Wait()
                     atomic.StoreInt32(&isKernelActive, 0)
                 }(cmd)
             } else {
-                // 启动失败立即解锁
+                // 启动失败立刻解锁保护区
                 atomic.StoreInt32(&isSystemInitializing, 0)
             }
         }
+        
+        // 5. 循环检查间隔
         time.Sleep(2 * time.Second)
     }
 }
@@ -663,18 +677,22 @@ func monitorIconState() {
 func watchTunState() {
     ticker := time.NewTicker(3 * time.Second)
     defer ticker.Stop()
-    var lastHasTun bool
+    
+    // 【修改点 1】删除了局部变量 var lastHasTun bool
+    // 直接使用全局变量 globalLastHasTun
 
     for {
         select {
         case <-ticker.C:
             if atomic.LoadInt32(&isReallyExiting) == 1 { return }
             
-            // 如果正在初始化或同步中，跳过，避免干扰启动纠偏
+            // 如果正在初始化或同步中，跳过
+            // 此时 monitorKernelDaemon 正在后台干活，它干完活会更新 globalLastHasTun
             if atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1 {
                 continue
             }
 
+            // 1. 探测物理网卡事实
             currentHasTun := false
             ifaces, err := net.Interfaces()
             if err == nil {
@@ -686,24 +704,25 @@ func watchTunState() {
                 }
             }
 
-            if currentHasTun != lastHasTun {
+            // 2. 检查事实与“上一次记录”是否相符
+            // 注意：此时 globalLastHasTun 可能已经被 monitorKernelDaemon 纠正过了
+            if currentHasTun != globalLastHasTun {
+                
                 // 仅在内核活跃时处理变更
                 if atomic.LoadInt32(&isKernelActive) == 1 {
-                    lastHasTun = currentHasTun
+                    // 【修改点 2】更新全局变量
+                    globalLastHasTun = currentHasTun
                     
-                    // --- 注入第二份的“体验优化”逻辑 ---
-                    atomic.StoreInt32(&hasFirstSynced, 1) // 标记已同步，防止被旧配置反向覆盖
+                    // 标记已同步，防止被旧配置反向覆盖
+                    atomic.StoreInt32(&hasFirstSynced, 1) 
                     
-                    // 只有在手动关闭/开启导致变化时，才同步物理状态到磁盘
+                    // 将事实同步回磁盘配置
                     saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
 
-                    // 立即刷新 UI，消除延迟感知
+                    // 立即执行 UI 强刷 (颜色 + 勾选)
+                    // 使用我们之前合并的那个 syncUIAppearance 更稳
                     newState := checkSystemState()
-                    updateIconByState(newState)
-                    
-                    if mTun != nil {
-                        if currentHasTun { mTun.Check() } else { mTun.Uncheck() }
-                    }
+                    syncUIAppearance(newState) 
                 }
             }
         }
