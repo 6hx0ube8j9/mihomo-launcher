@@ -438,17 +438,18 @@ func onExit() {
     })
 }
 func checkSystemState() int {
-    // 只有 API 通不通这一件事决定红灯
-    if _, err := doAPIRequest("GET", "", nil); err != nil {
+    // 1. 尝试连接内核 API
+    _, err := doAPIRequest("GET", "", nil) 
+    if err != nil {
         return StateStop 
     }
 
-    // 首次同步逻辑保持
+    // 2. 首次同步逻辑
     if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
         go syncConfigToKernel()
     }
 
-    // 返回基础色：开启了系统代理就蓝，否则就灰
+    // 3. 只返回基础业务状态（不再直接判定 TUN 是否成功）
     if getIniConfig("system_proxy_enabled") == "true" {
         return StateProxy
     }
@@ -493,78 +494,92 @@ func monitorKernelDaemon() {
 	}
 }
 
+var tunPendingCycles int // 记录网卡缺失的循环次数
+
 func monitorIconState() {
     for {
-        if atomic.LoadInt32(&isReallyExiting) == 1 { return }
+        if isReallyExiting { return }
 
-        // 1. 基础状态获取
         localTunWanted := getIniConfig("tun_enabled") == "true"
         hasTun := hasPhysicalTunInterface()
-        rawState := checkSystemState() // 返回 Stop(红) / Proxy(蓝) / Default(灰)
+        rawState := checkSystemState() // API 基础状态
 
         var curr int
-
-        // 2. 物理进程判定
         if !isProcessRunning("mihomo.exe") {
             curr = StateStop
+            tunPendingCycles = 0 // 进程不在，重置计数
         } else {
-            // 3. 真实物理映射
-            // 只有当 [配置想要TUN] 且 [物理网卡确实存在] 时，才显示绿色
-            if localTunWanted && hasTun {
-                curr = StateTun
+            if localTunWanted {
+                if hasTun {
+                    curr = StateTun
+                    tunPendingCycles = 0 // 网卡到位，重置计数
+                } else {
+                    // --- 核心容错逻辑 ---
+                    // 每一个循环约 800ms，15次大约是 12 秒
+                    if tunPendingCycles < 15 {
+                        tunPendingCycles++
+                        curr = StateStop // 门控期：死守红色，拦截蓝色闪烁
+                    } else {
+                        // 【超时降级】网卡太久没出来，不再死守红色
+                        // 此时将 rawState (蓝/灰) 暴露给用户，说明 TUN 启动失败
+                        curr = rawState 
+                    }
+                }
             } else {
-                // 其他任何情况（网卡还没出来、网卡崩了、重载中），都直接显示 API 的原始状态
-                curr = rawState 
+                curr = rawState
+                tunPendingCycles = 0
             }
         }
 
-        // 4. 驱动 UI
         if curr != lastState {
             updateIconByState(curr)
             lastState = curr
         }
-        time.Sleep(800 * time.Millisecond) // 稍微加快刷新频率，让反馈更灵敏
+        
+        time.Sleep(800 * time.Millisecond)
     }
 }
 
 func watchTunState() {
     ticker := time.NewTicker(2 * time.Second)
     defer ticker.Stop()
+    var lastHasTun bool
 
-    lastHasTun := hasPhysicalTunInterface()
+    for {
+        select {
+        case <-ticker.C:
+            if isReallyExiting { return }
 
-    for range ticker.C {
-        if atomic.LoadInt32(&isReallyExiting) == 1 { return }
+            // 只在 Launcher 正在点重载 (isSyncing) 时拦截，防止 PATCH 请求冲突
+            if atomic.LoadInt32(&isSyncing) == 1 {
+                continue
+            }
 
-        // 唯一需要拦截的时机：Launcher 自己正在点“重载配置”发送请求时
-        if atomic.LoadInt32(&isSyncing) == 1 {
-            lastHasTun = hasPhysicalTunInterface()
-            continue
-        }
-
-        currentHasTun := hasPhysicalTunInterface()
-        if currentHasTun != lastHasTun {
-            // 【关键点】只要内核进程在跑，就认为是有效的 Web 操作
-            if isProcessRunning("mihomo.exe") {
-                lastHasTun = currentHasTun
-                
-                // 将 Web 端的物理状态强制同步到本地配置
-                saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
-                
-                // 同步托盘菜单的勾选状态
-                if mTun != nil {
-                    if currentHasTun { mTun.Check() } else { mTun.Uncheck() }
+            // 物理查网卡
+            currentHasTun := false
+            currentIfaces, _ := net.Interfaces()
+            for _, i := range currentIfaces {
+                if isTunInterfaceMatch(i.Name) {
+                    currentHasTun = true
+                    break
                 }
-                
-                // 强制触发 monitorIconState 状态重刷
-                lastState = -1 
-            } else {
+            }
+
+            if currentHasTun != lastHasTun {
                 lastHasTun = currentHasTun
+                // 关键：只要内核活着，Web 改了网卡，我们就同步
+                if atomic.LoadInt32(&isKernelActive) == 1 {
+                    saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
+                    if mTun != nil {
+                        if currentHasTun { mTun.Check() } else { mTun.Uncheck() }
+                    }
+                    // 强制 monitorIconState 立即重绘
+                    lastState = -1 
+                }
             }
         }
     }
 }
-
 // 提取出的公共检测函数
 func hasPhysicalTunInterface() bool {
     ifaces, err := net.Interfaces()
@@ -919,26 +934,44 @@ func checkAutoStartStatus() bool {
 	return cmd.Run() == nil
 }
 
-func updateIconByState(state int) {
-    // 严格对应常量顺序：
-    // StateStop(0)=stop, StateTun(2)=tun, StateProxy(3)=proxy, StateDefault(4)=default
-    // 注意：索引 1 原本是 StateError，现在用一个空位或者直接重构映射
-    
-    iconMap := map[int]string{
-        StateStop:    "stop.ico",    // 红色
-        StateTun:     "tun.ico",     // 绿色
-        StateProxy:   "proxy.ico",   // 蓝色
-        StateDefault: "default.ico", // 灰色
+func updateIconByState(requestedState int) {
+    // --- 1. 获取最高权重的物理指标 ---
+    hasTun := hasPhysicalTunInterface()
+    isKernelRunning := isProcessRunning("mihomo.exe")
+    tunWanted := getIniConfig("tun_enabled") == "true"
+
+    finalState := requestedState
+
+    // --- 2. 物理仲裁逻辑 (赋权核心) ---
+    if !isKernelRunning {
+        finalState = StateStop
+    } else {
+        // 如果用户配置开启了 TUN 模式
+        if tunWanted {
+            if hasTun {
+                finalState = StateTun // 看到物理网卡，才准变绿
+            } else {
+                // 【关键拦截】：只要物理网卡没出来，不管 API 传回什么，
+                // 哪怕是 StateProxy 或 StateDefault，一律强制回退为红色 (StateStop)
+                // 这彻底消灭了 Stop -> Proxy -> Tun 的三色闪烁
+                finalState = StateStop 
+            }
+        }
+        // 如果 tunWanted 为 false，则维持 requestedState (蓝或灰)
     }
 
-    fileName, exists := iconMap[state]
-    if !exists {
-        return // 如果传入了不存在的状态（比如已删掉的 1），直接拦截
+    // --- 3. 强制分发：同步菜单状态 ---
+    // 既然这里是终审，那么菜单的勾选必须在这里同步，确保视觉统一
+    if mTun != nil {
+        if finalState == StateTun {
+            mTun.Check()
+        } else {
+            mTun.Uncheck()
+        }
     }
 
-    if b, err := iconFs.ReadFile("icons/" + fileName); err == nil {
-        systray.SetIcon(b)
-    }
+    // --- 4. 最终渲染 ---
+    renderIconPhysically(finalState)
 }
 
 func getIniConfig(key string) string {
