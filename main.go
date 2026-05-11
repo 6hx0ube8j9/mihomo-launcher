@@ -509,7 +509,6 @@ func monitorIconState() {
         localTunWanted := getIniConfig("tun_enabled") == "true"
         
         var curr int
-        
         if !isProcessRunning("mihomo.exe") {
             curr = StateStop
             failCount = 0
@@ -518,26 +517,26 @@ func monitorIconState() {
             hasTun := hasPhysicalTunInterface()
 
             if localTunWanted {
-                // --- 关键修改：无论是不是 Busy，只要配置想要 TUN，且网卡没出来，都进入 4s 缓冲 ---
                 if hasTun {
                     curr = StateTun
                     failCount = 0
                 } else {
-                    // 网卡还没出来
-                    failCount++
-                    if failCount > 4 {
-                        // 4秒到了，网卡还是没影，彻底失败
-                        if !isBusy {
-                            // 只有不在初始化/重载时，才写回 INI (保证重载不误写)
+                    // --- 关键逻辑：重载配置期间的操作 ---
+                    if isBusy {
+                        // 重载/初始化中，网卡消失了：立即回退图标显示流转感，但不计时，不改 INI
+                        curr = rawState 
+                        failCount = 0 
+                    } else {
+                        // 正常运行中，网卡突然丢了：执行 4s 锁绿容错
+                        failCount++
+                        if failCount > 4 {
                             saveIniConfig("tun_enabled", "false")
                             if mTun != nil { mTun.Uncheck() }
+                            curr = rawState
+                            failCount = 0
+                        } else {
+                            curr = StateTun 
                         }
-                        curr = rawState // 此时才回退到蓝/灰
-                        failCount = 0
-                    } else {
-                        // 【重点】4秒内，无论 API 通没通，强制显示绿色
-                        // 这样启动时就会：Stop (红) -> 直接跳转 Tun (绿)
-                        curr = StateTun 
                     }
                 }
             } else {
@@ -555,17 +554,17 @@ func monitorIconState() {
 }
 
 func watchTunState() {
-    ticker := time.NewTicker(2 * time.Second) // 缩短到 2s，让 Web 反应更快
+    ticker := time.NewTicker(2 * time.Second)
     defer ticker.Stop()
 
-    // 初始状态
+    // 初始状态获取一次
     lastHasTun := hasPhysicalTunInterface()
 
     for range ticker.C {
         if atomic.LoadInt32(&isReallyExiting) == 1 { return }
 
-        // 准则：只有在 Launcher 正在点菜单重载 (isSyncing) 时，才拦截
-        // 内核重启或启动中 (isSystemInitializing) 时，也要允许 Web 状态落盘
+        // 只在托盘点击“重载配置”的极短时间内屏蔽（防止抢占）
+        // 核心重启期间 (Initializing) 也要保持监听
         if atomic.LoadInt32(&isSyncing) == 1 {
             lastHasTun = hasPhysicalTunInterface()
             continue
@@ -573,19 +572,21 @@ func watchTunState() {
 
         currentHasTun := hasPhysicalTunInterface()
         if currentHasTun != lastHasTun {
-            lastHasTun = currentHasTun
-            
-            // 只要内核还在，就认为是 Web 操作，直接写 INI
+            // 只有当内核真正处于活动状态时，才认为是有效的 Web 变更
             if atomic.LoadInt32(&isKernelActive) == 1 {
+                lastHasTun = currentHasTun
                 saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
                 
-                // 强制更新菜单勾选
+                // 强制同步 UI 勾选
                 if mTun != nil {
                     if currentHasTun { mTun.Check() } else { mTun.Uncheck() }
                 }
                 
-                // 让 monitorIconState 立即发现配置变了
-                // 这样 Web 一关，图标立刻变蓝
+                // 触发一次图标刷新
+                lastState = -1 // 强制下一轮 monitor 刷新
+            } else {
+                // 如果内核还没活，持续更新 lastHasTun 但不操作 INI
+                lastHasTun = currentHasTun
             }
         }
     }
