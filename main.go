@@ -93,66 +93,79 @@ const (
 )
 
 func checkSystemState() int {
-    // 1. 获取物理事实
-    hasTunOnSystem := false
-    ifaces, _ := net.Interfaces()
-    for _, i := range ifaces {
-        if isTunInterfaceMatch(i.Name) {
-            hasTunOnSystem = true
-            break
-        }
-    }
+	// 1. 获取物理网卡事实
+	hasTunOnSystem := false
+	ifaces, _ := net.Interfaces()
+	for _, i := range ifaces {
+		if isTunInterfaceMatch(i.Name) {
+			hasTunOnSystem = true
+			break
+		}
+	}
 
-    // 2. 尝试连接 API
-    resp, err := doAPIRequest("GET", "/configs", nil)
-    if err != nil {
-        return StateStop 
-    }
+	// 2. 尝试连接内核 API
+	resp, err := doAPIRequest("GET", "/configs", nil)
+	if err != nil {
+		// API 断开时，如果 .ini 要求开启但网卡没了，说明内核挂了，返回 Stop 触发守护逻辑
+		return StateStop 
+	}
 
-    // 【精准手术】：纠偏逻辑（核心）
-    isBusy := atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1
-    if !isBusy {
-        respStr := string(resp)
-        kernelTunEnabled := strings.Contains(respStr, `"tun":`) && strings.Contains(respStr, `"enable":true`)
-        localTunConfig := (getIniConfig("tun_enabled") == "true")
+	// 3. 执行“强权纠偏”手术
+	isBusy := atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1
+	if !isBusy {
+		respStr := string(resp)
+		kernelTunEnabled := strings.Contains(respStr, `"tun":`) && strings.Contains(respStr, `"enable":true`)
+		localTunConfig := (getIniConfig("tun_enabled") == "true")
 
-        // 核心矛盾点：ini 要开，但内核关了（Web 重启导致）
-        if localTunConfig && !kernelTunEnabled {
-            // 【精准手术】：绝不改写 ini 为 false。
-            // 而是异步强行把内核拉起来。
-            go syncConfigToKernel() 
-            
-            // 如果网卡确实还没刷出来，报 Error (红灯)
-            if !hasTunOnSystem {
-                return StateError 
-            }
-        }
+		// 【关键场景】：.ini 开启 && 内核 API 显示关闭
+		if localTunConfig && !kernelTunEnabled {
+			if !hasTunOnSystem {
+				// 情况 A：物理网卡也没了。判定为 Web 面板重启或非法关闭，执行纠偏推回。
+				go syncConfigToKernel()
+				return StateError // 亮红灯显示自愈中
+			} else {
+				// 情况 B：网卡还在，API 却说 false。可能是内核重载瞬态，维持原状不写磁盘。
+				return StateStop
+			}
+		}
 
-        // 仅保留“Web 端主动开启，本地跟随”的逻辑（这种同步是良性的）
-        if !localTunConfig && kernelTunEnabled {
-            saveIniConfig("tun_enabled", "true")
-            if mTun != nil { mTun.Check() }
-        }
-    }
+		// 【场景 B】：Web 面板手动开启了 TUN，且网卡已出。同步回 .ini。
+		if !localTunConfig && kernelTunEnabled && hasTunOnSystem {
+			saveIniConfig("tun_enabled", "true")
+			if mTun != nil { mTun.Check() }
+		}
+		
+		// 【场景 C】：Web 面板手动关闭了 TUN，且网卡已消失。同步回 .ini。
+		if localTunConfig && !kernelTunEnabled && !hasTunOnSystem {
+			saveIniConfig("tun_enabled", "false")
+			if mTun != nil { mTun.Uncheck() }
+		}
+	}
 
-    // 后续逻辑保持原样
-    if atomic.LoadInt32(&isSystemInitializing) == 1 {
-        atomic.StoreInt32(&isSystemInitializing, 0)
-    }
-    if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
-        go syncConfigToKernel()
-    }
+	// 4. 重置初始化锁（如果探针漏掉的话）
+	if atomic.LoadInt32(&isSystemInitializing) == 1 {
+		atomic.StoreInt32(&isSystemInitializing, 0)
+	}
 
-    currentTunPlan := (getIniConfig("tun_enabled") == "true")
-    if currentTunPlan {
-        if hasTunOnSystem { return StateTun }
-        return StateError // 计划要开但没网卡，报红灯
-    }
+	// 5. 首次拉起同步
+	if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
+		go syncConfigToKernel()
+	}
 
-    if getIniConfig("system_proxy_enabled") == "true" {
-        return StateProxy
-    }
-    return StateDefault
+	// 6. 最终 UI 状态判定
+	currentTunPlan := (getIniConfig("tun_enabled") == "true")
+	if currentTunPlan {
+		if hasTunOnSystem {
+			return StateTun // 只有开启意图 + 物理网卡在，才是正常蓝灯
+		}
+		return StateError // 意图开启但网卡消失，红灯
+	}
+
+	if getIniConfig("system_proxy_enabled") == "true" {
+		return StateProxy
+	}
+
+	return StateDefault
 }
 
 func main() {
@@ -486,50 +499,56 @@ func onExit() {
 }
 
 func monitorKernelDaemon() {
-    target := filepath.Join(baseDir, "mihomo.exe")
-    absBaseDir, _ := filepath.Abs(baseDir)
+	target := filepath.Join(baseDir, "mihomo.exe")
+	absBaseDir, _ := filepath.Abs(baseDir)
 
-    for {
-        if atomic.LoadInt32(&isReallyExiting) == 1 { return }
+	for {
+		if atomic.LoadInt32(&isReallyExiting) == 1 {
+			return
+		}
 
-        if !isProcessRunning("mihomo.exe") {
-            atomic.StoreInt32(&isSystemInitializing, 1) 
-            atomic.StoreInt32(&hasFirstSynced, 0)      
-            atomic.StoreInt32(&isKernelActive, 0)      
+		if !isProcessRunning("mihomo.exe") {
+			// --- 【启动保护期开始】 ---
+			atomic.StoreInt32(&isSystemInitializing, 1) 
+			atomic.StoreInt32(&hasFirstSynced, 0)      
+			atomic.StoreInt32(&isKernelActive, 0)      
 
-            KillProcessByName("mihomo.exe")
-            time.Sleep(500 * time.Millisecond)
+			KillProcessByName("mihomo.exe")
+			time.Sleep(500 * time.Millisecond)
 
-            cmd := exec.Command(target, "-d", ".")
-            cmd.Dir = absBaseDir
-            cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+			cmd := exec.Command(target, "-d", ".")
+			cmd.Dir = absBaseDir
+			cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 
-            if err := cmd.Start(); err == nil {
-                atomic.StoreInt32(&isKernelActive, 1)
-                
-                go func() {
-                    for i := 0; i < 12; i++ {
-                        time.Sleep(500 * time.Millisecond)
-                        resp, err := doAPIRequest("GET", "/configs", nil)
-                        if err == nil && len(resp) > 200 {
-                            syncConfigToKernel() 
-                            time.Sleep(500 * time.Millisecond) // 给网卡一点点创建时间
-                            break
-                        }
-                    }
-                    atomic.StoreInt32(&isSystemInitializing, 0)
-                }()
+			if err := cmd.Start(); err == nil {
+				atomic.StoreInt32(&isKernelActive, 1)
 
-                go func(c *exec.Cmd) {
-                    _ = c.Wait()
-                    atomic.StoreInt32(&isKernelActive, 0)
-                }(cmd)
-            } else {
-                atomic.StoreInt32(&isSystemInitializing, 0)
-            }
-        }
-        time.Sleep(2 * time.Second)
-    }
+				// 【精准手术】：探针检测 API 正常后，强制同步一次配置再解锁
+				go func() {
+					for i := 0; i < 12; i++ {
+						time.Sleep(500 * time.Millisecond)
+						resp, err := doAPIRequest("GET", "/configs", nil)
+						if err == nil && len(resp) > 200 {
+							// 亲儿子重启成功，立即按照磁盘 .ini 强制纠偏一次
+							syncConfigToKernel()
+							time.Sleep(500 * time.Millisecond) // 给网卡创建留出纳秒级余地
+							break
+						}
+					}
+					// 只有在这里配置灌完了，才允许 checkSystemState 介入
+					atomic.StoreInt32(&isSystemInitializing, 0)
+				}()
+
+				go func(c *exec.Cmd) {
+					_ = c.Wait()
+					atomic.StoreInt32(&isKernelActive, 0)
+				}(cmd)
+			} else {
+				atomic.StoreInt32(&isSystemInitializing, 0)
+			}
+		}
+		time.Sleep(2 * time.Second)
+	}
 }
 
 func monitorIconState() {
@@ -611,48 +630,54 @@ func monitorIconState() {
 }
 
 func watchTunState() {
-    ticker := time.NewTicker(3 * time.Second)
-    defer ticker.Stop()
-    var lastHasTun bool
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
 
-    // 初始状态获取 (保持原样)
-    ifaces, _ := net.Interfaces()
-    for _, i := range ifaces {
-        if isTunInterfaceMatch(i.Name) {
-            lastHasTun = true
-            break
-        }
-    }
+	var lastHasTun bool
+	// 初始状态获取
+	ifaces, _ := net.Interfaces()
+	for _, i := range ifaces {
+		if isTunInterfaceMatch(i.Name) {
+			lastHasTun = true
+			break
+		}
+	}
 
-    for {
-        select {
-        case <-ticker.C:
-            if atomic.LoadInt32(&isReallyExiting) == 1 { return }
+	for {
+		select {
+		case <-ticker.C:
+			if atomic.LoadInt32(&isReallyExiting) == 1 {
+				return
+			}
 
-            currentHasTun := false
-            currentIfaces, _ := net.Interfaces()
-            for _, i := range currentIfaces {
-                if isTunInterfaceMatch(i.Name) {
-                    currentHasTun = true
-                    break
-                }
-            }
+			// 1. 获取物理事实
+			currentHasTun := false
+			currentIfaces, err := net.Interfaces()
+			if err != nil {
+				continue
+			}
+			for _, i := range currentIfaces {
+				if isTunInterfaceMatch(i.Name) {
+					currentHasTun = true
+					break
+				}
+			}
 
-            // 只有状态变化且非初始化锁定时才处理
-            if currentHasTun != lastHasTun && atomic.LoadInt32(&isSystemInitializing) == 0 {
-                lastHasTun = currentHasTun
+			// 2. 状态变化处理：仅在非初始化期间响应
+			if currentHasTun != lastHasTun && atomic.LoadInt32(&isSystemInitializing) == 0 {
+				lastHasTun = currentHasTun
 
-                // 【精准手术】：这里不再写 saveIniConfig。
-                // 仅同步 UI 状态，具体的纠偏决策交给 checkSystemState
-                newState := checkSystemState() 
-                updateIconByState(newState)
-                
-                if mTun != nil {
-                    if currentHasTun { mTun.Check() } else { mTun.Uncheck() }
-                }
-            }
-        }
-    }
+				// 【精准手术】：这里严禁调用 saveIniConfig。
+				// 所有的写入决策全部收拢到 checkSystemState 统一处理。
+				newState := checkSystemState()
+				updateIconByState(newState)
+				
+				if mTun != nil {
+					if currentHasTun { mTun.Check() } else { mTun.Uncheck() }
+				}
+			}
+		}
+	}
 }
 func syncConfigToKernel() {
     if !atomic.CompareAndSwapInt32(&isSyncing, 0, 1) {
