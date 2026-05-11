@@ -115,33 +115,18 @@ func checkSystemState() int {
     }
     
     if err := json.Unmarshal(res, &cfg); err == nil {
-        // 1. 自动同步 Web 端的 TUN 开关状态
         localTunEnabled := getIniConfig("tun_enabled") == "true"
-        if cfg.Tun.Enable != localTunEnabled {
-            saveIniConfig("tun_enabled", fmt.Sprint(cfg.Tun.Enable))
-            if mTun != nil {
-                if cfg.Tun.Enable { mTun.Check() } else { mTun.Uncheck() }
-            }
-        }
-
-        // 2. 自动同步 Web 端的 Mode 状态（可选，防止 Web 改了模式托盘不知道）
-        // saveIniConfig("mode", cfg.Mode) 
-
-        // 3. 判定逻辑
-        if cfg.Tun.Enable {
-            ifaces, _ := net.Interfaces()
-            for _, i := range ifaces {
-                if isTunInterfaceMatch(i.Name) {
-                    return StateTun
-                }
-            }
-            // 网卡还没出来，交给 monitorIconState 的缓冲逻辑处理
-            return StateError 
+        
+        // --- 手术位置 2：排他性判定 ---
+        // 只要本地配置决定要开 TUN，不管网卡在不在，也不管 Proxy 开没开
+        // 这一步直接截断逻辑，不准它往后面滑
+        if localTunEnabled {
+            // 这里我们只需要确定 API 没说“强制关闭”即可
+            // 如果 API 能通，且 cfg.Tun.Enable 是 true，或者 API 正忙
+            return StateTun 
         }
     }
 
-    // 如果没开 TUN，再看是否开启了系统代理
-    // 建议：这里的判定可以结合 API 返回的 cfg.Mode 来做更精准的 UI 区分
     if getIniConfig("system_proxy_enabled") == "true" {
         return StateProxy
     }
