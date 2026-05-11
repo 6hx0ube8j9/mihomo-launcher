@@ -93,41 +93,62 @@ const (
 )
 
 func checkSystemState() int {
-    // 1. 尝试连接内核 API
-    _, err := doAPIRequest("GET", "", nil) 
+    // 1. 尝试连接内核 API 并获取实时配置
+    // 注意：这里访问的是 /configs 接口，用来获取内核真实的 tun 开关状态
+    resp, err := doAPIRequest("GET", "/configs", nil) 
     if err != nil {
-        return StateStop // 发出信号：API 暂时不可用
+        return StateStop // API 连不上，说明内核可能在重启或挂了
     }
 
-    // 2. API 成功，重置逻辑锁
+    // --- 【新增：配置自动校准手术】 ---
+    // 解析内核当前的真实 TUN 状态
+    // 假设你的 doAPIRequest 返回的是 []byte，我们需要判断里面 "tun": { "enable": true }
+    // 如果嫌解析 JSON 麻烦，也可以直接用 strings.Contains 快速判定
+    kernelTunEnabled := strings.Contains(string(resp), `"tun":` ) && strings.Contains(string(resp), `"enable":true`)
+    
+    localTunConfig := (getIniConfig("tun_enabled") == "true")
+
+    // 如果内核里 TUN 已经关了，但本地 ini 还以为开着
+    // 这说明用户在 Web 面板做了修改，我们要以内核为准，强制修正本地配置
+    if !kernelTunEnabled && localTunConfig {
+        saveIniConfig("tun_enabled", "false")
+        if mTun != nil { mTun.Uncheck() }
+        // 修正后，localTunConfig 变为 false，继续往下走逻辑
+        localTunConfig = false
+    }
+    // --- 【校准结束】 ---
+
+    // 2. API 成功，重置初始化锁
     if atomic.LoadInt32(&isSystemInitializing) == 1 {
         atomic.StoreInt32(&isSystemInitializing, 0)
     }
 
-    // 3. 首次同步逻辑 (保持不变)
+    // 3. 首次同步逻辑
     if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
         go syncConfigToKernel()
     }
 
-    // 4. 检查网卡
-    if getIniConfig("tun_enabled") == "true" {
-        hasTun := false
-        ifaces, _ := net.Interfaces()
-        for _, i := range ifaces {
-            if isTunInterfaceMatch(i.Name) {
-                hasTun = true
-                break
-            }
+    // 4. 判定物理网卡事实
+    hasTunOnSystem := false
+    ifaces, _ := net.Interfaces()
+    for _, i := range ifaces {
+        if isTunInterfaceMatch(i.Name) {
+            hasTunOnSystem = true
+            break
         }
-        if hasTun {
-            return StateTun
+    }
+
+    // 5. 最终状态返回矩阵
+    if kernelTunEnabled {
+        if hasTunOnSystem {
+            return StateTun // 内核要开且有网卡：正常
         }
-        
-        // 网卡还没出来时，我们也返回 StateStop 信号，交给外面的计数器去“等”
+        // 内核要开但没网卡：可能是真挂了，也可能刚启动没弹出来
+        // 返回 StateStop 让外部 monitorIconState 的 failCount 去缓冲 5 秒再报 Error
         return StateStop 
     }
 
-    // 5. 检查系统代理
+    // 6. 如果内核没开 TUN，检查系统代理
     if getIniConfig("system_proxy_enabled") == "true" {
         return StateProxy
     }
