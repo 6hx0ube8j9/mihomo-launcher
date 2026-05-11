@@ -503,119 +503,89 @@ func monitorKernelDaemon() {
 func monitorIconState() {
     var failCount int
     for {
-        // 1. 退出检查
         if atomic.LoadInt32(&isReallyExiting) == 1 { return }
 
-        // 2. 环境参数快照
         isBusy := atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1
         localTunWanted := getIniConfig("tun_enabled") == "true"
         
         var curr int
         
-        // 3. 进程存在判定 (准则: 进程不在必为红)
         if !isProcessRunning("mihomo.exe") {
             curr = StateStop
             failCount = 0
         } else {
-            // 4. 获取 API 状态和网卡状态
             rawState := checkSystemState() 
             hasTun := hasPhysicalTunInterface()
 
             if localTunWanted {
+                // --- 关键修改：无论是不是 Busy，只要配置想要 TUN，且网卡没出来，都进入 4s 缓冲 ---
                 if hasTun {
-                    // 状态正常
                     curr = StateTun
                     failCount = 0
                 } else {
-                    // 状态异常：网卡丢失
-                    if isBusy {
-                        // 【初始化或重载中】
-                        // 允许图标回退到代理/默认色，展现流转感，但不计入故障，不改配置
-                        curr = rawState 
-                        failCount = 0 
-                    } else {
-                        // 【正常运行中】
-                        // 执行 4s 锁绿豁免，防止网络波动导致图标闪烁
-                        failCount++
-                        if failCount > 4 {
-                            // 真正失效：执行静默回退
+                    // 网卡还没出来
+                    failCount++
+                    if failCount > 4 {
+                        // 4秒到了，网卡还是没影，彻底失败
+                        if !isBusy {
+                            // 只有不在初始化/重载时，才写回 INI (保证重载不误写)
                             saveIniConfig("tun_enabled", "false")
                             if mTun != nil { mTun.Uncheck() }
-                            curr = rawState 
-                            failCount = 0
-                        } else {
-                            // 豁免期内：维持绿色
-                            curr = StateTun 
                         }
+                        curr = rawState // 此时才回退到蓝/灰
+                        failCount = 0
+                    } else {
+                        // 【重点】4秒内，无论 API 通没通，强制显示绿色
+                        // 这样启动时就会：Stop (红) -> 直接跳转 Tun (绿)
+                        curr = StateTun 
                     }
                 }
             } else {
-                // 用户未开启 TUN，直接遵循 API 状态
                 curr = rawState
                 failCount = 0
             }
         }
 
-        // 5. 驱动 UI 更新
         if curr != lastState {
             updateIconByState(curr)
             lastState = curr
         }
-
         time.Sleep(1 * time.Second)
     }
 }
 
 func watchTunState() {
-    // 3秒检查一次物理网卡，平衡性能与灵敏度
-    ticker := time.NewTicker(3 * time.Second)
+    ticker := time.NewTicker(2 * time.Second) // 缩短到 2s，让 Web 反应更快
     defer ticker.Stop()
 
-    // 记录上一次的物理状态，初始值直接调用一次物理检测
+    // 初始状态
     lastHasTun := hasPhysicalTunInterface()
 
-    for {
-        select {
-        case <-ticker.C:
-            if atomic.LoadInt32(&isReallyExiting) == 1 { return }
+    for range ticker.C {
+        if atomic.LoadInt32(&isReallyExiting) == 1 { return }
 
-            // --- 核心防护区 ---
-            // 1. 初始化中 (isSystemInitializing): 内核还没稳，网卡闪现是正常的
-            // 2. 同步中 (isSyncing): 用户正在点菜单重载，此时物理变动不落盘
-            // 3. 内核未活动 (isKernelActive): 内核都没起来，网卡的消失可能是系统清理，不予记录
-            if atomic.LoadInt32(&isSystemInitializing) == 1 || 
-               atomic.LoadInt32(&isSyncing) == 1 || 
-               atomic.LoadInt32(&isKernelActive) == 0 {
-                
-                // 关键点：在忙碌期间，我们虽然不写 INI，但要保持 lastHasTun 的同步
-                // 这样忙碌期结束后，如果状态没变，就不会触发保存
-                lastHasTun = hasPhysicalTunInterface()
-                continue
-            }
+        // 准则：只有在 Launcher 正在点菜单重载 (isSyncing) 时，才拦截
+        // 内核重启或启动中 (isSystemInitializing) 时，也要允许 Web 状态落盘
+        if atomic.LoadInt32(&isSyncing) == 1 {
+            lastHasTun = hasPhysicalTunInterface()
+            continue
+        }
 
-            // 获取当前物理实时状态
-            currentHasTun := hasPhysicalTunInterface()
-
-            // 检测到物理状态变化（通常是用户在 Web 控制台点下了 TUN 开关）
-            if currentHasTun != lastHasTun {
-                
-                lastHasTun = currentHasTun
-
-                // A. 情报拦截：防止 checkSystemState 在下一秒把配置推回去
-                atomic.StoreInt32(&hasFirstSynced, 1)
-
-                // B. 持久化：既然是平稳运行期的变动，确认为用户意愿，写入 INI
+        currentHasTun := hasPhysicalTunInterface()
+        if currentHasTun != lastHasTun {
+            lastHasTun = currentHasTun
+            
+            // 只要内核还在，就认为是 Web 操作，直接写 INI
+            if atomic.LoadInt32(&isKernelActive) == 1 {
                 saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
-
-                // C. 立即刷新 UI 展现：消除“图标反应慢”的感觉
-                newState := checkSystemState()
-                updateIconByState(newState)
-                lastState = newState 
-
-                // D. 同步菜单勾选状态
+                
+                // 强制更新菜单勾选
                 if mTun != nil {
                     if currentHasTun { mTun.Check() } else { mTun.Uncheck() }
                 }
+                
+                // 让 monitorIconState 立即发现配置变了
+                // 这样 Web 一关，图标立刻变蓝
             }
         }
     }
