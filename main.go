@@ -41,39 +41,43 @@ const (
 )
 
 var (
-	hJob                 windows.Handle
-	hMutex               windows.Handle
-	httpClient           = &http.Client{Timeout: 1 * time.Second}
-	exePath, _           = os.Executable()
-	baseDir              = filepath.Dir(exePath)
+	// --- 系统句柄 ---
+	hJob    windows.Handle
+	hMutex  windows.Handle
+	
+	// --- 网络与路径 ---
+	httpClient      = &http.Client{Timeout: 1 * time.Second}
+	exePath, _      = os.Executable()
+	baseDir         = filepath.Dir(exePath)
 
 	// --- 状态控制 (使用 int32 确保 atomic 安全) ---
-	isSystemInitializing int32 = 1
+	// 初始值为 1，确保启动时的探测逻辑优先执行
+	isSystemInitializing int32 = 1 
 	isSyncing            int32
 	isReallyExiting      int32
 	hasFirstSynced       int32
 	isKernelActive       int32
 	isFocusing           int32
 	manualUpdateTrigger  int32
-    // --- 逻辑跟踪 ---
-    lastState        = -1
-    globalLastHasTun bool   // 【核心补丁】用于跨函数同步 TUN 打勾状态事实
-    tunErrorCounter  = 0
-    mTun             *systray.MenuItem    
+
 	// --- 并发同步 ---
 	exitOnce   sync.Once
 	configMu   sync.RWMutex
 	configData = make(map[string]string)
 
-	// --- 逻辑跟踪 ---
-	lastState       = -1
-	tunErrorCounter = 0
-	mTun            *systray.MenuItem
+	// --- 逻辑跟踪 (在此处安全整合补丁) ---
+	lastState        = -1
+	tunErrorCounter  = 0
+	mTun             *systray.MenuItem
+	
+	// 【新增补丁变量】仅用于解决打勾同步逻辑，不影响原有指针
+	globalLastHasTun bool 
 
-	// --- 动态库载入 ---
+	// --- 动态库载入 (User32 / Kernel32) ---
 	u32 = windows.NewLazySystemDLL("user32.dll")
 	k32 = windows.NewLazySystemDLL("kernel32.dll")
 
+	// --- User32 过程调用 ---
 	procEnumWindows      = u32.NewProc("EnumWindows")
 	procGetClassName     = u32.NewProc("GetClassNameW")
 	procIsWindowVisible  = u32.NewProc("IsWindowVisible")
@@ -84,8 +88,10 @@ var (
 	procBringToTop       = u32.NewProc("BringWindowToTop")
 	procGetForeground    = u32.NewProc("GetForegroundWindow")
 	procAttachThread     = u32.NewProc("AttachThreadInput")
-	procGetCurrentThread = k32.NewProc("GetCurrentThreadId")
 	procKeybdEvent       = u32.NewProc("keybd_event")
+
+	// --- Kernel32 过程调用 ---
+	procGetCurrentThread = k32.NewProc("GetCurrentThreadId")
 )
 
 const (
