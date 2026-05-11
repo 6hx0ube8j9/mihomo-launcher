@@ -70,8 +70,8 @@ var (
 		},
 	}
 
-	user32           = windows.NewLazySystemDLL("user32.dll")
-	procGetWindowText = user32.NewProc("GetWindowTextW")
+	moduser32      = syscall.NewLazyDLL("user32.dll")
+	procGetWindowText = moduser32.NewProc("GetWindowTextW")
 )
 
 func main() {
@@ -198,27 +198,21 @@ func onExit() {
 func monitorKernelDaemon() {
 	target := filepath.Join(baseDir, "mihomo.exe")
 	absBaseDir, _ := filepath.Abs(baseDir)
-
 	for {
 		if atomic.LoadInt32(&isReallyExiting) == 1 {
 			return
 		}
-
 		if !isProcessRunning("mihomo.exe") {
 			atomic.StoreInt32(&isSystemInitializing, 1)
 			atomic.StoreInt32(&hasFirstSynced, 0)
 			atomic.StoreInt32(&isKernelActive, 0)
-
 			KillProcessByName("mihomo.exe")
 			time.Sleep(500 * time.Millisecond)
-
 			cmd := exec.Command(target, "-d", ".")
 			cmd.Dir = absBaseDir
 			cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-
 			if err := cmd.Start(); err == nil {
 				atomic.StoreInt32(&isKernelActive, 1)
-
 				if hJob != 0 {
 					hp, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
 					if err == nil {
@@ -226,7 +220,6 @@ func monitorKernelDaemon() {
 						_ = windows.CloseHandle(hp)
 					}
 				}
-
 				go func() {
 					success := false
 					for i := 0; i < 12; i++ {
@@ -246,7 +239,6 @@ func monitorKernelDaemon() {
 						syncUIAppearance(checkSystemState())
 					}
 				}()
-
 				go func(c *exec.Cmd) {
 					_ = c.Wait()
 					atomic.StoreInt32(&isKernelActive, 0)
@@ -265,7 +257,6 @@ func monitorIconState() {
 		if atomic.LoadInt32(&isReallyExiting) == 1 {
 			return
 		}
-
 		if !isProcessRunning("mihomo.exe") {
 			failCount = 0
 			if lastState != StateStop {
@@ -283,7 +274,6 @@ func monitorIconState() {
 					break
 				}
 			}
-
 			if isTunMode && !hasTun {
 				actualState := checkSystemState()
 				if actualState != StateTun && actualState != StateStop {
@@ -308,7 +298,6 @@ func monitorIconState() {
 					continue
 				}
 			}
-
 		UseFailCountLogic:
 			if curr == StateStop {
 				failCount++
@@ -333,7 +322,6 @@ func monitorIconState() {
 func watchTunState() {
 	ticker := time.NewTicker(3 * time.Second)
 	defer ticker.Stop()
-
 	for {
 		select {
 		case <-ticker.C:
@@ -343,7 +331,6 @@ func watchTunState() {
 			if atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1 {
 				continue
 			}
-
 			currentHasTun := false
 			ifaces, err := net.Interfaces()
 			if err == nil {
@@ -354,7 +341,6 @@ func watchTunState() {
 					}
 				}
 			}
-
 			if currentHasTun != globalLastHasTun {
 				if atomic.LoadInt32(&isKernelActive) == 1 {
 					globalLastHasTun = currentHasTun
@@ -372,12 +358,10 @@ func checkSystemState() int {
 	if atomic.LoadInt32(&isSystemInitializing) == 1 {
 		return StateStop
 	}
-
 	_, err := doAPIRequest("GET", "/", nil)
 	if err != nil {
 		return StateStop
 	}
-
 	hasTunOnSystem := false
 	ifaces, err := net.Interfaces()
 	if err == nil {
@@ -388,17 +372,13 @@ func checkSystemState() int {
 			}
 		}
 	}
-
 	globalLastHasTun = hasTunOnSystem
-
 	if hasTunOnSystem {
 		return StateTun
 	}
-
 	if getIniConfig("system_proxy_enabled") == "true" {
 		return StateProxy
 	}
-
 	return StateDefault
 }
 
@@ -407,17 +387,14 @@ func syncConfigToKernel() {
 		return
 	}
 	defer atomic.StoreInt32(&isSyncing, 0)
-
 	atomic.StoreInt32(&isSystemInitializing, 1)
 	timer := time.AfterFunc(10*time.Second, func() { atomic.StoreInt32(&isSystemInitializing, 0) })
 	defer timer.Stop()
-
 	tunEnabled := getIniConfig("tun_enabled") == "true"
 	payload := map[string]interface{}{
 		"mode": getIniConfig("mode"),
 		"tun":  map[string]bool{"enable": tunEnabled},
 	}
-
 	success := false
 	for i := 0; i < 3; i++ {
 		_, err := doAPIRequest("PATCH", "/configs", payload)
@@ -427,7 +404,6 @@ func syncConfigToKernel() {
 		}
 		time.Sleep(time.Duration(i+1) * 500 * time.Millisecond)
 	}
-
 	if success {
 		if mTun != nil {
 			if tunEnabled {
@@ -458,49 +434,41 @@ func doAPIRequest(method, path string, payload interface{}) ([]byte, error) {
 		return nil, fmt.Errorf("api address is empty")
 	}
 	url := apiAddr + "/" + strings.TrimPrefix(path, "/")
-
 	var bodyReader io.Reader
 	if payload != nil {
 		b, err := json.Marshal(payload)
 		if err != nil {
-			return nil, fmt.Errorf("marshal payload failed: %v", err)
+			return nil, err
 		}
 		bodyReader = bytes.NewBuffer(b)
 	}
-
 	req, err := http.NewRequest(method, url, bodyReader)
 	if err != nil {
 		return nil, err
 	}
-
 	req.Header.Set("Content-Type", "application/json")
 	if secret := getIniConfig("secret"); secret != "" {
 		req.Header.Set("Authorization", "Bearer "+secret)
 	}
-
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-
 	if method == "GET" && (path == "" || path == "/") {
 		_, _ = io.Copy(io.Discard, resp.Body)
 		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return nil, fmt.Errorf("API Heartbeat Error: %d", resp.StatusCode)
+			return nil, fmt.Errorf("err: %d", resp.StatusCode)
 		}
 		return nil, nil
 	}
-
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
-		return nil, fmt.Errorf("read response body failed: %v", err)
+		return nil, err
 	}
-
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return body, fmt.Errorf("API Error: %d, Response: %s", resp.StatusCode, string(body))
+		return body, fmt.Errorf("API Error: %d", resp.StatusCode)
 	}
-
 	return body, nil
 }
 
@@ -536,17 +504,14 @@ func sniffAndSolidifyConfig() {
 	if err != nil {
 		return
 	}
-
 	lines := strings.Split(string(data), "\n")
 	inTunSection := false
 	foundMixed := false
-
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if trimmed == "" || strings.HasPrefix(trimmed, "#") {
 			continue
 		}
-
 		if strings.HasPrefix(trimmed, "mixed-port:") {
 			if parts := strings.SplitN(trimmed, ":", 2); len(parts) == 2 {
 				port := strings.Trim(parts[1], " \"'")
@@ -563,7 +528,6 @@ func sniffAndSolidifyConfig() {
 				}
 			}
 		}
-
 		if strings.HasPrefix(trimmed, "tun:") {
 			inTunSection = true
 			continue
@@ -579,7 +543,6 @@ func sniffAndSolidifyConfig() {
 				}
 			}
 		}
-
 		if strings.HasPrefix(trimmed, "external-controller:") {
 			addr := strings.Trim(strings.TrimPrefix(trimmed, "external-controller:"), " \"'")
 			if strings.HasPrefix(addr, ":") {
@@ -592,7 +555,6 @@ func sniffAndSolidifyConfig() {
 				saveIniConfig("external-controller", addr)
 			}
 		}
-
 		if strings.HasPrefix(trimmed, "secret:") {
 			val := strings.Trim(strings.TrimPrefix(trimmed, "secret:"), " \"'")
 			saveIniConfig("secret", val)
@@ -687,7 +649,6 @@ func launchWebUI() {
 				secret)
 		}
 	}
-
 	resp, err := httpClient.Get("http://127.0.0.1:9222/json")
 	if err == nil {
 		defer resp.Body.Close()
@@ -706,12 +667,12 @@ func launchWebUI() {
 }
 
 func focusWindowSilky(titlePart string) {
-	cb := syscall.NewCallback(func(hwnd windows.HWND, lparam uintptr) uintptr {
+	cb := syscall.NewCallback(func(hwnd syscall.Handle, lparam uintptr) uintptr {
 		b := make([]uint16, 255)
 		ret, _, _ := procGetWindowText.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)))
 		if ret > 0 && strings.Contains(windows.UTF16ToString(b), titlePart) {
-			windows.ShowWindow(hwnd, windows.SW_RESTORE)
-			windows.SetForegroundWindow(hwnd)
+			windows.ShowWindow(windows.HWND(hwnd), windows.SW_RESTORE)
+			windows.SetForegroundWindow(windows.HWND(hwnd))
 			return 0
 		}
 		return 1
