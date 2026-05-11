@@ -256,6 +256,19 @@ func focusWindowSilky(targetHwnd uintptr) {
     })
 }
 
+func syncUIAppearance(state int) {
+	// 1. 图标变色
+	updateIconByState(state)
+
+	// 2. 菜单打勾逻辑：只有处于 StateTun (绿色) 时，TUN 菜单才打勾
+	if mTun != nil {
+		if state == StateTun {
+			mTun.Check()
+		} else {
+			mTun.Uncheck()
+		}
+	}
+}
 func launchWebUI() {
 
     apiAddr := getIniConfig("external-controller")
