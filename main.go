@@ -41,49 +41,54 @@ const (
 )
 
 var (
-	hJob                 windows.Handle
-	hMutex               windows.Handle
-	httpClient           = &http.Client{Timeout: 1 * time.Second}
-	exePath, _           = os.Executable()
-	baseDir              = filepath.Dir(exePath)
-	isSystemInitializing = true
-	isSyncing            int32
-	isReallyExiting      bool
-	hasFirstSynced       int32
-	exitOnce             sync.Once
-	configMu             sync.RWMutex
-	configData           = make(map[string]string)
-	lastState            = -1
-	tunErrorCounter      = 0
-	mTun                 *systray.MenuItem
-	isKernelActive       int32
-	manualUpdateTrigger  int32
-    user32           = windows.NewLazySystemDLL("user32.dll")
-    kernel32         = windows.NewLazySystemDLL("kernel32.dll")
-    // 动态库载入
+    hJob                 windows.Handle
+    hMutex               windows.Handle
+    httpClient           = &http.Client{Timeout: 1 * time.Second}
+    exePath, _           = os.Executable()
+    baseDir              = filepath.Dir(exePath)
+
+    // --- 状态控制 ---
+    // 建议：将 bool 改为 int32 (1表示true, 0表示false)，确保跨协程 atomic 访问的安全一致性
+    isSystemInitializing int32 = 1 
+    
+    isSyncing            int32
+    isReallyExiting      int32
+    hasFirstSynced       int32
+    isKernelActive       int32
+    isFocusing           int32
+    manualUpdateTrigger  int32
+
+    // --- 并发同步 ---
+    exitOnce             sync.Once
+    configMu             sync.RWMutex
+    configData           = make(map[string]string)
+
+    // --- 逻辑跟踪 ---
+    lastState            = -1
+    tunErrorCounter      = 0
+    mTun                 *systray.MenuItem
+
+    // --- 动态库载入 (已合并冗余) ---
     u32 = windows.NewLazySystemDLL("user32.dll")
     k32 = windows.NewLazySystemDLL("kernel32.dll")
 
-    // 1. 窗口寻找与属性 (用于在桌面上“揪”出浏览器)
+    // 1. 窗口寻找与属性
     procEnumWindows      = u32.NewProc("EnumWindows")
     procGetClassName     = u32.NewProc("GetClassNameW")
     procIsWindowVisible  = u32.NewProc("IsWindowVisible")
     procGetWindowThread  = u32.NewProc("GetWindowThreadProcessId")
-    
-    // 2. 焦点与状态夺取 (置顶的核心手术刀)
+
+    // 2. 焦点与状态夺取
     procSetWindowPos     = u32.NewProc("SetWindowPos")
-    procShowWindow        = u32.NewProc("ShowWindow")
+    procShowWindow       = u32.NewProc("ShowWindow")
     procSetForeground    = u32.NewProc("SetForegroundWindow")
     procBringToTop       = u32.NewProc("BringWindowToTop")
     procGetForeground    = u32.NewProc("GetForegroundWindow")
     procAttachThread     = u32.NewProc("AttachThreadInput")
     procGetCurrentThread = k32.NewProc("GetCurrentThreadId")
-    
-    // 3. 辅助黑魔法 (刷新焦点)
-    procKeybdEvent       = u32.NewProc("keybd_event")
 
-    // 4. 状态控制 (防止疯狂连点)
-    isFocusing           int32 
+    // 3. 辅助
+    procKeybdEvent       = u32.NewProc("keybd_event")
 )
 
 const (
@@ -497,12 +502,16 @@ func monitorIconState() {
 				}
 			}
 
-			// --- 第三步：基于“因果”的判定 ---
-			
-			// 如果是 TUN 模式 且 物理网卡没了
 			if isTunMode && !hasTun {
-				// 【关键点】
-				// 如果系统此时处于“初始化锁”保护下，说明是正常启动中，我们不报 Error，而是跟从 checkSystemState 的 Stop 信号
+                actualState := checkSystemState()
+				if actualState != StateTun && actualState != StateStop {
+				    failCount = 0
+					lastState = actualState
+					updateIconByState(actualState)
+					if mTun != nil { mTun.Uncheck() }
+					time.Sleep(1 * time.Second)
+					continue
+				}	
 				if isSystemInitializing {
 					// 启动中，网卡没出来很正常，交给 failCount 处理（保持灰色）
 					goto UseFailCountLogic 
@@ -1031,26 +1040,30 @@ func getIniConfig(key string) string {
 
 func saveIniConfig(key, val string) {
     configMu.Lock()
-    // 1. 变化检测：如果不动，则不写
-    if old, ok := configData[key]; ok && old == val && key != "" {
-        configMu.Unlock()
-        return
-    }
+    
+    // 1. 只有当 key 不为空时才处理逻辑
     if key != "" {
+        old, ok := configData[key]
+        // 如果值没变，直接解锁退出，保护磁盘寿命
+        if ok && old == val {
+            configMu.Unlock()
+            return
+        }
+        // 值变了，更新内存缓存
         configData[key] = val
     }
 
-    // 2. 准备数据（在锁内快速完成或拷贝）
+    // 2. 准备数据（在锁内快速拷贝）
     keys := []string{"mode", "tun_enabled", "system_proxy_enabled", "startup_enabled", "proxy_address", "tun_device_name", "external-controller", "secret"}
     var buf bytes.Buffer
     for _, k := range keys {
         if v, ok := configData[k]; ok {
-            buf.WriteString(k + " = " + v + "\n") // 使用字符串拼接比 Sprintf 更快
+            buf.WriteString(k + " = " + v + "\n")
         }
     }
-    configMu.Unlock() // 尽早释放锁，不要带着锁去写磁盘
+    configMu.Unlock() // 锁内逻辑到此为止
 
-    // 3. 磁盘 IO（锁外执行）
+    // 3. 磁盘 IO（锁外执行，保证 UI 线程不卡顿）
     _ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), buf.Bytes(), 0644)
 }
 
