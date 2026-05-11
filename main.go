@@ -92,6 +92,63 @@ const (
 	debugPort      = "52719"
 )
 
+func checkSystemState() int {
+    res, err := doAPIRequest("GET", "/configs", nil)
+    if err != nil {
+        return StateStop
+    }
+
+    if atomic.LoadInt32(&isSystemInitializing) == 1 {
+        atomic.StoreInt32(&isSystemInitializing, 0)
+    }
+
+    if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
+        go syncConfigToKernel()
+    }
+
+    // --- 加固：解析更多有用字段 ---
+    var cfg struct {
+        Mode string `json:"mode"`
+        Tun  struct {
+            Enable bool `json:"enable"`
+        } `json:"tun"`
+    }
+    
+    if err := json.Unmarshal(res, &cfg); err == nil {
+        // 1. 自动同步 Web 端的 TUN 开关状态
+        localTunEnabled := getIniConfig("tun_enabled") == "true"
+        if cfg.Tun.Enable != localTunEnabled {
+            saveIniConfig("tun_enabled", fmt.Sprint(cfg.Tun.Enable))
+            if mTun != nil {
+                if cfg.Tun.Enable { mTun.Check() } else { mTun.Uncheck() }
+            }
+        }
+
+        // 2. 自动同步 Web 端的 Mode 状态（可选，防止 Web 改了模式托盘不知道）
+        // saveIniConfig("mode", cfg.Mode) 
+
+        // 3. 判定逻辑
+        if cfg.Tun.Enable {
+            ifaces, _ := net.Interfaces()
+            for _, i := range ifaces {
+                if isTunInterfaceMatch(i.Name) {
+                    return StateTun
+                }
+            }
+            // 网卡还没出来，交给 monitorIconState 的缓冲逻辑处理
+            return StateError 
+        }
+    }
+
+    // 如果没开 TUN，再看是否开启了系统代理
+    // 建议：这里的判定可以结合 API 返回的 cfg.Mode 来做更精准的 UI 区分
+    if getIniConfig("system_proxy_enabled") == "true" {
+        return StateProxy
+    }
+    
+    return StateDefault
+}
+
 func main() {
 	var err error
 	exePath, err = os.Executable()
@@ -462,165 +519,149 @@ func monitorKernelDaemon() {
 }
 
 func monitorIconState() {
-	var failCount int
+    var failCount int
 
-	for {
-		if atomic.LoadInt32(&isReallyExiting) == 1 { return }
+    for {
+        if atomic.LoadInt32(&isReallyExiting) == 1 { return }
 
-		// 1. 物理层判定：进程不在，直接灰色
-		if !isProcessRunning("mihomo.exe") {
-			failCount = 0
-			if lastState != StateStop {
-				updateIconByState(StateStop)
-				lastState = StateStop
-			}
-		} else {
-			// --- 第一步：执行联动函数 ---
-			// 它会更新 isSystemInitializing 的状态
-			curr := checkSystemState()
+        // 1. 物理层判定：进程不在，直接灰色
+        if !isProcessRunning("mihomo.exe") {
+            failCount = 0
+            if lastState != StateStop {
+                updateIconByState(StateStop)
+                lastState = StateStop
+            }
+        } else {
+            // --- 第一步：执行联动函数 (查 /configs) ---
+            curr := checkSystemState()
 
-			// --- 第二步：物理网卡真实状态捕捉 ---
-			isTunMode := (getIniConfig("tun_enabled") == "true")
-			hasTun := false
-			ifaces, _ := net.Interfaces()
-			for _, i := range ifaces {
-				if isTunInterfaceMatch(i.Name) {
-					hasTun = true
-					break
-				}
-			}
+            // --- 第二步：获取 TUN 物理事实 ---
+            isTunMode := (getIniConfig("tun_enabled") == "true")
+            hasTun := false
+            ifaces, _ := net.Interfaces()
+            for _, i := range ifaces {
+                if isTunInterfaceMatch(i.Name) {
+                    hasTun = true
+                    break
+                }
+            }
 
-			if isTunMode && !hasTun {
-                actualState := checkSystemState()
-				if actualState != StateTun && actualState != StateStop {
-				    failCount = 0
-					lastState = actualState
-					updateIconByState(actualState)
-					if mTun != nil { mTun.Uncheck() }
-					time.Sleep(1 * time.Second)
-					continue
-				}	
-				if atomic.LoadInt32(&isSystemInitializing) == 1 {
-					// 启动中，网卡没出来很正常，交给 failCount 处理（保持灰色）
-					goto UseFailCountLogic 
-				} else {
-					// 锁已经开了，说明是“运行中”。此时网卡没了，必然是重载或故障！
-					failCount = 0 
-					if lastState != StateError {
-						updateIconByState(StateError)
-						lastState = StateError
-					}
-					// 这种情况下我们不往下走了，直接等待下一秒看它会不会恢复绿
-					time.Sleep(1 * time.Second)
-					continue
-				}
-			}
+            // --- 第三步：核心逻辑判定 ---
+            if isTunMode {
+                if hasTun {
+                    failCount = 0 // 健康：有网卡
+                } else {
+                    // 亚健康/故障：模式开了但没网卡
+                    isBusy := atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1
+                    if isBusy {
+                        failCount++ 
+                    } else {
+                        failCount += 2 
+                    }
 
-		UseFailCountLogic:
-			// 以下是原有的 5 秒容错逻辑
-			if curr == StateStop {
-				failCount++
-				if failCount > 5 {
-					if lastState != StateError {
-						updateIconByState(StateError)
-						lastState = StateError
-					}
-				}
-			} else {
-				failCount = 0
-				if curr != lastState {
-					updateIconByState(curr)
-					lastState = curr
-				}
-			}
-		}
+                    if failCount > 3 {
+                        if lastState != StateError {
+                            updateIconByState(StateError)
+                            lastState = StateError
+                        }
+                    }
+                    // 注意：这里不再 continue，让它统一走底部的 Sleep
+                }
+            } else {
+                // 非 TUN 模式下的原有逻辑：5秒容错
+                if curr == StateStop {
+                    failCount++
+                    if failCount > 5 {
+                        if lastState != StateError {
+                            updateIconByState(StateError)
+                            lastState = StateError
+                        }
+                    }
+                } else {
+                    failCount = 0
+                    if curr != lastState {
+                        updateIconByState(curr)
+                        lastState = curr
+                    }
+                }
+            }
+        }
 
-		time.Sleep(1 * time.Second)
-	}
+        // 全局唯一心跳频率控制
+        time.Sleep(1 * time.Second)
+    }
 }
 
 func watchTunState() {
-	// 使用 Ticker 替代阻塞 API。3秒一次的频率在性能与实时性之间平衡得最好
-	ticker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop()
+    ticker := time.NewTicker(3 * time.Second)
+    defer ticker.Stop()
 
-	var lastHasTun bool
+    // 1. 启动时获取初始物理状态
+    var lastHasTun bool
+    ifaces, _ := net.Interfaces()
+    for _, i := range ifaces {
+        if isTunInterfaceMatch(i.Name) {
+            lastHasTun = true
+            break
+        }
+    }
 
-	// --- 启动时初始化状态 ---
-	// 先查一次防止漏掉启动瞬间的状态
-	ifaces, _ := net.Interfaces()
-	for _, i := range ifaces {
-		if isTunInterfaceMatch(i.Name) {
-			lastHasTun = true
-			break
-		}
-	}
+    for {
+        select {
+        case <-ticker.C:
+            if atomic.LoadInt32(&isReallyExiting) == 1 {
+                return
+            }
 
-	for {
-		select {
-		case <-ticker.C:
-			if atomic.LoadInt32(&isReallyExiting) == 1 {
-				return
-			}
+            // 如果正在忙碌（如 syncConfigToKernel 正在 PATCH 接口），跳过本次，避免干扰
+            if atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1 {
+                continue
+            }
 
-			// 2. 检查系统是否正在忙碌（初始化或正在手动同步中则跳过本次循环）
-			if atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1 {
-				continue
-			}
+            // 获取当前物理网卡状态
+            currentHasTun := false
+            currentIfaces, err := net.Interfaces()
+            if err != nil {
+                continue
+            }
+            for _, i := range currentIfaces {
+                if isTunInterfaceMatch(i.Name) {
+                    currentHasTun = true
+                    break
+                }
+            }
 
-			// 3. 获取当前物理网卡列表，检查 TUN 设备是否存在
-			currentHasTun := false
-			currentIfaces, err := net.Interfaces()
-			if err != nil {
-				// 获取网卡列表失败可能是系统底层调用繁忙，跳过等待下次 ticker
-				continue
-			}
+            // --- 状态变更判定 ---
+            if currentHasTun != lastHasTun {
+                // 无论内核在不在，都要更新“上一次状态”记录，保持物理同步
+                lastHasTun = currentHasTun
 
-			for _, i := range currentIfaces {
-				if isTunInterfaceMatch(i.Name) {
-					currentHasTun = true
-					break
-				}
-			}
+                // 只有在内核活着时，才认为是用户/Web引发的“有效操作”，执行联动
+                if atomic.LoadInt32(&isKernelActive) == 1 && atomic.LoadInt32(&isReallyExiting) == 0 {
+                    
+                    // A. 强制同步内存缓存，防止 getIniConfig 读到旧数据
+                    configMu.Lock()
+                    configData["tun_enabled"] = fmt.Sprint(currentHasTun)
+                    configMu.Unlock()
 
-			// 4. 当物理网卡状态发生“变化”时（Web操作、手动开关、内核崩溃等）
-			if currentHasTun != lastHasTun {
-				
-				// --- 【核心安全判定】 ---
-				// 只有当内核处于活动状态，且没有在准备退出时，才认为是“有效的状态变更”
-				if atomic.LoadInt32(&isKernelActive) == 1 && atomic.LoadInt32(&isReallyExiting) == 0 {
-					
-					lastHasTun = currentHasTun
+                    // B. 持久化到磁盘
+                    saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
 
-					// A. 【加急情报汇报】
-					// 强制标记为“已同步”，防止 checkSystemState 触发 syncConfigToKernel 
-					// 这样就不会因为读取到旧的 .ini 配置而把刚刚从 Web 关掉的 TUN 又强行开回去
-					atomic.StoreInt32(&hasFirstSynced, 1)
+                    // C. 标记已同步，防止 checkSystemState 再次触发 syncConfigToKernel 反向覆盖
+                    atomic.StoreInt32(&hasFirstSynced, 1)
 
-					// B. 【持久化配置】
-					// 既然确定是运行时变动，将新的物理事实写入配置文件
-					saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
-
-					// C. 【立即同步 UI 状态】
-					// 不等 monitorIconState 的下一秒循环，我们在这里直接触发一次状态自检并更新图标
-					// 这能彻底消除从 Web 关闭 TUN 时产生的“黄色/红色”闪烁
-					newState := checkSystemState()
-					updateIconByState(newState)
-					lastState = newState // 强制同步指挥官手里的“最后记录”
-
-					// D. 【更新菜单勾选】
-					if mTun != nil {
-						if currentHasTun {
-							mTun.Check()
-						} else {
-							mTun.Uncheck()
-						}
-					}
-
-				}
-			}
-		}
-	}
+                    // D. 立即刷新 UI（不用等 monitorIconState 的下一秒）
+                    newState := checkSystemState()
+                    updateIconByState(newState)
+                    lastState = newState
+                    
+                    if mTun != nil {
+                        if currentHasTun { mTun.Check() } else { mTun.Uncheck() }
+                    }
+                }
+            }
+        }
+    }
 }
 func syncConfigToKernel() {
     if !atomic.CompareAndSwapInt32(&isSyncing, 0, 1) {
@@ -702,13 +743,13 @@ func doAPIRequest(method, path string, payload interface{}) ([]byte, error) {
 	// 6. 性能优化：心跳检测逻辑
 	// 如果是 GET 请求且 path 为空（说明来自 checkSystemState 的存活检查）
 	// 我们只关心状态码，不关心内容，直接丢弃 Body 以节省内存分配
-	if method == "GET" && (path == "" || path == "/") {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return nil, fmt.Errorf("API Heartbeat Error: %d", resp.StatusCode)
-		}
-		return nil, nil
-	}
+    if method == "GET" && path == "" {
+        _, _ = io.Copy(io.Discard, resp.Body)
+        if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+            return nil, fmt.Errorf("API Heartbeat Error: %d", resp.StatusCode)
+        }
+        return nil, nil
+    }
 
 	// 7. 读取响应内容
 	// 对于配置更新、状态获取等请求，我们需要读取完整的响应体
@@ -898,48 +939,6 @@ func reloadConfigFile() {
     go syncConfigToKernel()
 }
 
-func checkSystemState() int {
-    // 1. 尝试连接内核 API
-    _, err := doAPIRequest("GET", "", nil) 
-    if err != nil {
-        return StateStop // 发出信号：API 暂时不可用
-    }
-
-    // 2. API 成功，重置逻辑锁
-    if atomic.LoadInt32(&isSystemInitializing) == 1 {
-        atomic.StoreInt32(&isSystemInitializing, 0)
-    }
-
-    // 3. 首次同步逻辑 (保持不变)
-    if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
-        go syncConfigToKernel()
-    }
-
-    // 4. 检查网卡
-    if getIniConfig("tun_enabled") == "true" {
-        hasTun := false
-        ifaces, _ := net.Interfaces()
-        for _, i := range ifaces {
-            if isTunInterfaceMatch(i.Name) {
-                hasTun = true
-                break
-            }
-        }
-        if hasTun {
-            return StateTun
-        }
-        
-        // 网卡还没出来时，我们也返回 StateStop 信号，交给外面的计数器去“等”
-        return StateStop 
-    }
-
-    // 5. 检查系统代理
-    if getIniConfig("system_proxy_enabled") == "true" {
-        return StateProxy
-    }
-
-    return StateDefault
-}
 
 func isAdmin() bool {
 	var token windows.Token
