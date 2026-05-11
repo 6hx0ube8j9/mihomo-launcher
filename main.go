@@ -438,17 +438,17 @@ func onExit() {
     })
 }
 func checkSystemState() int {
+    // 只有 API 通不通这一件事决定红灯
     if _, err := doAPIRequest("GET", "", nil); err != nil {
-        return StateStop // API 不通就是红色
+        return StateStop 
     }
 
-    // 首次同步逻辑
+    // 首次同步逻辑保持
     if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
         go syncConfigToKernel()
     }
 
-    // 如果 API 通了，默认返回“基础存活状态”
-    // 如果设置了系统代理就蓝，否则就灰
+    // 返回基础色：开启了系统代理就蓝，否则就灰
     if getIniConfig("system_proxy_enabled") == "true" {
         return StateProxy
     }
@@ -494,57 +494,36 @@ func monitorKernelDaemon() {
 }
 
 func monitorIconState() {
-    var failCount int
     for {
         if atomic.LoadInt32(&isReallyExiting) == 1 { return }
 
-        // 核心变量
-        isBusy := atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1
+        // 1. 基础状态获取
         localTunWanted := getIniConfig("tun_enabled") == "true"
         hasTun := hasPhysicalTunInterface()
-        rawState := checkSystemState() // 这里的 rawState 现在只可能是 Stop/Proxy/Default
+        rawState := checkSystemState() // 返回 Stop(红) / Proxy(蓝) / Default(灰)
 
         var curr int
+
+        // 2. 物理进程判定
         if !isProcessRunning("mihomo.exe") {
             curr = StateStop
-            failCount = 0
         } else {
-            if localTunWanted {
-                if hasTun {
-                    curr = StateTun
-                    failCount = 0
-                } else {
-                    // 情况：配置要开启 TUN，但物理网卡不存在
-                    if isBusy {
-                        // 【初始化/重载期间】：不做任何容错，直接回退显示原始状态 (蓝/灰)
-                        // 这解决了你说的“一直显示 TUN”不回退的问题
-                        curr = rawState
-                        failCount = 0
-                    } else {
-                        // 【正常运行期间】：给 4 秒机会，维持绿色
-                        failCount++
-                        if failCount > 4 {
-                            saveIniConfig("tun_enabled", "false")
-                            if mTun != nil { mTun.Uncheck() }
-                            curr = rawState
-                            failCount = 0
-                        } else {
-                            curr = StateTun
-                        }
-                    }
-                }
+            // 3. 真实物理映射
+            // 只有当 [配置想要TUN] 且 [物理网卡确实存在] 时，才显示绿色
+            if localTunWanted && hasTun {
+                curr = StateTun
             } else {
-                // 用户根本没打算开 TUN
-                curr = rawState
-                failCount = 0
+                // 其他任何情况（网卡还没出来、网卡崩了、重载中），都直接显示 API 的原始状态
+                curr = rawState 
             }
         }
 
+        // 4. 驱动 UI
         if curr != lastState {
             updateIconByState(curr)
             lastState = curr
         }
-        time.Sleep(1 * time.Second)
+        time.Sleep(800 * time.Millisecond) // 稍微加快刷新频率，让反馈更灵敏
     }
 }
 
@@ -557,8 +536,7 @@ func watchTunState() {
     for range ticker.C {
         if atomic.LoadInt32(&isReallyExiting) == 1 { return }
 
-        // 只有当 Launcher 正在主动 PATCH 配置时，才屏蔽监听
-        // 其他时间（包括内核重启中）都要监听 Web 端引起的网卡变化
+        // 唯一需要拦截的时机：Launcher 自己正在点“重载配置”发送请求时
         if atomic.LoadInt32(&isSyncing) == 1 {
             lastHasTun = hasPhysicalTunInterface()
             continue
@@ -566,15 +544,19 @@ func watchTunState() {
 
         currentHasTun := hasPhysicalTunInterface()
         if currentHasTun != lastHasTun {
-            // 只要内核是活跃的，就认为是用户操作，同步到 INI
-            if atomic.LoadInt32(&isKernelActive) == 1 {
+            // 【关键点】只要内核进程在跑，就认为是有效的 Web 操作
+            if isProcessRunning("mihomo.exe") {
                 lastHasTun = currentHasTun
+                
+                // 将 Web 端的物理状态强制同步到本地配置
                 saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
                 
+                // 同步托盘菜单的勾选状态
                 if mTun != nil {
                     if currentHasTun { mTun.Check() } else { mTun.Uncheck() }
                 }
-                // 强制下一秒 monitor 刷新状态
+                
+                // 强制触发 monitorIconState 状态重刷
                 lastState = -1 
             } else {
                 lastHasTun = currentHasTun
