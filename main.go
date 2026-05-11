@@ -438,27 +438,20 @@ func onExit() {
     })
 }
 func checkSystemState() int {
-    // API 检查：不通则红 (StateStop)
     if _, err := doAPIRequest("GET", "", nil); err != nil {
-        return StateStop
+        return StateStop // API 不通就是红色
     }
 
-    // API 通了，尝试首次同步（由 atomic 保证仅一次）
+    // 首次同步逻辑
     if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
         go syncConfigToKernel()
     }
 
-    // TUN 优先级判定
-    if getIniConfig("tun_enabled") == "true" && hasPhysicalTunInterface() {
-        return StateTun
-    }
-
-    // 代理优先级判定
+    // 如果 API 通了，默认返回“基础存活状态”
+    // 如果设置了系统代理就蓝，否则就灰
     if getIniConfig("system_proxy_enabled") == "true" {
         return StateProxy
     }
-
-    // 默认灰色
     return StateDefault
 }
 func monitorKernelDaemon() {
@@ -505,29 +498,30 @@ func monitorIconState() {
     for {
         if atomic.LoadInt32(&isReallyExiting) == 1 { return }
 
+        // 核心变量
         isBusy := atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1
         localTunWanted := getIniConfig("tun_enabled") == "true"
-        
+        hasTun := hasPhysicalTunInterface()
+        rawState := checkSystemState() // 这里的 rawState 现在只可能是 Stop/Proxy/Default
+
         var curr int
         if !isProcessRunning("mihomo.exe") {
             curr = StateStop
             failCount = 0
         } else {
-            rawState := checkSystemState() 
-            hasTun := hasPhysicalTunInterface()
-
             if localTunWanted {
                 if hasTun {
                     curr = StateTun
                     failCount = 0
                 } else {
-                    // --- 关键逻辑：重载配置期间的操作 ---
+                    // 情况：配置要开启 TUN，但物理网卡不存在
                     if isBusy {
-                        // 重载/初始化中，网卡消失了：立即回退图标显示流转感，但不计时，不改 INI
-                        curr = rawState 
-                        failCount = 0 
+                        // 【初始化/重载期间】：不做任何容错，直接回退显示原始状态 (蓝/灰)
+                        // 这解决了你说的“一直显示 TUN”不回退的问题
+                        curr = rawState
+                        failCount = 0
                     } else {
-                        // 正常运行中，网卡突然丢了：执行 4s 锁绿容错
+                        // 【正常运行期间】：给 4 秒机会，维持绿色
                         failCount++
                         if failCount > 4 {
                             saveIniConfig("tun_enabled", "false")
@@ -535,11 +529,12 @@ func monitorIconState() {
                             curr = rawState
                             failCount = 0
                         } else {
-                            curr = StateTun 
+                            curr = StateTun
                         }
                     }
                 }
             } else {
+                // 用户根本没打算开 TUN
                 curr = rawState
                 failCount = 0
             }
@@ -557,14 +552,13 @@ func watchTunState() {
     ticker := time.NewTicker(2 * time.Second)
     defer ticker.Stop()
 
-    // 初始状态获取一次
     lastHasTun := hasPhysicalTunInterface()
 
     for range ticker.C {
         if atomic.LoadInt32(&isReallyExiting) == 1 { return }
 
-        // 只在托盘点击“重载配置”的极短时间内屏蔽（防止抢占）
-        // 核心重启期间 (Initializing) 也要保持监听
+        // 只有当 Launcher 正在主动 PATCH 配置时，才屏蔽监听
+        // 其他时间（包括内核重启中）都要监听 Web 端引起的网卡变化
         if atomic.LoadInt32(&isSyncing) == 1 {
             lastHasTun = hasPhysicalTunInterface()
             continue
@@ -572,20 +566,17 @@ func watchTunState() {
 
         currentHasTun := hasPhysicalTunInterface()
         if currentHasTun != lastHasTun {
-            // 只有当内核真正处于活动状态时，才认为是有效的 Web 变更
+            // 只要内核是活跃的，就认为是用户操作，同步到 INI
             if atomic.LoadInt32(&isKernelActive) == 1 {
                 lastHasTun = currentHasTun
                 saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
                 
-                // 强制同步 UI 勾选
                 if mTun != nil {
                     if currentHasTun { mTun.Check() } else { mTun.Uncheck() }
                 }
-                
-                // 触发一次图标刷新
-                lastState = -1 // 强制下一轮 monitor 刷新
+                // 强制下一秒 monitor 刷新状态
+                lastState = -1 
             } else {
-                // 如果内核还没活，持续更新 lastHasTun 但不操作 INI
                 lastHasTun = currentHasTun
             }
         }
