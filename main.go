@@ -97,9 +97,9 @@ func checkSystemState() int {
     isBusy := atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1
     localTun := getIniConfig("tun_enabled") == "true"
 
+    // --- 保险 1：API 报错时，绝对禁止修改本地配置 ---
     if err != nil {
-        // 重启中 API 不通，如果原本是 TUN，坚持报 StateTun
-        if isBusy && localTun { return StateTun }
+        if localTun && isBusy { return StateTun }
         return StateStop
     }
 
@@ -108,25 +108,31 @@ func checkSystemState() int {
     }
     
     if err := json.Unmarshal(res, &cfg); err == nil {
-        // 同步逻辑：只在不忙且确实关闭时同步
-        if !isBusy && !cfg.Tun.Enable && localTun {
-            saveIniConfig("tun_enabled", "false")
-            if mTun != nil { mTun.Uncheck() }
-            localTun = false
+        // --- 保险 2：只有 API 成功响应，且明确返回 enable: false 时 ---
+        // 增加额外判定：只有当 localTun 为 true，但内核明确说没开，且【不忙】时
+        if !isBusy && localTun && !cfg.Tun.Enable {
+            // 这里就是你说的“马上写 ini”发生的地方
+            // 为了防止误杀，我们再加一个物理检查：如果网卡还在，不准改 ini
+            if !hasPhysicalTunInterface() { 
+                saveIniConfig("tun_enabled", "false")
+                if mTun != nil { mTun.Uncheck() }
+                localTun = false
+            }
         }
 
-        // 返回状态：只要 API 开了，或者我们想开且正在重启，都报绿色
         if cfg.Tun.Enable || (localTun && isBusy) {
             return StateTun
         }
     }
-
-    if getIniConfig("system_proxy_enabled") == "true" {
-        return StateProxy
-    }
     return StateDefault
 }
-
+func hasPhysicalTunInterface() bool {
+    ifaces, _ := net.Interfaces()
+    for _, i := range ifaces {
+        if isTunInterfaceMatch(i.Name) { return true }
+    }
+    return false
+}
 func main() {
 	var err error
 	exePath, err = os.Executable()
