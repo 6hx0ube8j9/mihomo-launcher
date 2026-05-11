@@ -93,32 +93,34 @@ const (
 )
 
 func checkSystemState() int {
-    // 1. 尝试连接内核 API 并获取实时配置
-    // 注意：这里访问的是 /configs 接口，用来获取内核真实的 tun 开关状态
+    // 1. 尝试连接内核 API
     resp, err := doAPIRequest("GET", "/configs", nil) 
     if err != nil {
-        return StateStop // API 连不上，说明内核可能在重启或挂了
+        return StateStop 
     }
 
-    // --- 【新增：配置自动校准手术】 ---
-    // 解析内核当前的真实 TUN 状态
-    // 假设你的 doAPIRequest 返回的是 []byte，我们需要判断里面 "tun": { "enable": true }
-    // 如果嫌解析 JSON 麻烦，也可以直接用 strings.Contains 快速判定
-    kernelTunEnabled := strings.Contains(string(resp), `"tun":` ) && strings.Contains(string(resp), `"enable":true`)
+    // --- 【关键手术：增加校准保护】 ---
+    // 只有当系统【不在】初始化中，且【不在】手动同步中，才允许内核状态反向覆盖本地 ini
+    isBusy := atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1
     
-    localTunConfig := (getIniConfig("tun_enabled") == "true")
+    if !isBusy {
+        // 解析内核真实状态
+        kernelTunEnabled := strings.Contains(string(resp), `"tun":`) && strings.Contains(string(resp), `"enable":true`)
+        localTunConfig := (getIniConfig("tun_enabled") == "true")
 
-    // 如果内核里 TUN 已经关了，但本地 ini 还以为开着
-    // 这说明用户在 Web 面板做了修改，我们要以内核为准，强制修正本地配置
-    if !kernelTunEnabled && localTunConfig {
-        saveIniConfig("tun_enabled", "false")
-        if mTun != nil { mTun.Uncheck() }
-        // 修正后，localTunConfig 变为 false，继续往下走逻辑
-        localTunConfig = false
+        // 只有当内核明确表示关了，而本地是开着的时候，才纠偏
+        if !kernelTunEnabled && localTunConfig {
+            // 这里再加一个保险：如果 API 返回的配置太短（比如还没加载完），不执行纠偏
+            if len(resp) > 100 { 
+                saveIniConfig("tun_enabled", "false")
+                if mTun != nil { mTun.Uncheck() }
+                localTunConfig = false
+            }
+        }
     }
     // --- 【校准结束】 ---
 
-    // 2. API 成功，重置初始化锁
+    // 2. API 成功，重置初始化锁 (这里重置后，下一次循环才会进入上面的纠偏逻辑)
     if atomic.LoadInt32(&isSystemInitializing) == 1 {
         atomic.StoreInt32(&isSystemInitializing, 0)
     }
@@ -138,21 +140,19 @@ func checkSystemState() int {
         }
     }
 
-    // 5. 最终状态返回矩阵
-    if kernelTunEnabled {
+    // 5. 最终判定
+    // 这里再加个逻辑：如果配置是 true 但网卡还没出来，返回 StateStop 给 failCount 缓冲
+    isTunEnabledInConfig := (getIniConfig("tun_enabled") == "true")
+    if isTunEnabledInConfig {
         if hasTunOnSystem {
-            return StateTun // 内核要开且有网卡：正常
+            return StateTun
         }
-        // 内核要开但没网卡：可能是真挂了，也可能刚启动没弹出来
-        // 返回 StateStop 让外部 monitorIconState 的 failCount 去缓冲 5 秒再报 Error
-        return StateStop 
+        return StateStop // 网卡重启瞬间，这里会返回 Stop，托盘图标变灰但不会报错，也不会改 ini
     }
 
-    // 6. 如果内核没开 TUN，检查系统代理
     if getIniConfig("system_proxy_enabled") == "true" {
         return StateProxy
     }
-
     return StateDefault
 }
 
