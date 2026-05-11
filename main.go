@@ -67,9 +67,11 @@ var (
 			MaxIdleConns:        100,
 			IdleConnTimeout:     90 * time.Second,
 			DisableKeepAlives:   false,
-			Proxy:               nil,
 		},
 	}
+
+	user32           = windows.NewLazySystemDLL("user32.dll")
+	procGetWindowText = user32.NewProc("GetWindowTextW")
 )
 
 func main() {
@@ -89,7 +91,7 @@ func onReady() {
 	systray.SetTitle(APP_NAME)
 	systray.SetTooltip(APP_NAME)
 
-	mDashboard := systray.AddMenuItem("控制面板", "打开 Web UI")
+	mDashboard := systray.AddMenuItem("控制面板", "")
 	systray.AddSeparator()
 
 	mMode := systray.AddMenuItem("代理模式", "")
@@ -101,9 +103,9 @@ func onReady() {
 	mSystemProxy := systray.AddMenuItemCheckbox("系统代理", "", getIniConfig("system_proxy_enabled") == "true")
 	systray.AddSeparator()
 
-	mReload := systray.AddMenuItem("重载配置", "Reload config.yaml")
+	mReload := systray.AddMenuItem("重载配置", "")
 	mStartup := systray.AddMenuItemCheckbox("开机启动", "", checkAutoStartStatus())
-	mQuit := systray.AddMenuItem("退出程序", "Exit")
+	mQuit := systray.AddMenuItem("退出程序", "")
 
 	go monitorKernelDaemon()
 	go monitorIconState()
@@ -677,10 +679,13 @@ func launchWebUI() {
 	apiAddr := getIniConfig("external-controller")
 	secret := getIniConfig("secret")
 	if apiAddr != "" {
-		targetURL += fmt.Sprintf("/?hostname=%s&port=%s&secret=%s",
-			strings.TrimPrefix(strings.Split(apiAddr, ":")[1], "//"),
-			strings.Split(apiAddr, ":")[2],
-			secret)
+		parts := strings.Split(apiAddr, ":")
+		if len(parts) >= 3 {
+			targetURL += fmt.Sprintf("/?hostname=%s&port=%s&secret=%s",
+				strings.TrimPrefix(parts[1], "//"),
+				parts[2],
+				secret)
+		}
 	}
 
 	resp, err := httpClient.Get("http://127.0.0.1:9222/json")
@@ -703,8 +708,8 @@ func launchWebUI() {
 func focusWindowSilky(titlePart string) {
 	cb := syscall.NewCallback(func(hwnd windows.HWND, lparam uintptr) uintptr {
 		b := make([]uint16, 255)
-		_, err := windows.GetWindowText(hwnd, &b[0], int32(len(b)))
-		if err == nil && strings.Contains(windows.UTF16ToString(b), titlePart) {
+		ret, _, _ := procGetWindowText.Call(uintptr(hwnd), uintptr(unsafe.Pointer(&b[0])), uintptr(len(b)))
+		if ret > 0 && strings.Contains(windows.UTF16ToString(b), titlePart) {
 			windows.ShowWindow(hwnd, windows.SW_RESTORE)
 			windows.SetForegroundWindow(hwnd)
 			return 0
