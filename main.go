@@ -543,46 +543,91 @@ func monitorIconState() {
 }
 
 func watchTunState() {
-    ticker := time.NewTicker(3 * time.Second)
-    defer ticker.Stop()
-    var lastHasTun bool
+	// 使用 Ticker 替代阻塞 API。3秒一次的频率在性能与实时性之间平衡得最好
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
 
-    // 初始化略...
+	var lastHasTun bool
 
-    for {
-        select {
-        case <-ticker.C:
-            // --- 第一道防线：程序正在退出，立即停止一切侦察活动 ---
-            if isReallyExiting {
-                return 
-            }
-            if isSystemInitializing || atomic.LoadInt32(&isSyncing) == 1 {
-                continue
-            }
-            currentHasTun := checkTunInterfaceNow() // 假设你封装了刚才的 net.Interfaces 逻辑
+	// --- 启动时初始化状态 ---
+	// 先查一次防止漏掉启动瞬间的状态
+	ifaces, _ := net.Interfaces()
+	for _, i := range ifaces {
+		if isTunInterfaceMatch(i.Name) {
+			lastHasTun = true
+			break
+		}
+	}
 
-            if currentHasTun != lastHasTun {
-                if atomic.LoadInt32(&isKernelActive) == 1 && !isReallyExiting {
-                    lastHasTun = currentHasTun
-                    
-                    // 标记已经同步，防止 checkSystemState 触发老的 syncConfigToKernel
-                    atomic.StoreInt32(&hasFirstSynced, 1)
+	for {
+		select {
+		case <-ticker.C:
+			// 1. 【第一道防线】如果程序正在准备退出，立即停止一切逻辑并销毁协程
+			// 防止在退出过程中由于内核关闭导致网卡消失，误触发配置重写
+			if isReallyExiting {
+				return
+			}
 
-                    // 先持久化到 .ini
-                    saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
+			// 2. 检查系统是否正在忙碌（初始化或正在手动同步中则跳过本次循环）
+			if isSystemInitializing || atomic.LoadInt32(&isSyncing) == 1 {
+				continue
+			}
 
-                    // 立即修正状态，让 monitorIconState 这一秒不报黄
-                    newState := checkSystemState()
-                    updateIconByState(newState)
-                    lastState = newState 
+			// 3. 获取当前物理网卡列表，检查 TUN 设备是否存在
+			currentHasTun := false
+			currentIfaces, err := net.Interfaces()
+			if err != nil {
+				// 获取网卡列表失败可能是系统底层调用繁忙，跳过等待下次 ticker
+				continue
+			}
 
-                    if mTun != nil {
-                        if currentHasTun { mTun.Check() } else { mTun.Uncheck() }
-                    }
-                }
-            }
-        }
-    }
+			for _, i := range currentIfaces {
+				if isTunInterfaceMatch(i.Name) {
+					currentHasTun = true
+					break
+				}
+			}
+
+			// 4. 当物理网卡状态发生“变化”时（Web操作、手动开关、内核崩溃等）
+			if currentHasTun != lastHasTun {
+				
+				// --- 【核心安全判定】 ---
+				// 只有当内核处于活动状态，且没有在准备退出时，才认为是“有效的状态变更”
+				if atomic.LoadInt32(&isKernelActive) == 1 && !isReallyExiting {
+					
+					lastHasTun = currentHasTun
+
+					// A. 【加急情报汇报】
+					// 强制标记为“已同步”，防止 checkSystemState 触发 syncConfigToKernel 
+					// 这样就不会因为读取到旧的 .ini 配置而把刚刚从 Web 关掉的 TUN 又强行开回去
+					atomic.StoreInt32(&hasFirstSynced, 1)
+
+					// B. 【持久化配置】
+					// 既然确定是运行时变动，将新的物理事实写入配置文件
+					saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
+
+					// C. 【立即同步 UI 状态】
+					// 不等 monitorIconState 的下一秒循环，我们在这里直接触发一次状态自检并更新图标
+					// 这能彻底消除从 Web 关闭 TUN 时产生的“黄色/红色”闪烁
+					newState := checkSystemState()
+					updateIconByState(newState)
+					lastState = newState // 强制同步指挥官手里的“最后记录”
+
+					// D. 【更新菜单勾选】
+					if mTun != nil {
+						if currentHasTun {
+							mTun.Check()
+						} else {
+							mTun.Uncheck()
+						}
+					}
+					
+					// 日志记录（可选）
+					// log.Printf("[WatchDog] TUN 状态变更捕捉成功: %v, 已同步至配置与图标", currentHasTun)
+				}
+			}
+		}
+	}
 }
 func syncConfigToKernel() {
     if !atomic.CompareAndSwapInt32(&isSyncing, 0, 1) {
