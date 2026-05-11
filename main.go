@@ -12,9 +12,9 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
-	"sync/atomic"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"time"
 	"unsafe"
@@ -50,7 +50,6 @@ var (
 	isSyncing            int32
 	isReallyExiting      bool
 	hasFirstSynced       int32
-	globalOpID           int32
 	exitOnce             sync.Once
 	configMu             sync.RWMutex
 	configData           = make(map[string]string)
@@ -812,58 +811,11 @@ func setMihomoMode(mode string) {
 }
 
 func setTunMode(enable bool) {
-	// 1. 每次进入函数，流水号自增。newID 是本次操作的唯一身份证
-	newID := atomic.AddInt32(&globalOpID, 1)
-
-	// 2. 锁定 UI 状态，进入初始化保护模式
 	isSystemInitializing = true
 	saveIniConfig("tun_enabled", fmt.Sprint(enable))
-
-	// 3. 异步处理：发送请求并盯着网卡状态
-	go func(opID int32) {
-		// A. 发送 API 请求给内核
-		_, err := doAPIRequest("PATCH", "/configs", map[string]interface{}{
-			"tun": map[string]bool{"enable": enable},
-		})
-
-		// 如果 API 报错，没必要探测了，直接尝试释放锁并退出
-		if err != nil {
-			if atomic.LoadInt32(&globalOpID) == opID {
-				isSystemInitializing = false
-			}
-			return
-		}
-
-		// B. 高频探测逻辑：每 200ms 检查一次网卡，最高检查 3 秒
-		for i := 0; i < 15; i++ {
-			// 【关键】每一轮都检查身份证：如果由于连续点击 ID 变了，本协程立刻退出
-			if atomic.LoadInt32(&globalOpID) != opID {
-				return
-			}
-
-			// 定义内部快速检查：开启时等网卡现身，关闭时等网卡消失
-			found := false
-			ifaces, _ := net.Interfaces()
-			for _, iface := range ifaces {
-				if isTunInterfaceMatch(iface.Name) { // 调用你原有的网卡名匹配函数
-					found = true
-					break
-				}
-			}
-
-			// 如果当前网卡状态 符合 我们的期望值(enable)，说明内核已准备好
-			if found == enable {
-				break
-			}
-
-			time.Sleep(200 * time.Millisecond)
-		}
-
-		// C. 只有最后一次操作对应的协程，才有资格释放全局初始化锁
-		if atomic.LoadInt32(&globalOpID) == opID {
-			isSystemInitializing = false
-		}
-	}(newID)
+	_, _ = doAPIRequest("PATCH", "/configs", map[string]interface{}{"tun": map[string]bool{"enable": enable}})
+	time.Sleep(3 * time.Second)
+	isSystemInitializing = false
 }
 
 func setProxyRegistry(enable bool) {
