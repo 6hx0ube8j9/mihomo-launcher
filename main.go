@@ -473,7 +473,7 @@ func monitorIconState() {
 	for {
 		if isReallyExiting { return }
 
-		// --- 1. 【最高准则】内核进程判定 ---
+		// 1. 物理层判定：进程不在，直接灰色
 		if !isProcessRunning("mihomo.exe") {
 			failCount = 0
 			if lastState != StateStop {
@@ -481,46 +481,42 @@ func monitorIconState() {
 				lastState = StateStop
 			}
 		} else {
-			// --- 2. 【核心判定】TUN 模式下的物理检查 ---
-			isTunMode := (getIniConfig("tun_enabled") == "true")
-			hasTun := false
+			curr := checkSystemState()
 
-			// 在此处直接展开网卡检查逻辑，不调用外部新函数
-			ifaces, _ := net.Interfaces()
-			for _, i := range ifaces {
-				if isTunInterfaceMatch(i.Name) {
-					hasTun = true
-					break
+			isTunConfigEnabled := (getIniConfig("tun_enabled") == "true")
+			hasPhysicalTun := false
+			if isTunConfigEnabled {
+				ifaces, _ := net.Interfaces()
+				for _, i := range ifaces {
+					if isTunInterfaceMatch(i.Name) {
+						hasPhysicalTun = true
+						break
+					}
 				}
 			}
 
-			if isTunMode && !hasTun {
-				// 用户要开 TUN 但网卡没了：立即变红 (Error)，不给 5 次机会
+
+			if isTunConfigEnabled && !hasPhysicalTun {
 				failCount = 0
 				if lastState != StateError {
 					updateIconByState(StateError)
 					lastState = StateError
 				}
+			} else if curr == StateStop {
+				// 场景 B: API 连不上（checkSystemState 返回了 StateStop）
+				// 维持你原始的 5 秒容错逻辑
+				failCount++
+				if failCount > 5 {
+					if lastState != StateError {
+						updateIconByState(StateError)
+						lastState = StateError
+					}
+				}
 			} else {
-				// --- 3. 【通信判定】逻辑层 5 次机会容错 ---
-				curr := checkSystemState()
-
-				if curr == StateStop {
-					failCount++
-					// 只有 API 通信失败，才消耗这 5 次机会
-					if failCount > 5 {
-						if lastState != StateStop {
-							updateIconByState(StateStop)
-							lastState = StateStop
-						}
-					}
-				} else {
-					// 一旦通信成功，立即重置计数并更新图标
-					failCount = 0
-					if curr != lastState {
-						updateIconByState(curr)
-						lastState = curr
-					}
+				failCount = 0
+				if curr != lastState {
+					updateIconByState(curr)
+					lastState = curr
 				}
 			}
 		}
