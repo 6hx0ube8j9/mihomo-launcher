@@ -18,7 +18,7 @@ import (
 	"syscall"
 	"time"
 	"unsafe"
-	
+
 	"github.com/energye/systray"
 	"golang.org/x/sys/windows"
 	"golang.org/x/sys/windows/registry"
@@ -41,67 +41,55 @@ const (
 )
 
 var (
-    hJob                 windows.Handle
-    hMutex               windows.Handle
-    httpClient           = &http.Client{Timeout: 1 * time.Second}
-    exePath, _           = os.Executable()
-    baseDir              = filepath.Dir(exePath)
+	hJob                 windows.Handle
+	hMutex               windows.Handle
+	httpClient           = &http.Client{Timeout: 1 * time.Second}
+	exePath, _           = os.Executable()
+	baseDir              = filepath.Dir(exePath)
 
-    // --- 状态控制 ---
-    // 建议：将 bool 改为 int32 (1表示true, 0表示false)，确保跨协程 atomic 访问的安全一致性
-    isSystemInitializing int32 = 1 
-    
-    isSyncing            int32
-    isReallyExiting      int32
-    hasFirstSynced       int32
-    isKernelActive       int32
-    isFocusing           int32
-    manualUpdateTrigger  int32
+	// --- 状态控制 (使用 int32 确保 atomic 安全) ---
+	isSystemInitializing int32 = 1
+	isSyncing            int32
+	isReallyExiting      int32
+	hasFirstSynced       int32
+	isKernelActive       int32
+	isFocusing           int32
+	manualUpdateTrigger  int32
 
-    // --- 并发同步 ---
-    exitOnce             sync.Once
-    configMu             sync.RWMutex
-    configData           = make(map[string]string)
+	// --- 并发同步 ---
+	exitOnce   sync.Once
+	configMu   sync.RWMutex
+	configData = make(map[string]string)
 
-    // --- 逻辑跟踪 ---
-    lastState            = -1
-    tunErrorCounter      = 0
-    mTun                 *systray.MenuItem
+	// --- 逻辑跟踪 ---
+	lastState       = -1
+	tunErrorCounter = 0
+	mTun            *systray.MenuItem
 
-    // --- 动态库载入 (已合并冗余) ---
-    u32 = windows.NewLazySystemDLL("user32.dll")
-    k32 = windows.NewLazySystemDLL("kernel32.dll")
+	// --- 动态库载入 ---
+	u32 = windows.NewLazySystemDLL("user32.dll")
+	k32 = windows.NewLazySystemDLL("kernel32.dll")
 
-    // 1. 窗口寻找与属性
-    procEnumWindows      = u32.NewProc("EnumWindows")
-    procGetClassName     = u32.NewProc("GetClassNameW")
-    procIsWindowVisible  = u32.NewProc("IsWindowVisible")
-    procGetWindowThread  = u32.NewProc("GetWindowThreadProcessId")
-
-    // 2. 焦点与状态夺取
-    procSetWindowPos     = u32.NewProc("SetWindowPos")
-    procShowWindow       = u32.NewProc("ShowWindow")
-    procSetForeground    = u32.NewProc("SetForegroundWindow")
-    procBringToTop       = u32.NewProc("BringWindowToTop")
-    procGetForeground    = u32.NewProc("GetForegroundWindow")
-    procAttachThread     = u32.NewProc("AttachThreadInput")
-    procGetCurrentThread = k32.NewProc("GetCurrentThreadId")
-
-    // 3. 辅助
-    procKeybdEvent       = u32.NewProc("keybd_event")
+	procEnumWindows      = u32.NewProc("EnumWindows")
+	procGetClassName     = u32.NewProc("GetClassNameW")
+	procIsWindowVisible  = u32.NewProc("IsWindowVisible")
+	procGetWindowThread  = u32.NewProc("GetWindowThreadProcessId")
+	procSetWindowPos     = u32.NewProc("SetWindowPos")
+	procShowWindow       = u32.NewProc("ShowWindow")
+	procSetForeground    = u32.NewProc("SetForegroundWindow")
+	procBringToTop       = u32.NewProc("BringWindowToTop")
+	procGetForeground    = u32.NewProc("GetForegroundWindow")
+	procAttachThread     = u32.NewProc("AttachThreadInput")
+	procGetCurrentThread = k32.NewProc("GetCurrentThreadId")
+	procKeybdEvent       = u32.NewProc("keybd_event")
 )
 
 const (
-    // 物理层级常量
-    HWND_TOPMOST   = ^uintptr(0) // -1: 强制置顶
-    HWND_NOTOPMOST = ^uintptr(1) // -2: 解除置顶
-
-    // 状态常量
-    SW_RESTORE     = 9           // 恢复窗口（最小化时有效）
-    
-    // 动作组合标志位: NOSIZE(1) | NOMOVE(2) | SHOWWINDOW(64) = 0x0043
-    SWP_SILKY      = 0x0043 
-	debugPort = "52719"
+	HWND_TOPMOST   = ^uintptr(0)
+	HWND_NOTOPMOST = ^uintptr(1)
+	SW_RESTORE     = 9
+	SWP_SILKY      = 0x0043
+	debugPort      = "52719"
 )
 
 func main() {
@@ -477,7 +465,7 @@ func monitorIconState() {
 	var failCount int
 
 	for {
-		if isReallyExiting { return }
+		if atomic.LoadInt32(&isReallyExiting) == 1 { return }
 
 		// 1. 物理层判定：进程不在，直接灰色
 		if !isProcessRunning("mihomo.exe") {
@@ -578,7 +566,7 @@ func watchTunState() {
 			}
 
 			// 2. 检查系统是否正在忙碌（初始化或正在手动同步中则跳过本次循环）
-			if isSystemInitializing || atomic.LoadInt32(&isSyncing) == 1 {
+			if atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1 {
 				continue
 			}
 
@@ -862,7 +850,7 @@ func setTunMode(enable bool) {
 }
 
 func setProxyRegistry(enable bool) {
-	if !isReallyExiting {
+	if atomic.LoadInt32(&isReallyExiting) == 0 {
 		saveIniConfig("system_proxy_enabled", fmt.Sprint(enable))
 	}
 	key, err := registry.OpenKey(registry.CURRENT_USER, REG_PROXY, registry.SET_VALUE)
