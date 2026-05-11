@@ -473,7 +473,7 @@ func monitorIconState() {
 	for {
 		if isReallyExiting { return }
 
-		// 1. 【最高准则】进程没了，必须 STOP (瞬间变灰)
+		// 1. 物理层判定：进程不在，直接灰色
 		if !isProcessRunning("mihomo.exe") {
 			failCount = 0
 			if lastState != StateStop {
@@ -481,13 +481,12 @@ func monitorIconState() {
 				lastState = StateStop
 			}
 		} else {
-			// 保持原有联动：必须执行以维持同步逻辑
+			// --- 第一步：执行联动函数 ---
+			// 它会更新 isSystemInitializing 的状态
 			curr := checkSystemState()
 
-			// 2. 【TUN 准则】TUN 模式下，内核在但网卡没了，必须 ERROR (瞬间变红)
+			// --- 第二步：物理网卡真实状态捕捉 ---
 			isTunMode := (getIniConfig("tun_enabled") == "true")
-			
-			// 直接检查网卡
 			hasTun := false
 			ifaces, _ := net.Interfaces()
 			for _, i := range ifaces {
@@ -497,23 +496,39 @@ func monitorIconState() {
 				}
 			}
 
+			// --- 第三步：基于“因果”的判定 ---
+			
+			// 如果是 TUN 模式 且 物理网卡没了
 			if isTunMode && !hasTun {
-				failCount = 0 // 物理故障不走容错
-				if lastState != StateError {
-					updateIconByState(StateError)
-					lastState = StateError
+				// 【关键点】
+				// 如果系统此时处于“初始化锁”保护下，说明是正常启动中，我们不报 Error，而是跟从 checkSystemState 的 Stop 信号
+				if isSystemInitializing {
+					// 启动中，网卡没出来很正常，交给 failCount 处理（保持灰色）
+					goto UseFailCountLogic 
+				} else {
+					// 锁已经开了，说明是“运行中”。此时网卡没了，必然是重载或故障！
+					failCount = 0 
+					if lastState != StateError {
+						updateIconByState(StateError)
+						lastState = StateError
+					}
+					// 这种情况下我们不往下走了，直接等待下一秒看它会不会恢复绿
+					time.Sleep(1 * time.Second)
+					continue
 				}
-			} else if curr == StateStop {
-				// 3. 【API 准则】给程序 5 次机会，还没好就压倒性 STOP
+			}
+
+		UseFailCountLogic:
+			// 以下是原有的 5 秒容错逻辑
+			if curr == StateStop {
 				failCount++
 				if failCount > 5 {
-					if lastState != StateStop {
-						updateIconByState(StateStop)
-						lastState = StateStop
+					if lastState != StateError {
+						updateIconByState(StateError)
+						lastState = StateError
 					}
 				}
 			} else {
-				// 正常状态切换
 				failCount = 0
 				if curr != lastState {
 					updateIconByState(curr)
