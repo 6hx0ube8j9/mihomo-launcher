@@ -33,10 +33,11 @@ const (
 	REG_RUN      = `Software\Microsoft\Windows\CurrentVersion\Run`
 	REG_PROXY    = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
 	APP_NAME     = "MihomoLauncher"
-    StateStop    = 0 // 红色：内核离线/API断开
-    StateTun     = 2 // 绿色：TUN 正常工作
-    StateProxy   = 3 // 蓝色：系统代理模式
-    StateDefault = 4 // 灰色：核心存活，无特殊模式
+	StateStop    = 0
+	StateError   = 1
+	StateTun     = 2
+	StateProxy   = 3
+	StateDefault = 4
 )
 
 var (
@@ -91,7 +92,48 @@ const (
 	debugPort      = "52719"
 )
 
+func checkSystemState() int {
+    // 1. 尝试连接内核 API
+    _, err := doAPIRequest("GET", "", nil) 
+    if err != nil {
+        return StateStop // 发出信号：API 暂时不可用
+    }
 
+    // 2. API 成功，重置逻辑锁
+    if atomic.LoadInt32(&isSystemInitializing) == 1 {
+        atomic.StoreInt32(&isSystemInitializing, 0)
+    }
+
+    // 3. 首次同步逻辑 (保持不变)
+    if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
+        go syncConfigToKernel()
+    }
+
+    // 4. 检查网卡
+    if getIniConfig("tun_enabled") == "true" {
+        hasTun := false
+        ifaces, _ := net.Interfaces()
+        for _, i := range ifaces {
+            if isTunInterfaceMatch(i.Name) {
+                hasTun = true
+                break
+            }
+        }
+        if hasTun {
+            return StateTun
+        }
+        
+        // 网卡还没出来时，我们也返回 StateStop 信号，交给外面的计数器去“等”
+        return StateStop 
+    }
+
+    // 5. 检查系统代理
+    if getIniConfig("system_proxy_enabled") == "true" {
+        return StateProxy
+    }
+
+    return StateDefault
+}
 
 func main() {
 	var err error
@@ -388,73 +430,41 @@ func onReady() {
 
 func onExit() {
     exitOnce.Do(func() {
-        // 1. 【广播退出信号】
-        // 立即拦截所有正在运行的 monitor 和 watch 协程，防止它们在退出瞬间误写 INI
         atomic.StoreInt32(&isReallyExiting, 1)
 
-        // 2. 【代理恢复】（最高优先级）
-        // 在关闭内核和清理 Job 之前，先把系统代理关掉
-        // 这样可以避免内核挂了但系统代理还在，导致用户完全无法上网
-        setProxyRegistry(false)
-
-        // 3. 【托盘清理】
-        // 立即从通知栏消失，给用户“已经关掉”的直观感受
-        systray.Quit()
-
-        // 4. 【高级清理】CDP 关闭浏览器标签
-        // 增加了一个判断：只有内核活跃时才尝试关闭，避免不必要的等待
-        if atomic.LoadInt32(&isKernelActive) == 1 {
-            client := &http.Client{Timeout: 150 * time.Millisecond} // 稍微缩短超时
-            apiURL := fmt.Sprintf("http://127.0.0.1:%s/json", debugPort)
-            if resp, err := client.Get(apiURL); err == nil {
-                var targets []map[string]interface{}
-                if json.NewDecoder(resp.Body).Decode(&targets) == nil {
-                    for _, t := range targets {
-                        if id, ok := t["id"].(string); ok {
-                            _, _ = client.Get(fmt.Sprintf("http://127.0.0.1:%s/json/close/%s", debugPort, id))
-                        }
+        // 1. 【高级清理】先通过 CDP 优雅关闭浏览器窗口
+        client := &http.Client{Timeout: 200 * time.Millisecond}
+        apiURL := fmt.Sprintf("http://127.0.0.1:%s/json", debugPort)
+        if resp, err := client.Get(apiURL); err == nil {
+            var targets []map[string]interface{}
+            if json.NewDecoder(resp.Body).Decode(&targets) == nil {
+                for _, t := range targets {
+                    if id, ok := t["id"].(string); ok {
+                        _, _ = client.Get(fmt.Sprintf("http://127.0.0.1:%s/json/close/%s", debugPort, id))
                     }
                 }
-                resp.Body.Close()
             }
+            resp.Body.Close()
         }
 
-        // 5. 【子进程强制收割】
-        // 关闭 Job Object 句柄。根据 Windows 机制，Job 内的所有进程（内核、浏览器）将瞬间结束
-        if hJob != 0 { 
-            windows.CloseHandle(hJob) 
-        }
+        // 2. 【系统恢复】恢复代理设置和图标
+        setProxyRegistry(false)
+        systray.Quit()
 
-        // 6. 【单实例锁释放】
-        // 最后释放 Mutex，确保下次启动时环境是干净的
-        if hMutex != 0 { 
-            windows.CloseHandle(hMutex) 
-        }
+        // 3. 【关键停顿】给 100ms 让信号传递
+        time.Sleep(100 * time.Millisecond)
 
-        // 7. 【彻底物理退出】
-        // 给系统 50ms 处理未完成的 I/O 句柄释放
-        time.Sleep(50 * time.Millisecond)
+        // 4. 【强制兜底】即便 CDP 失败了，这行也能确保子进程（浏览器/内核）彻底消失
+        if hJob != 0 { windows.CloseHandle(hJob) }
+        
+        // 5. 【门锁释放】确保下次启动不会提示“程序已在运行”
+        if hMutex != 0 { windows.CloseHandle(hMutex) }
+
+        // 6. 【彻底退出】
         os.Exit(0)
     })
 }
-func checkSystemState() int {
-    // 1. 尝试连接内核 API
-    _, err := doAPIRequest("GET", "", nil) 
-    if err != nil {
-        return StateStop 
-    }
 
-    // 2. 首次同步逻辑
-    if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
-        go syncConfigToKernel()
-    }
-
-    // 3. 只返回基础业务状态（不再直接判定 TUN 是否成功）
-    if getIniConfig("system_proxy_enabled") == "true" {
-        return StateProxy
-    }
-    return StateDefault
-}
 func monitorKernelDaemon() {
 	target := filepath.Join(baseDir, "mihomo.exe")
 	absBaseDir, _ := filepath.Abs(baseDir)
@@ -494,112 +504,166 @@ func monitorKernelDaemon() {
 	}
 }
 
-var tunPendingCycles int // 记录网卡缺失的循环次数
-
 func monitorIconState() {
-    for {
-        if atomic.LoadInt32(&isReallyExiting) == 1 { return }
+	var failCount int
 
-        localTunWanted := getIniConfig("tun_enabled") == "true"
-        hasTun := hasPhysicalTunInterface()
-        rawState := checkSystemState()
+	for {
+		if atomic.LoadInt32(&isReallyExiting) == 1 { return }
 
-        var curr int
-        if !isProcessRunning("mihomo.exe") {
-            curr = StateStop
-            tunPendingCycles = 0
-        } else {
-            if localTunWanted {
-                if hasTun {
-                    curr = StateTun
-                    tunPendingCycles = 0
-                } else {
-                    if tunPendingCycles < 15 {
-                        tunPendingCycles++
-                        curr = StateStop // 红色压制蓝色
-                    } else {
-                        curr = rawState // 超时放行
-                    }
-                }
-            } else {
-                curr = rawState
-                tunPendingCycles = 0
-            }
-        }
+		// 1. 物理层判定：进程不在，直接灰色
+		if !isProcessRunning("mihomo.exe") {
+			failCount = 0
+			if lastState != StateStop {
+				updateIconByState(StateStop)
+				lastState = StateStop
+			}
+		} else {
+			// --- 第一步：执行联动函数 ---
+			// 它会更新 isSystemInitializing 的状态
+			curr := checkSystemState()
 
-        if curr != lastState {
-            updateIconByState(curr)
-            lastState = curr
-        }
-        time.Sleep(800 * time.Millisecond)
-    }
+			// --- 第二步：物理网卡真实状态捕捉 ---
+			isTunMode := (getIniConfig("tun_enabled") == "true")
+			hasTun := false
+			ifaces, _ := net.Interfaces()
+			for _, i := range ifaces {
+				if isTunInterfaceMatch(i.Name) {
+					hasTun = true
+					break
+				}
+			}
+
+			if isTunMode && !hasTun {
+                actualState := checkSystemState()
+				if actualState != StateTun && actualState != StateStop {
+				    failCount = 0
+					lastState = actualState
+					updateIconByState(actualState)
+					if mTun != nil { mTun.Uncheck() }
+					time.Sleep(1 * time.Second)
+					continue
+				}	
+				if atomic.LoadInt32(&isSystemInitializing) == 1 {
+					// 启动中，网卡没出来很正常，交给 failCount 处理（保持灰色）
+					goto UseFailCountLogic 
+				} else {
+					// 锁已经开了，说明是“运行中”。此时网卡没了，必然是重载或故障！
+					failCount = 0 
+					if lastState != StateError {
+						updateIconByState(StateError)
+						lastState = StateError
+					}
+					// 这种情况下我们不往下走了，直接等待下一秒看它会不会恢复绿
+					time.Sleep(1 * time.Second)
+					continue
+				}
+			}
+
+		UseFailCountLogic:
+			// 以下是原有的 5 秒容错逻辑
+			if curr == StateStop {
+				failCount++
+				if failCount > 5 {
+					if lastState != StateError {
+						updateIconByState(StateError)
+						lastState = StateError
+					}
+				}
+			} else {
+				failCount = 0
+				if curr != lastState {
+					updateIconByState(curr)
+					lastState = curr
+				}
+			}
+		}
+
+		time.Sleep(1 * time.Second)
+	}
 }
-func renderIconPhysically(state int) {
-    iconMap := map[int]string{
-        StateStop:    "stop.ico",
-        StateTun:     "tun.ico",
-        StateProxy:   "proxy.ico",
-        StateDefault: "default.ico",
-    }
-    
-    fileName, ok := iconMap[state]
-    if !ok { return }
 
-    // 注意：这里的 iconFs 必须是你定义的 embed.FS
-    if b, err := iconFs.ReadFile("icons/" + fileName); err == nil {
-        systray.SetIcon(b)
-    }
-}
 func watchTunState() {
-    ticker := time.NewTicker(2 * time.Second)
-    defer ticker.Stop()
-    var lastHasTun bool
+	// 使用 Ticker 替代阻塞 API。3秒一次的频率在性能与实时性之间平衡得最好
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
 
-    for {
-        select {
-        case <-ticker.C:
-            if atomic.LoadInt32(&isReallyExiting) == 1 { return }
+	var lastHasTun bool
 
-            // 只在 Launcher 正在点重载 (isSyncing) 时拦截，防止 PATCH 请求冲突
-            if atomic.LoadInt32(&isSyncing) == 1 {
-                continue
-            }
+	// --- 启动时初始化状态 ---
+	// 先查一次防止漏掉启动瞬间的状态
+	ifaces, _ := net.Interfaces()
+	for _, i := range ifaces {
+		if isTunInterfaceMatch(i.Name) {
+			lastHasTun = true
+			break
+		}
+	}
 
-            // 物理查网卡
-            currentHasTun := false
-            currentIfaces, _ := net.Interfaces()
-            for _, i := range currentIfaces {
-                if isTunInterfaceMatch(i.Name) {
-                    currentHasTun = true
-                    break
-                }
-            }
+	for {
+		select {
+		case <-ticker.C:
+			if atomic.LoadInt32(&isReallyExiting) == 1 {
+				return
+			}
 
-            if currentHasTun != lastHasTun {
-                lastHasTun = currentHasTun
-                // 关键：只要内核活着，Web 改了网卡，我们就同步
-                if atomic.LoadInt32(&isKernelActive) == 1 {
-                    saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
-                    if mTun != nil {
-                        if currentHasTun { mTun.Check() } else { mTun.Uncheck() }
-                    }
-                    // 强制 monitorIconState 立即重绘
-                    lastState = -1 
-                }
-            }
-        }
-    }
-}
-// 提取出的公共检测函数
-func hasPhysicalTunInterface() bool {
-    ifaces, err := net.Interfaces()
-    if err != nil { return false }
-    for _, i := range ifaces {
-        if isTunInterfaceMatch(i.Name) {
-            return true
-        }
-    }
-    return false
+			// 2. 检查系统是否正在忙碌（初始化或正在手动同步中则跳过本次循环）
+			if atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1 {
+				continue
+			}
+
+			// 3. 获取当前物理网卡列表，检查 TUN 设备是否存在
+			currentHasTun := false
+			currentIfaces, err := net.Interfaces()
+			if err != nil {
+				// 获取网卡列表失败可能是系统底层调用繁忙，跳过等待下次 ticker
+				continue
+			}
+
+			for _, i := range currentIfaces {
+				if isTunInterfaceMatch(i.Name) {
+					currentHasTun = true
+					break
+				}
+			}
+
+			// 4. 当物理网卡状态发生“变化”时（Web操作、手动开关、内核崩溃等）
+			if currentHasTun != lastHasTun {
+				
+				// --- 【核心安全判定】 ---
+				// 只有当内核处于活动状态，且没有在准备退出时，才认为是“有效的状态变更”
+				if atomic.LoadInt32(&isKernelActive) == 1 && atomic.LoadInt32(&isReallyExiting) == 0 {
+					
+					lastHasTun = currentHasTun
+
+					// A. 【加急情报汇报】
+					// 强制标记为“已同步”，防止 checkSystemState 触发 syncConfigToKernel 
+					// 这样就不会因为读取到旧的 .ini 配置而把刚刚从 Web 关掉的 TUN 又强行开回去
+					atomic.StoreInt32(&hasFirstSynced, 1)
+
+					// B. 【持久化配置】
+					// 既然确定是运行时变动，将新的物理事实写入配置文件
+					saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
+
+					// C. 【立即同步 UI 状态】
+					// 不等 monitorIconState 的下一秒循环，我们在这里直接触发一次状态自检并更新图标
+					// 这能彻底消除从 Web 关闭 TUN 时产生的“黄色/红色”闪烁
+					newState := checkSystemState()
+					updateIconByState(newState)
+					lastState = newState // 强制同步指挥官手里的“最后记录”
+
+					// D. 【更新菜单勾选】
+					if mTun != nil {
+						if currentHasTun {
+							mTun.Check()
+						} else {
+							mTun.Uncheck()
+						}
+					}
+
+				}
+			}
+		}
+	}
 }
 func syncConfigToKernel() {
     if !atomic.CompareAndSwapInt32(&isSyncing, 0, 1) {
@@ -640,7 +704,69 @@ func syncConfigToKernel() {
     atomic.StoreInt32(&isSystemInitializing, 0)
 }
 
+func doAPIRequest(method, path string, payload interface{}) ([]byte, error) {
+	// 1. 获取并格式化 API 地址
+	apiAddr := strings.TrimSuffix(getIniConfig("external-controller"), "/")
+	if apiAddr == "" {
+		return nil, fmt.Errorf("api address is empty")
+	}
+	url := apiAddr + "/" + strings.TrimPrefix(path, "/")
 
+	// 2. 处理请求 Body
+	var bodyReader io.Reader
+	if payload != nil {
+		b, err := json.Marshal(payload)
+		if err != nil {
+			return nil, fmt.Errorf("marshal payload failed: %v", err)
+		}
+		bodyReader = bytes.NewBuffer(b)
+	}
+
+	// 3. 创建请求
+	req, err := http.NewRequest(method, url, bodyReader)
+	if err != nil {
+		return nil, err
+	}
+
+	// 4. 设置 Header
+	req.Header.Set("Content-Type", "application/json")
+	if secret := getIniConfig("secret"); secret != "" {
+		req.Header.Set("Authorization", "Bearer "+secret)
+	}
+
+	// 5. 执行请求
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	// 确保 Body 最终被关闭，防止连接泄漏
+	defer resp.Body.Close()
+
+	// 6. 性能优化：心跳检测逻辑
+	// 如果是 GET 请求且 path 为空（说明来自 checkSystemState 的存活检查）
+	// 我们只关心状态码，不关心内容，直接丢弃 Body 以节省内存分配
+	if method == "GET" && (path == "" || path == "/") {
+		_, _ = io.Copy(io.Discard, resp.Body)
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return nil, fmt.Errorf("API Heartbeat Error: %d", resp.StatusCode)
+		}
+		return nil, nil
+	}
+
+	// 7. 读取响应内容
+	// 对于配置更新、状态获取等请求，我们需要读取完整的响应体
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("read response body failed: %v", err)
+	}
+
+	// 8. 错误状态码处理
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return body, fmt.Errorf("API Error: %d, Response: %s", resp.StatusCode, string(body))
+	}
+
+	return body, nil
+}
 
 func ensureDefaultConfig() {
 	configMu.Lock()
@@ -749,7 +875,33 @@ func sniffAndSolidifyConfig() {
 	}
 }
 
+func setMihomoMode(mode string) {
+	saveIniConfig("mode", mode)
+	_, _ = doAPIRequest("PATCH", "/configs", map[string]string{"mode": mode})
+}
 
+func setTunMode(enable bool) {
+	atomic.StoreInt32(&isSystemInitializing, 1)
+	saveIniConfig("tun_enabled", fmt.Sprint(enable))
+	_, _ = doAPIRequest("PATCH", "/configs", map[string]interface{}{"tun": map[string]bool{"enable": enable}})
+	time.Sleep(3 * time.Second)
+	atomic.StoreInt32(&isSystemInitializing, 0)
+}
+
+func setProxyRegistry(enable bool) {
+	if atomic.LoadInt32(&isReallyExiting) == 0 {
+		saveIniConfig("system_proxy_enabled", fmt.Sprint(enable))
+	}
+	key, err := registry.OpenKey(registry.CURRENT_USER, REG_PROXY, registry.SET_VALUE)
+	if err != nil { return }
+	defer key.Close()
+	if enable {
+		_ = key.SetDWordValue("ProxyEnable", 1)
+		_ = key.SetStringValue("ProxyServer", getIniConfig("proxy_address"))
+	} else {
+		_ = key.SetDWordValue("ProxyEnable", 0)
+	}
+}
 
 func toggleAutoStart(enable bool) {
 	const taskName = "MihomoLauncherTask"
@@ -779,7 +931,15 @@ func toggleAutoStart(enable bool) {
 	if success { saveIniConfig("startup_enabled", fmt.Sprint(enable)) }
 }
 
-
+func reloadConfigFile() {
+    atomic.StoreInt32(&isSystemInitializing, 1)
+    _, err := doAPIRequest("PUT", "/configs?force=false", map[string]string{"path": filepath.Join(baseDir, "config.yaml")})
+    if err != nil {
+        atomic.StoreInt32(&isSystemInitializing, 0)
+        return
+    }
+    go syncConfigToKernel()
+}
 
 
 func isAdmin() bool {
@@ -842,145 +1002,19 @@ func KillProcessByName(name string) {
     }
 }
 
-func setMihomoMode(mode string) {
-	saveIniConfig("mode", mode)
-	_, _ = doAPIRequest("PATCH", "/configs", map[string]string{"mode": mode})
-}
-
-func setTunMode(enable bool) {
-	atomic.StoreInt32(&isSystemInitializing, 1)
-	saveIniConfig("tun_enabled", fmt.Sprint(enable))
-	_, _ = doAPIRequest("PATCH", "/configs", map[string]interface{}{"tun": map[string]bool{"enable": enable}})
-	time.Sleep(3 * time.Second)
-	atomic.StoreInt32(&isSystemInitializing, 0)
-}
-
-func setProxyRegistry(enable bool) {
-	if atomic.LoadInt32(&isReallyExiting) == 0 {
-		saveIniConfig("system_proxy_enabled", fmt.Sprint(enable))
-	}
-	key, err := registry.OpenKey(registry.CURRENT_USER, REG_PROXY, registry.SET_VALUE)
-	if err != nil { return }
-	defer key.Close()
-	if enable {
-		_ = key.SetDWordValue("ProxyEnable", 1)
-		_ = key.SetStringValue("ProxyServer", getIniConfig("proxy_address"))
-	} else {
-		_ = key.SetDWordValue("ProxyEnable", 0)
-	}
-}
-func reloadConfigFile() {
-    atomic.StoreInt32(&isSystemInitializing, 1)
-    _, err := doAPIRequest("PUT", "/configs?force=false", map[string]string{"path": filepath.Join(baseDir, "config.yaml")})
-    if err != nil {
-        atomic.StoreInt32(&isSystemInitializing, 0)
-        return
-    }
-    go syncConfigToKernel()
-}
 func checkAutoStartStatus() bool {
 	cmd := exec.Command("schtasks", "/Query", "/TN", "MihomoLauncherTask")
 	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 	return cmd.Run() == nil
 }
-func doAPIRequest(method, path string, payload interface{}) ([]byte, error) {
-	// 1. 获取并格式化 API 地址
-	apiAddr := strings.TrimSuffix(getIniConfig("external-controller"), "/")
-	if apiAddr == "" {
-		return nil, fmt.Errorf("api address is empty")
-	}
-	url := apiAddr + "/" + strings.TrimPrefix(path, "/")
 
-	// 2. 处理请求 Body
-	var bodyReader io.Reader
-	if payload != nil {
-		b, err := json.Marshal(payload)
-		if err != nil {
-			return nil, fmt.Errorf("marshal payload failed: %v", err)
+func updateIconByState(state int) {
+	files := []string{"stop.ico", "error.ico", "tun.ico", "proxy.ico", "default.ico"}
+	if state >= 0 && state < len(files) {
+		if b, err := iconFs.ReadFile("icons/" + files[state]); err == nil {
+			systray.SetIcon(b)
 		}
-		bodyReader = bytes.NewBuffer(b)
 	}
-
-	// 3. 创建请求
-	req, err := http.NewRequest(method, url, bodyReader)
-	if err != nil {
-		return nil, err
-	}
-
-	// 4. 设置 Header
-	req.Header.Set("Content-Type", "application/json")
-	if secret := getIniConfig("secret"); secret != "" {
-		req.Header.Set("Authorization", "Bearer "+secret)
-	}
-
-	// 5. 执行请求
-	resp, err := httpClient.Do(req)
-	if err != nil {
-		return nil, err
-	}
-	// 确保 Body 最终被关闭，防止连接泄漏
-	defer resp.Body.Close()
-
-	// 6. 性能优化：心跳检测逻辑
-	// 如果是 GET 请求且 path 为空（说明来自 checkSystemState 的存活检查）
-	// 我们只关心状态码，不关心内容，直接丢弃 Body 以节省内存分配
-	if method == "GET" && (path == "" || path == "/") {
-		_, _ = io.Copy(io.Discard, resp.Body)
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return nil, fmt.Errorf("API Heartbeat Error: %d", resp.StatusCode)
-		}
-		return nil, nil
-	}
-
-	// 7. 读取响应内容
-	// 对于配置更新、状态获取等请求，我们需要读取完整的响应体
-	body, err := io.ReadAll(resp.Body)
-	if err != nil {
-		return nil, fmt.Errorf("read response body failed: %v", err)
-	}
-
-	// 8. 错误状态码处理
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return body, fmt.Errorf("API Error: %d, Response: %s", resp.StatusCode, string(body))
-	}
-
-	return body, nil
-}
-func updateIconByState(requestedState int) {
-    hasTun := hasPhysicalTunInterface()
-    // 确保 isKernelActive 是 atomic 获取或者是 bool
-    isKernelRunning := isProcessRunning("mihomo.exe")
-    tunWanted := getIniConfig("tun_enabled") == "true"
-
-    finalState := requestedState
-
-    if !isKernelRunning {
-        finalState = StateStop
-    } else {
-        if tunWanted {
-            if hasTun {
-                finalState = StateTun
-            } else {
-                // 超时前死守红色，拦截蓝色
-                if tunPendingCycles < 15 {
-                    finalState = StateStop
-                }
-                // 超时后自然降级为 requestedState (即 rawState)
-            }
-        }
-    }
-
-    // 同步菜单
-    if mTun != nil {
-        if finalState == StateTun {
-            mTun.Check()
-        } else {
-            mTun.Uncheck()
-        }
-    }
-
-    // 调用上面定义的底层渲染
-    renderIconPhysically(finalState)
 }
 
 func getIniConfig(key string) string {
