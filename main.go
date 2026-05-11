@@ -93,7 +93,7 @@ const (
 )
 
 func checkSystemState() int {
-    // 1. 获取物理网卡事实
+    // 1. 获取物理网卡事实 (先拿事实，作为后续校准的“否决权”)
     hasTunOnSystem := false
     ifaces, _ := net.Interfaces()
     for _, i := range ifaces {
@@ -105,64 +105,72 @@ func checkSystemState() int {
 
     // 2. 尝试连接内核 API 获取实时配置
     resp, err := doAPIRequest("GET", "/configs", nil)
-    if err != nil { 
-        return StateStop // API 连不上，说明内核正在重启或挂了
+    if err != nil {
+        return StateStop // API 连不上，说明内核正在重启或挂了，保持现状
     }
 
-    // --- 【修正语法错误点】 ---
-    respStr := string(resp)
-    if !strings.Contains(respStr, `"port"`) { // 连 port 都没有，说明内核没准备好
-        return StateStop
-    }
-
-    // --- 【核心增强逻辑】 ---
+    // --- 【核心增强手术：带“否决权”的校准保护】 ---
     
     // 判定当前是否允许校准 (非初始化中、非手动同步中)
     isBusy := atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1
     
     if !isBusy {
         // 解析内核真实状态
+        respStr := string(resp)
         kernelTunEnabled := strings.Contains(respStr, `"tun":`) && strings.Contains(respStr, `"enable":true`)
         localTunConfig := (getIniConfig("tun_enabled") == "true")
 
-        // 场景：本地以为开着，但 API 说关了
+        // 场景：本地以为开着，但 API 说关了 (可能是 Web 操作，也可能是内核重载瞬间)
         if !kernelTunEnabled && localTunConfig {
             /* 
-               双重校验保险：
-               只有当 (API说关了) 且 (物理网卡也真的消失了) 时，才确信是 Web 端的操作。
+               关键保险：只有当 (API说关了) 且 (物理网卡也真的消失了) 时，才确信是 Web 端的操作。
+               如果此时物理网卡还在，说明内核正在重载或者还没反应过来，绝对不能改写 ini。
             */
             if !hasTunOnSystem {
-                // 确认是人为在 Web 关闭
-                if len(resp) > 100 { 
+                // 双重证据确凿，说明是 Web 面板关掉了 TUN
+                if len(resp) > 100 { // 长度校验，确保 resp 不是异常短的错误信息
                     saveIniConfig("tun_enabled", "false")
                     if mTun != nil { mTun.Uncheck() }
-                    localTunConfig = false // 更新局部变量供后续判断
+                    localTunConfig = false // 更新当前局部变量
                 }
             } else {
-                // 关键点：API说关了但网卡还在，判定为“重载中”或“数据不同步”
-                // 返回 StateStop 保护 ini 不被误改
+                // 虽然 API 说关了，但网卡还在，可能是重载瞬间。
+                // 我们返回 StateStop 稳住图标，不报错，也不改 ini。
                 return StateStop 
             }
         }
         
-        // 反向校准：如果 Web 开了，本地没开
+        // 反向校准：如果 Web 开了，本地没开，这种同步通常是安全的
         if kernelTunEnabled && !localTunConfig {
             saveIniConfig("tun_enabled", "true")
             if mTun != nil { mTun.Check() }
-            localTunConfig = true
         }
     }
+    // --- 【校准结束】 ---
 
-    // 3. 最终状态判定 (基于校准后的 localTunConfig)
-    // 必须重新获取一遍最新的配置值，确保返回的图标状态是正确的
+    // 3. API 成功，重置初始化锁
+    if atomic.LoadInt32(&isSystemInitializing) == 1 {
+        atomic.StoreInt32(&isSystemInitializing, 0)
+    }
+
+    // 4. 首次同步逻辑 (保持不变)
+    if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
+        go syncConfigToKernel()
+    }
+
+    // 5. 最终判定逻辑 (此时以最新的 ini 状态为准)
     currentTunPlan := (getIniConfig("tun_enabled") == "true")
     if currentTunPlan {
         if hasTunOnSystem {
-            return StateTun // 只有配置要开且网卡真在，才亮蓝色
+            return StateTun // 计划要开且网卡存在：正常
         }
-        return StateStop // 配置要开但网卡还没出来，变灰
+        // 计划要开但网卡不在：
+        // 可能是重载瞬间或启动慢。返回 Stop 让 monitorIconState 的 failCount 缓冲。
+        // 不会写死 ini 为 false。
+        return StateStop 
     }
 
+    // 检查系统代理模式
     if getIniConfig("system_proxy_enabled") == "true" {
         return StateProxy
     }
@@ -505,34 +513,32 @@ func monitorKernelDaemon() {
     absBaseDir, _ := filepath.Abs(baseDir)
 
     for {
-        // 1. 退出前置检查
+        // 1. 检查是否正在退出进程
         if atomic.LoadInt32(&isReallyExiting) == 1 {
             return
         }
 
-        // 2. 检查进程是否存在
+        // 2. 核心守护逻辑：如果进程不在运行
         if !isProcessRunning("mihomo.exe") {
-            // --- 【严父模式：强制锁死禁区】 ---
-            // 在杀进程和重载前，先立起“初始化”大旗
-            // 这会导致 saveIniConfig 和 watchTunState 的写入逻辑失效
-            atomic.StoreInt32(&isSystemInitializing, 1) 
-            atomic.StoreInt32(&hasFirstSynced, 0)      // 重置同步状态
-            atomic.StoreInt32(&isKernelActive, 0)      // 标记内核当前离线
+            // --- 【启动保护期开始】 ---
+            atomic.StoreInt32(&isSystemInitializing, 1) // 开启全局初始化锁
+            atomic.StoreInt32(&hasFirstSynced, 0)      // 重置同步标记
+            atomic.StoreInt32(&isKernelActive, 0)      // 标记内核不活跃
 
-            // 清理可能残留的进程
+            // 清理可能残留的进程（容错）
             KillProcessByName("mihomo.exe")
-            time.Sleep(500 * time.Millisecond) // 给系统回收句柄留点时间
+            time.Sleep(500 * time.Millisecond)
 
             // 3. 启动内核进程
             cmd := exec.Command(target, "-d", ".")
             cmd.Dir = absBaseDir
-            // Windows 下隐藏 CMD 黑窗口
+            // 隐藏窗口启动
             cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 
             if err := cmd.Start(); err == nil {
                 atomic.StoreInt32(&isKernelActive, 1)
 
-                // 将进程绑定到 Job Object，确保托盘关掉时内核跟着陪葬
+                // 将进程绑定到 Job Object，确保托盘退出时内核必死
                 if hJob != 0 {
                     hp, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
                     if err == nil {
@@ -541,40 +547,38 @@ func monitorKernelDaemon() {
                     }
                 }
 
-                // 异步等待进程结束，进程一旦结束立刻标记离线
+                // 异步等待进程结束
                 go func(c *exec.Cmd) {
                     _ = c.Wait()
                     atomic.StoreInt32(&isKernelActive, 0)
-                    // 如果进程异常退出，下个 2s 循环会自动触发重启并再次上锁
                 }(cmd)
 
-                // --- 【智能动态解锁逻辑】 ---
-                // 不再硬睡 1.5s，而是启动一个状态探针
+                // --- 【核心优化点：动态释放初始化锁】 ---
+                // 不再硬睡 1.5s，而是启动一个探针。
+                // 只有当 API 能跑通且返回了有效配置，才认为初始化完成。
                 go func() {
-                    // 最多轮询 12 次 (约 6-7 秒)，防止内核启动失败导致永久锁死
+                    // 最多等待 6 秒（12次循环），超时则强制解锁防止死锁
                     for i := 0; i < 12; i++ {
                         time.Sleep(500 * time.Millisecond)
                         
-                        // 探测 API 是否不仅连通，而且数据完整
+                        // 探测 API 是否就绪
                         resp, err := doAPIRequest("GET", "/configs", nil)
-                        if err == nil && len(resp) > 200 && strings.Contains(string(resp), `"port"`) {
-                            // API 已经能返回正常的业务数据，说明加载稳了
-                            // 此时再额外缓冲 500ms，等 Windows 网卡创建彻底完成
-                            time.Sleep(500 * time.Millisecond)
+                        if err == nil && len(resp) > 200 {
+                            // API 已经能返回正常的 JSON 配置，说明加载稳了
                             break
                         }
                     }
-                    // 此时解开禁制，checkSystemState 和 watchTunState 恢复磁盘写入权限
+                    // 只有这里解锁了，checkSystemState 里的“校准手术”才会被允许执行
                     atomic.StoreInt32(&isSystemInitializing, 0)
                 }()
 
             } else {
-                // 启动失败的容错：解开锁，让 checkSystemState 能报告 StateError(红色)
+                // 启动失败，立即释放锁以便尝试下一次循环，或触发 Error 图标
                 atomic.StoreInt32(&isSystemInitializing, 0)
             }
         }
 
-        // 4. 巡检频率
+        // 4. 守护频率：每 2 秒巡检一次
         time.Sleep(2 * time.Second)
     }
 }
