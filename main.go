@@ -589,8 +589,6 @@ func syncConfigToKernel() {
     }
     defer atomic.StoreInt32(&isSyncing, 0)
 
-    isSystemInitializing = true
-    // 保护：如果函数因为意外卡死，10秒后强制解除初始化状态
     timer := time.AfterFunc(10*time.Second, func() { isSystemInitializing = false })
     defer timer.Stop()
 
