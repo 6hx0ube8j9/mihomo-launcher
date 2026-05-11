@@ -57,6 +57,7 @@ var (
 	tunErrorCounter      = 0
 	mTun                 *systray.MenuItem
 	isKernelActive       int32
+	manualUpdateTrigger  int32
     user32           = windows.NewLazySystemDLL("user32.dll")
     kernel32         = windows.NewLazySystemDLL("kernel32.dll")
     // 动态库载入
@@ -585,31 +586,29 @@ func watchTunState() {
 					break
 				}
 			}
+			
+            if currentHasTun != lastHasTun {
+                lastHasTun = currentHasTun
 
-			// 4. 只有当网卡状态发生“变化”时，才触发逻辑
-			if currentHasTun != lastHasTun {
-				// 记录日志或更新状态
-				lastHasTun = currentHasTun
+                // 只有内核处于活动状态时，才去执行同步
+                if atomic.LoadInt32(&isKernelActive) == 1 {
 
-				// 只有内核处于活动状态时，才去同步 UI 和配置
-				if atomic.LoadInt32(&isKernelActive) == 1 {
-					// 更新托盘菜单的勾选状态
-					if mTun != nil {
-						if currentHasTun {
-							mTun.Check()
-						} else {
-							mTun.Uncheck()
-						}
-					}
+                    newState := checkSystemState()
 
-					// 自动持久化当前状态到 INI 配置
-					// 这样如果用户在外部手动关了 TUN，Launcher 也能记住
-					saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
-					
-					// 如果你希望在网卡丢失时通知内核，可以在这里调用 API
-					// _, _ = doAPIRequest("PATCH", "/configs", map[string]interface{}{"tun": map[string]bool{"enable": currentHasTun}})
-				}
-			}
+                    updateIconByState(newState)
+                    lastState = newState 
+
+                    saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
+
+                    if mTun != nil {
+                        if currentHasTun {
+                            mTun.Check()
+                        } else {
+                            mTun.Uncheck()
+                        }
+                    }
+                }
+            }
 			
 		}
 	}
