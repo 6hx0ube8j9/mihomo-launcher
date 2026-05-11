@@ -106,10 +106,8 @@ func checkSystemState() int {
         go syncConfigToKernel()
     }
 
-    // --- 加固：解析更多有用字段 ---
     var cfg struct {
-        Mode string `json:"mode"`
-        Tun  struct {
+        Tun struct {
             Enable bool `json:"enable"`
         } `json:"tun"`
     }
@@ -117,20 +115,26 @@ func checkSystemState() int {
     if err := json.Unmarshal(res, &cfg); err == nil {
         localTunEnabled := getIniConfig("tun_enabled") == "true"
         
-        // --- 手术位置 2：排他性判定 ---
-        // 只要本地配置决定要开 TUN，不管网卡在不在，也不管 Proxy 开没开
-        // 这一步直接截断逻辑，不准它往后面滑
-        if localTunEnabled {
-            // 这里我们只需要确定 API 没说“强制关闭”即可
-            // 如果 API 能通，且 cfg.Tun.Enable 是 true，或者 API 正忙
-            return StateTun 
+        // --- 核心同步手术位置 ---
+        // 如果 Web 说关了，但本地还写着开，且当前没在“重载/同步”忙碌期
+        isBusy := atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1
+        
+        if !cfg.Tun.Enable && localTunEnabled && !isBusy {
+            saveIniConfig("tun_enabled", "false"))
+            if mTun != nil {
+                mTun.Uncheck()
+            }
+        }
+
+        // 判定返回值
+        if cfg.Tun.Enable {
+            return StateTun
         }
     }
 
     if getIniConfig("system_proxy_enabled") == "true" {
         return StateProxy
     }
-    
     return StateDefault
 }
 
