@@ -588,7 +588,7 @@ func watchTunState() {
 				
 				// --- 【核心安全判定】 ---
 				// 只有当内核处于活动状态，且没有在准备退出时，才认为是“有效的状态变更”
-				if atomic.LoadInt32(&isKernelActive) == 1 && !isReallyExiting {
+				if atomic.LoadInt32(&isKernelActive) == 1 && atomic.LoadInt32(&isReallyExiting) == 0 {
 					
 					lastHasTun = currentHasTun
 
@@ -616,9 +616,7 @@ func watchTunState() {
 							mTun.Uncheck()
 						}
 					}
-					
-					// 日志记录（可选）
-					// log.Printf("[WatchDog] TUN 状态变更捕捉成功: %v, 已同步至配置与图标", currentHasTun)
+
 				}
 			}
 		}
