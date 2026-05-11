@@ -377,7 +377,7 @@ func onReady() {
 
     mRestart := mMoreRoot.AddSubMenuItem("重启内核", "")
     mRestart.Click(func() {
-        isSystemInitializing = true
+        atomic.StoreInt32(&isSystemInitializing, 1)
         atomic.StoreInt32(&hasFirstSynced, 0)
         KillProcessByName("mihomo.exe")
     })
@@ -442,7 +442,7 @@ func monitorKernelDaemon() {
 			return
 		}
 		if !isProcessRunning("mihomo.exe") {
-			isSystemInitializing = true
+			atomic.StoreInt32(&isSystemInitializing, 1)
 			atomic.StoreInt32(&hasFirstSynced, 0)
 			atomic.StoreInt32(&isKernelActive, 0)
 			KillProcessByName("mihomo.exe")
@@ -464,9 +464,9 @@ func monitorKernelDaemon() {
 					atomic.StoreInt32(&isKernelActive, 0)
 				}(cmd)
 				time.Sleep(1500 * time.Millisecond)
-				isSystemInitializing = false
+				atomic.StoreInt32(&isSystemInitializing, 0)
 			} else {
-				isSystemInitializing = false
+				atomic.StoreInt32(&isSystemInitializing, 0)
 			}
 		}
 		time.Sleep(2 * time.Second)
@@ -512,7 +512,7 @@ func monitorIconState() {
 					time.Sleep(1 * time.Second)
 					continue
 				}	
-				if isSystemInitializing {
+				if atomic.LoadInt32(&isSystemInitializing) == 1 {
 					// 启动中，网卡没出来很正常，交给 failCount 处理（保持灰色）
 					goto UseFailCountLogic 
 				} else {
@@ -644,9 +644,9 @@ func syncConfigToKernel() {
     }
     defer atomic.StoreInt32(&isSyncing, 0)
 
-    isSystemInitializing = true
+    atomic.StoreInt32(&isSystemInitializing, 1)
     // 保护：如果函数因为意外卡死，10秒后强制解除初始化状态
-    timer := time.AfterFunc(10*time.Second, func() { isSystemInitializing = false })
+    timer := time.AfterFunc(10*time.Second, func() { atomic.StoreInt32(&isSystemInitializing, 0) })
     defer timer.Stop()
 
     tunEnabled := getIniConfig("tun_enabled") == "true"
@@ -674,7 +674,7 @@ func syncConfigToKernel() {
         time.Sleep(500 * time.Millisecond)
     }
 
-    isSystemInitializing = false
+    atomic.StoreInt32(&isSystemInitializing, 0)
 }
 
 func doAPIRequest(method, path string, payload interface{}) ([]byte, error) {
@@ -854,11 +854,11 @@ func setMihomoMode(mode string) {
 }
 
 func setTunMode(enable bool) {
-	isSystemInitializing = true
+	atomic.StoreInt32(&isSystemInitializing, 1)
 	saveIniConfig("tun_enabled", fmt.Sprint(enable))
 	_, _ = doAPIRequest("PATCH", "/configs", map[string]interface{}{"tun": map[string]bool{"enable": enable}})
 	time.Sleep(3 * time.Second)
-	isSystemInitializing = false
+	atomic.StoreInt32(&isSystemInitializing, 0)
 }
 
 func setProxyRegistry(enable bool) {
@@ -905,10 +905,10 @@ func toggleAutoStart(enable bool) {
 }
 
 func reloadConfigFile() {
-    isSystemInitializing = true
+    atomic.StoreInt32(&isSystemInitializing, 1)
     _, err := doAPIRequest("PUT", "/configs?force=false", map[string]string{"path": filepath.Join(baseDir, "config.yaml")})
     if err != nil {
-        isSystemInitializing = false
+        atomic.StoreInt32(&isSystemInitializing, 0)
         return
     }
     go syncConfigToKernel()
@@ -922,8 +922,8 @@ func checkSystemState() int {
     }
 
     // 2. API 成功，重置逻辑锁
-    if isSystemInitializing {
-        isSystemInitializing = false
+    if atomic.LoadInt32(&isSystemInitializing) == 1 {
+        atomic.StoreInt32(&isSystemInitializing, 0)
     }
 
     // 3. 首次同步逻辑 (保持不变)
