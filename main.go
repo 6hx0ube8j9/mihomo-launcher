@@ -120,7 +120,7 @@ func checkSystemState() int {
         isBusy := atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1
         
         if !cfg.Tun.Enable && localTunEnabled && !isBusy {
-            saveIniConfig("tun_enabled", "false"))
+            saveIniConfig("tun_enabled", "false")
             if mTun != nil {
                 mTun.Uncheck()
             }
