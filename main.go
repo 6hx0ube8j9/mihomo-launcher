@@ -94,40 +94,29 @@ const (
 
 func checkSystemState() int {
     res, err := doAPIRequest("GET", "/configs", nil)
+    isBusy := atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1
+    localTun := getIniConfig("tun_enabled") == "true"
+
     if err != nil {
+        // 重启中 API 不通，如果原本是 TUN，坚持报 StateTun
+        if isBusy && localTun { return StateTun }
         return StateStop
     }
 
-    if atomic.LoadInt32(&isSystemInitializing) == 1 {
-        atomic.StoreInt32(&isSystemInitializing, 0)
-    }
-
-    if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
-        go syncConfigToKernel()
-    }
-
     var cfg struct {
-        Tun struct {
-            Enable bool `json:"enable"`
-        } `json:"tun"`
+        Tun struct { Enable bool `json:"enable"` } `json:"tun"`
     }
     
     if err := json.Unmarshal(res, &cfg); err == nil {
-        localTunEnabled := getIniConfig("tun_enabled") == "true"
-        
-        // --- 核心同步手术位置 ---
-        // 如果 Web 说关了，但本地还写着开，且当前没在“重载/同步”忙碌期
-        isBusy := atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1
-        
-        if !cfg.Tun.Enable && localTunEnabled && !isBusy {
+        // 同步逻辑：只在不忙且确实关闭时同步
+        if !isBusy && !cfg.Tun.Enable && localTun {
             saveIniConfig("tun_enabled", "false")
-            if mTun != nil {
-                mTun.Uncheck()
-            }
+            if mTun != nil { mTun.Uncheck() }
+            localTun = false
         }
 
-        // 判定返回值
-        if cfg.Tun.Enable {
+        // 返回状态：只要 API 开了，或者我们想开且正在重启，都报绿色
+        if cfg.Tun.Enable || (localTun && isBusy) {
             return StateTun
         }
     }
@@ -513,18 +502,19 @@ func monitorIconState() {
     for {
         if atomic.LoadInt32(&isReallyExiting) == 1 { return }
 
-        var curr int // 当前循环锁定的状态
+        var curr int 
+        isBusy := atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1
 
         if !isProcessRunning("mihomo.exe") {
             curr = StateStop
             failCount = 0
         } else {
-            // 获取核心状态
+            // 1. 获取理论状态
             curr = checkSystemState()
             
-            // --- TUN 专项逻辑：处理 failCount ---
-            isTunMode := (getIniConfig("tun_enabled") == "true")
-            if isTunMode {
+            // 2. TUN 专项逻辑
+            isTunIntent := (getIniConfig("tun_enabled") == "true")
+            if isTunIntent {
                 hasTun := false
                 ifaces, _ := net.Interfaces()
                 for _, i := range ifaces {
@@ -536,35 +526,47 @@ func monitorIconState() {
 
                 if hasTun {
                     failCount = 0
+                    // 如果网卡在，强行修正为绿色
+                    curr = StateTun 
                 } else {
-                    // 没网卡时，根据忙碌状态累加 failCount
-                    isBusy := atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1
-                    if isBusy { failCount++ } else { failCount += 2 }
-
-                    // 如果还没到报错阈值，我们暂时维持 curr 为 StateTun 
-                    // 这样图标就不会在变色前闪烁
-                    if failCount > 3 {
-                        curr = StateError
+                    // 物理网卡消失时的处理
+                    if isBusy {
+                        // 【关键】重启中没网卡很正常，不累加计数，且强行维持绿色
+                        curr = StateTun 
+                    } else {
+                        // 真的丢了网卡
+                        failCount += 2
+                        if failCount > 5 {
+                            curr = StateError
+                        } else {
+                            // 计数中，暂时维持绿色不跳变
+                            curr = StateTun 
+                        }
                     }
                 }
             } else {
-                // 非 TUN 模式，如果 API 不通 (StateStop)，走 5 秒容错
+                // 非 TUN 模式
                 if curr == StateStop {
-                    failCount++
-                    if failCount > 5 { curr = StateError }
+                    if isBusy {
+                        // 如果正在忙，不累加计数，维持之前的状态
+                        curr = lastState 
+                    } else {
+                        failCount++
+                        if failCount > 5 { curr = StateError }
+                    }
                 } else {
                     failCount = 0
                 }
             }
         }
 
-        // --- 核心修复：执行图标更新 (不被分支拦截) ---
-        if curr != lastState {
+        // --- 核心修复：执行图标更新 ---
+        if curr != lastState && curr != -1 { // 增加 -1 过滤防止初次启动抖动
             updateIconByState(curr)
             lastState = curr
             
-            // 确保菜单勾选也绝对同步
-            if mTun != nil {
+            // 只有在非 ERROR 状态下才同步菜单勾选
+            if mTun != nil && curr != StateError {
                 if curr == StateTun { mTun.Check() } else { mTun.Uncheck() }
             }
         }
