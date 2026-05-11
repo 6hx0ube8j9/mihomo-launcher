@@ -473,7 +473,7 @@ func monitorIconState() {
 	for {
 		if isReallyExiting { return }
 
-		// 1. 物理层判定：进程不在，直接灰色
+		// 1. 【最高准则】进程没了，必须 STOP (瞬间变灰)
 		if !isProcessRunning("mihomo.exe") {
 			failCount = 0
 			if lastState != StateStop {
@@ -481,38 +481,39 @@ func monitorIconState() {
 				lastState = StateStop
 			}
 		} else {
+			// 保持原有联动：必须执行以维持同步逻辑
 			curr := checkSystemState()
 
-			isTunConfigEnabled := (getIniConfig("tun_enabled") == "true")
-			hasPhysicalTun := false
-			if isTunConfigEnabled {
-				ifaces, _ := net.Interfaces()
-				for _, i := range ifaces {
-					if isTunInterfaceMatch(i.Name) {
-						hasPhysicalTun = true
-						break
-					}
+			// 2. 【TUN 准则】TUN 模式下，内核在但网卡没了，必须 ERROR (瞬间变红)
+			isTunMode := (getIniConfig("tun_enabled") == "true")
+			
+			// 直接检查网卡
+			hasTun := false
+			ifaces, _ := net.Interfaces()
+			for _, i := range ifaces {
+				if isTunInterfaceMatch(i.Name) {
+					hasTun = true
+					break
 				}
 			}
 
-
-			if isTunConfigEnabled && !hasPhysicalTun {
-				failCount = 0
+			if isTunMode && !hasTun {
+				failCount = 0 // 物理故障不走容错
 				if lastState != StateError {
 					updateIconByState(StateError)
 					lastState = StateError
 				}
 			} else if curr == StateStop {
-				// 场景 B: API 连不上（checkSystemState 返回了 StateStop）
-				// 维持你原始的 5 秒容错逻辑
+				// 3. 【API 准则】给程序 5 次机会，还没好就压倒性 STOP
 				failCount++
 				if failCount > 5 {
-					if lastState != StateError {
-						updateIconByState(StateError)
-						lastState = StateError
+					if lastState != StateStop {
+						updateIconByState(StateStop)
+						lastState = StateStop
 					}
 				}
 			} else {
+				// 正常状态切换
 				failCount = 0
 				if curr != lastState {
 					updateIconByState(curr)
