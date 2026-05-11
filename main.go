@@ -469,45 +469,58 @@ func monitorKernelDaemon() {
 }
 
 func monitorIconState() {
-	var failCount int // 局部变量，用于记录连续失败次数
+    var apiFailCount int 
 
-	for {
-		if isReallyExiting { return }
+    for {
+        if isReallyExiting { return }
 
-		// 1. 物理层判定：进程不在，直接灰色
-		if !isProcessRunning("mihomo.exe") {
-			failCount = 0
-			if lastState != StateStop {
-				updateIconByState(StateStop)
-				lastState = StateStop
-			}
-		} else {
-			// 2. 进程在，检查 API 信号
-			curr := checkSystemState()
+        // --- 1. 【最高准则】内核进程判定 ---
+        // 只要内核没了，所有模式、所有状态全部作废，直接变灰
+        if !isProcessRunning("mihomo.exe") {
+            apiFailCount = 0
+            updateIconIfNot(StateStop)
+            lastState = StateStop
+            time.Sleep(1 * time.Second)
+            continue 
+        }
 
-			if curr == StateStop { // checkSystemState 连不上 API 时返回 Stop
-				failCount++
-				// 连续失败 5 次以上（约 5 秒），判定为内核假死或异常
-				if failCount > 5 {
-					if lastState != StateError {
-						updateIconByState(StateError) // 显示错误/警告图标
-						lastState = StateError
-					}
-				}
-				// 5 次以内，我们保持图标现状（lastState），不乱闪烁
-			} else {
-				// API 正常，立即重置计数器
-				failCount = 0
-				// 只有状态真正发生变化时，才刷新 UI
-				if curr != lastState {
-					updateIconByState(curr)
-					lastState = curr
-				}
-			}
-		}
-		
-		time.Sleep(1 * time.Second)
-	}
+        // --- 2. 【核心判定】TUN 模式的物理层检查 ---
+        // 只有内核在，才走这一步
+        isTunMode := (getIniConfig("tun_enabled") == "true")
+        if isTunMode {
+            if !isTunInterfaceExist() {
+                // 内核在，但网卡丢了：必须 ERROR，不给任何 5 次机会
+                apiFailCount = 0 
+                updateIconIfNot(StateError)
+                lastState = StateError
+                time.Sleep(1 * time.Second)
+                continue
+            }
+        }
+
+        // --- 3. 【通信判定】逻辑层 5 次机会容错 ---
+        // 走到这一步说明：要么不是 TUN 模式，要么是 TUN 模式且网卡完好
+        curr := checkSystemState() // 这里内部执行 API 通信请求
+
+        if curr == StateStop { 
+            apiFailCount++
+            // 只有通信失败，才消耗这 5 次机会
+            if apiFailCount > 5 {
+                updateIconIfNot(StateStop) // 5 次后，压倒性地变灰
+                lastState = StateStop
+            }
+            // 5 次以内，不更新图标，保持 lastState（绿/蓝/当前）
+        } else {
+            // 一旦通信成功，重置计数器并根据 checkSystemState 的实际结果更新
+            apiFailCount = 0
+            if curr != lastState {
+                updateIconByState(curr)
+                lastState = curr
+            }
+        }
+
+        time.Sleep(1 * time.Second)
+    }
 }
 
 func watchTunState() {
@@ -589,6 +602,8 @@ func syncConfigToKernel() {
     }
     defer atomic.StoreInt32(&isSyncing, 0)
 
+    isSystemInitializing = true
+    // 保护：如果函数因为意外卡死，10秒后强制解除初始化状态
     timer := time.AfterFunc(10*time.Second, func() { isSystemInitializing = false })
     defer timer.Stop()
 
