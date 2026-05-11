@@ -55,7 +55,11 @@ var (
 	isKernelActive       int32
 	isFocusing           int32
 	manualUpdateTrigger  int32
-
+    // --- 逻辑跟踪 ---
+    lastState        = -1
+    globalLastHasTun bool   // 【核心补丁】用于跨函数同步 TUN 打勾状态事实
+    tunErrorCounter  = 0
+    mTun             *systray.MenuItem    
 	// --- 并发同步 ---
 	exitOnce   sync.Once
 	configMu   sync.RWMutex
@@ -339,22 +343,23 @@ func launchWebUI() {
     }
 }
 func onReady() {
-	saveIniConfig("startup_enabled", fmt.Sprint(checkAutoStartStatus()))
-	ensureDefaultConfig()
-	sniffAndSolidifyConfig()
-	setProxyRegistry(getIniConfig("system_proxy_enabled") == "true")
-	updateIconByState(StateStop)
-    systray.SetOnClick(func(menu systray.IMenu) {
-        go launchWebUI()
-    })	
+    saveIniConfig("startup_enabled", fmt.Sprint(checkAutoStartStatus()))
+    ensureDefaultConfig()
+    sniffAndSolidifyConfig()
+    setProxyRegistry(getIniConfig("system_proxy_enabled") == "true")
+    updateIconByState(StateStop)
 
-    mWeb := systray.AddMenuItem("进入 Web 面板", "")
-    mWeb.Click(func() {
+    // 托盘图标点击直接打开 WebUI
+    systray.SetOnClick(func(menu systray.IMenu) {
         go launchWebUI()
     })
 
+    mWeb := systray.AddMenuItem("进入 Web 面板", "")
+    mWeb.Click(func() { go launchWebUI() })
+
     systray.AddSeparator()
 
+    // 1. 系统代理 (保持即时反馈)
     mProxy := systray.AddMenuItemCheckbox("系统代理", "", getIniConfig("system_proxy_enabled") == "true")
     mProxy.Click(func() {
         next := !mProxy.Checked()
@@ -363,36 +368,48 @@ func onReady() {
         if next { mProxy.Check() } else { mProxy.Uncheck() }
     })
 
+    // 2. 虚拟网卡 (合并修正点：配置驱动 + 异步刷新)
     mTun = systray.AddMenuItemCheckbox("虚拟网卡 (TUN)", "", getIniConfig("tun_enabled") == "true")
     mTun.Click(func() {
-        next := !mTun.Checked()
+        // A. 依靠配置判断而非 UI
+        next := getIniConfig("tun_enabled") != "true"
+        saveIniConfig("tun_enabled", fmt.Sprint(next))
+        
+        // B. 预刷新 UI (增强灵敏度)
         if next { mTun.Check() } else { mTun.Uncheck() }
-        go setTunMode(next)
+        
+        // C. 执行逻辑并强制最终校准
+        go func() {
+            setTunMode(next)
+            // 确保在内核可能重启后，勾选状态能准确同步
+            syncUIAppearance(checkSystemState())
+        }()
     })
 
     systray.AddSeparator()
 
+    // 3. 模式切换 (合并修正点：持久化 + 联动取消勾选)
     mModeRoot := systray.AddMenuItem("模式切换", "")
     curMode := getIniConfig("mode")
     modeMenus := make(map[string]*systray.MenuItem)
-    
-    modeMenus["rule"] = mModeRoot.AddSubMenuItemCheckbox("规则模式", "", curMode == "rule")
-    modeMenus["rule"].Click(func() {
-        setMihomoMode("rule")
-        modeMenus["rule"].Check(); modeMenus["global"].Uncheck(); modeMenus["direct"].Uncheck()
-    })
 
-    modeMenus["global"] = mModeRoot.AddSubMenuItemCheckbox("全局模式", "", curMode == "global")
-    modeMenus["global"].Click(func() {
-        setMihomoMode("global")
-        modeMenus["rule"].Uncheck(); modeMenus["global"].Check(); modeMenus["direct"].Uncheck()
-    })
+    setupMode := func(key, label string) {
+        modeMenus[key] = mModeRoot.AddSubMenuItemCheckbox(label, "", curMode == key)
+        modeMenus[key].Click(func() {
+            // 保存意图到 INI
+            saveIniConfig("mode", key)
+            // 立即切换所有菜单勾选 (排他性勾选)
+            for k, menu := range modeMenus {
+                if k == key { menu.Check() } else { menu.Uncheck() }
+            }
+            // 异步同步内核
+            go setMihomoMode(key)
+        })
+    }
 
-    modeMenus["direct"] = mModeRoot.AddSubMenuItemCheckbox("直连模式", "", curMode == "direct")
-    modeMenus["direct"].Click(func() {
-        setMihomoMode("direct")
-        modeMenus["rule"].Uncheck(); modeMenus["global"].Uncheck(); modeMenus["direct"].Check()
-    })
+    setupMode("rule", "规则模式")
+    setupMode("global", "全局模式")
+    setupMode("direct", "直连模式")
 
     systray.AddSeparator()
 
@@ -401,25 +418,32 @@ func onReady() {
         windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(baseDir), nil, nil, windows.SW_SHOWNORMAL)
     })
 
+    // 4. 更多选项 (增加自愈触发)
     mMoreRoot := systray.AddMenuItem("更多", "")
+    
     mAuto := mMoreRoot.AddSubMenuItemCheckbox("开机自启动", "", checkAutoStartStatus())
     mAuto.Click(func() {
         next := !mAuto.Checked()
         toggleAutoStart(next)
+        saveIniConfig("startup_enabled", fmt.Sprint(next)) // 同步配置
         if next { mAuto.Check() } else { mAuto.Uncheck() }
     })
 
     mRestart := mMoreRoot.AddSubMenuItem("重启内核", "")
     mRestart.Click(func() {
+        // 触发 monitorKernelDaemon 的重启逻辑
         atomic.StoreInt32(&isSystemInitializing, 1)
         atomic.StoreInt32(&hasFirstSynced, 0)
         KillProcessByName("mihomo.exe")
+        // 重启后 monitorKernelDaemon 会通过探针自动调用 syncUIAppearance 补齐状态
     })
 
     mReload := mMoreRoot.AddSubMenuItem("重载配置文件", "")
     mReload.Click(func() {
         sniffAndSolidifyConfig()
         reloadConfigFile()
+        // 重载后强制刷新一次 UI
+        syncUIAppearance(checkSystemState())
     })
 
     systray.AddSeparator()
@@ -473,10 +497,12 @@ func monitorKernelDaemon() {
     absBaseDir, _ := filepath.Abs(baseDir)
 
     for {
-        if atomic.LoadInt32(&isReallyExiting) == 1 { return }
+        if atomic.LoadInt32(&isReallyExiting) == 1 {
+            return
+        }
 
         if !isProcessRunning("mihomo.exe") {
-            // --- A. 启动保护区 (来自第一、二份共同点) ---
+            // --- A. 启动保护区 ---
             atomic.StoreInt32(&isSystemInitializing, 1)
             atomic.StoreInt32(&hasFirstSynced, 0)
             atomic.StoreInt32(&isKernelActive, 0)
@@ -491,7 +517,7 @@ func monitorKernelDaemon() {
             if err := cmd.Start(); err == nil {
                 atomic.StoreInt32(&isKernelActive, 1)
 
-                // --- B. 资源绑定 (来自第二份骨架：Job Object) ---
+                // --- B. 资源绑定 (Job Object) ---
                 if hJob != 0 {
                     hp, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
                     if err == nil {
@@ -500,32 +526,56 @@ func monitorKernelDaemon() {
                     }
                 }
 
-                // --- C. 主动纠偏探测 (从第一份注入：代替盲目 Sleep) ---
+                // --- C. 核心自愈与同步逻辑 ---
                 go func() {
+                    success := false
                     // 给予 6 秒启动窗口 (500ms * 12)
                     for i := 0; i < 12; i++ {
                         time.Sleep(500 * time.Millisecond)
+                        
+                        // 探针检测 API
                         resp, err := doAPIRequest("GET", "/configs", nil)
                         if err == nil && len(resp) > 200 {
-                            syncConfigToKernel() // 核心：启动后立即强灌 .ini 配置
+                            // 1. 立即灌入配置事实
+                            syncConfigToKernel()
+                            
+                            // 2. 获取当前判定状态
+                            state := checkSystemState()
+                            
+                            // 3. 【关键修复】同步全局变量，防止 watchTunState 产生逻辑跳过导致不打勾
+                            // 这里强制让 watchTunState 知道网卡现在的真实状态
+                            lastHasTun = (state == StateTun)
+
+                            // 4. 【强制刷新】执行 UI 变色和菜单打勾
+                            syncUIAppearance(state)
+                            
+                            success = true
                             break
                         }
                     }
-                    atomic.StoreInt32(&isSystemInitializing, 0) // 配置灌完后再解锁
+
+                    // 5. 无论成功与否，最终必须解锁，允许 checkSystemState 恢复正常接管
+                    atomic.StoreInt32(&isSystemInitializing, 0)
+                    
+                    // 6. 如果内核没起来，强制刷一次 UI（通常会显示灰灯或报错）
+                    if !success {
+                        syncUIAppearance(checkSystemState())
+                    }
                 }()
 
+                // 进程退出监听
                 go func(c *exec.Cmd) {
                     _ = c.Wait()
                     atomic.StoreInt32(&isKernelActive, 0)
                 }(cmd)
             } else {
+                // 启动失败立即解锁
                 atomic.StoreInt32(&isSystemInitializing, 0)
             }
         }
         time.Sleep(2 * time.Second)
     }
 }
-
 func monitorIconState() {
 	var failCount int
 
