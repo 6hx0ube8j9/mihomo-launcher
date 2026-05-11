@@ -380,14 +380,14 @@ func onReady() {
 
     mExit := systray.AddMenuItem("关闭程序", "")
     mExit.Click(func() {
-        isReallyExiting = true
+        atomic.StoreInt32(&isReallyExiting, 1)
         systray.Quit()
     })
 }
 
 func onExit() {
     exitOnce.Do(func() {
-        isReallyExiting = true
+        atomic.StoreInt32(&isReallyExiting, 1)
 
         // 1. 【高级清理】先通过 CDP 优雅关闭浏览器窗口
         client := &http.Client{Timeout: 200 * time.Millisecond}
@@ -426,7 +426,7 @@ func monitorKernelDaemon() {
 	target := filepath.Join(baseDir, "mihomo.exe")
 	absBaseDir, _ := filepath.Abs(baseDir)
 	for {
-		if isReallyExiting {
+		if atomic.LoadInt32(&isReallyExiting) == 1 {
 			return
 		}
 		if !isProcessRunning("mihomo.exe") {
@@ -559,9 +559,7 @@ func watchTunState() {
 	for {
 		select {
 		case <-ticker.C:
-			// 1. 【第一道防线】如果程序正在准备退出，立即停止一切逻辑并销毁协程
-			// 防止在退出过程中由于内核关闭导致网卡消失，误触发配置重写
-			if isReallyExiting {
+			if atomic.LoadInt32(&isReallyExiting) == 1 {
 				return
 			}
 
