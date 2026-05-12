@@ -521,25 +521,26 @@ func monitorKernelDaemon() {
 
 func monitorIconState() {
 	var failCount int
+	var curr int // 【修复：在此处提前声明 curr】
 
 	for {
 		if atomic.LoadInt32(&isReallyExiting) == 1 {
 			return
 		}
 
-		// 1. 物理层判定：进程不在，最优先设为 StateStop
+		// 1. 物理层判定
 		if !isProcessRunning("mihomo.exe") {
 			failCount = 0
+			curr = StateStop // 【赋值而非重声明】
 			if lastState != StateStop {
 				updateIconByState(StateStop)
 				lastState = StateStop
 			}
 		} else {
 			// --- 第一步：执行联动函数 ---
-			// curr 获取当前 API 探测到的建议状态 (StateTun/StateProxy/StateDefault/StateStop)
-			curr := checkSystemState()
+			curr = checkSystemState() // 【赋值而非重声明】
 
-			// --- 第二步：物理网卡真实状态捕捉 ---
+			// --- 第二步：物理网卡捕捉 ---
 			isTunMode := (getIniConfig("tun_enabled") == "true")
 			hasTun := false
 			ifaces, _ := net.Interfaces()
@@ -550,28 +551,21 @@ func monitorIconState() {
 				}
 			}
 
-			// --- 第三步：基于“因果”的判定 ---
-
+			// --- 第三步：逻辑判定 ---
 			if isTunMode && !hasTun {
-				// 情况 A：内部重启/重载有锁保护
 				if atomic.LoadInt32(&isSystemInitializing) == 1 {
 					goto UseFailCountLogic
 				}
-
-				// 情况 B：无锁状态下（可能是 Web 外部操作），API 已经反馈状态回退
 				if curr != StateTun {
-					// 内核已经同步了非 TUN 状态（如 Proxy 或 Default），这不是故障
 					failCount = 0
 					if curr != lastState {
 						updateIconByState(curr)
 						lastState = curr
 					}
 				} else {
-					// 情况 C：配置要求 TUN 但网卡确实没了，进入 5 秒缓冲轮询
 					goto UseFailCountLogic
 				}
 			} else {
-				// 正常逻辑：网卡在，或者非 TUN 模式，直接同步 checkSystemState 的建议值
 				failCount = 0
 				if curr != lastState {
 					updateIconByState(curr)
@@ -580,11 +574,10 @@ func monitorIconState() {
 			}
 		}
 
-		// 保持循环，继续下一轮探测
 		goto LoopEnd
 
 	UseFailCountLogic:
-		// 5 秒容错逻辑：在缓冲期内保持 curr 状态（通常是 StateStop）
+		// 此时 curr 已经是全局可见的了，不会再报 undefined
 		if curr == StateStop {
 			failCount++
 			if failCount > 5 {
@@ -593,14 +586,12 @@ func monitorIconState() {
 					lastState = StateError
 				}
 			} else {
-				// 5秒内，如果状态发生了由 Tun 到 Stop 的切换，先更新图标
 				if curr != lastState {
 					updateIconByState(curr)
 					lastState = curr
 				}
 			}
 		} else {
-			// 缓冲期内如果状态恢复正常，立即清零并更新
 			failCount = 0
 			if curr != lastState {
 				updateIconByState(curr)
