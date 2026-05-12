@@ -116,9 +116,8 @@ func checkSystemState() int {
     // 2. 检查内核通信
     resp, err := doAPIRequest("GET", "/configs", nil)
     if err != nil {
+        // 内核不通不代表进程死了，返回 Default 引导 monitorIconState 去做进程判定
         tunErrorCounter = 0 
-        // 【纠正】API 不通时，不直接返回 StateStop（红色），
-        // 而是返回 StateDefault（默认色），让 monitorIconState 根据物理进程判断是否显红。
         return StateDefault 
     }
 
@@ -127,19 +126,17 @@ func checkSystemState() int {
     
     if !isBusy {
         respStr := string(resp)
-        // 判定内核实时配置状态
         kernelTunEnabled := strings.Contains(respStr, `"tun":`) && strings.Contains(respStr, `"enable":true`)
         localTunConfig := (getIniConfig("tun_enabled") == "true")
 
-        // --- 场景 A：本地配置要开，但网卡或内核没对上 ---
+        // --- 场景 A：配置要开，但现实不符 ---
         if localTunConfig && (!kernelTunEnabled || !hasTunOnSystem) {
             tunErrorCounter++
             if tunErrorCounter <= 8 {
-                // 8秒缓冲期内：不报错，去最后判定（通常会落到 Default 或 Proxy）
-                goto EndDecision 
+                goto EndDecision // 缓冲期内跳到末尾，维持意图状态
             }
 
-            // 保护期过后，优先看内核是不是被手动关了
+            // 8秒过后，判定是外部关闭还是故障
             if !kernelTunEnabled {
                 saveIniConfig("tun_enabled", "false")
                 tunErrorCounter = 0
@@ -147,47 +144,50 @@ func checkSystemState() int {
                 goto EndDecision
             }
 
-            // 如果内核是开的但没网卡，触发黄色报警 (Error)
             if !hasTunOnSystem {
                 go syncConfigToKernel()
-                return StateError // 返回黄色
+                return StateError // 明确返回黄色报警
             }
         }
 
-        // --- 场景 B：外部开启感知 ---
+        // --- 场景 B/C：外部状态同步 ---
         if !localTunConfig && kernelTunEnabled && hasTunOnSystem {
             saveIniConfig("tun_enabled", "true")
             tunErrorCounter = 0
             if mTun != nil { mTun.Check() }
-        }
-
-        // --- 场景 C：外部关闭感知 ---
-        if localTunConfig && !kernelTunEnabled && hasTunOnSystem {
+        } else if localTunConfig && !kernelTunEnabled && hasTunOnSystem {
             saveIniConfig("tun_enabled", "false")
             tunErrorCounter = 0
             if mTun != nil { mTun.Uncheck() }
         }
     }
 
-    // 4. UI 最终判定逻辑
+    // 4. UI 最终判定逻辑 (消除 Default 闪烁的关键)
 EndDecision:
     globalLastHasTun = hasTunOnSystem 
-    currentTunPlan := (getIniConfig("tun_enabled") == "true")
+    tunIntent := (getIniConfig("tun_enabled") == "true")
+    proxyIntent := (getIniConfig("system_proxy_enabled") == "true")
 
-    if currentTunPlan {
-        if hasTunOnSystem { 
-            tunErrorCounter = 0 
-            return StateTun // 返回绿色
+    // 优先级 1: 如果用户想开 TUN
+    if tunIntent {
+        if hasTunOnSystem {
+            tunErrorCounter = 0
+            return StateTun // 绿色
         }
-        return StateError // 返回黄色
+        // 缓冲期内，即使网卡没出来，也返回 Tun，防止图标跳变
+        if tunErrorCounter > 0 && tunErrorCounter <= 8 {
+            return StateTun 
+        }
+        return StateError // 超过 8 秒，变黄
     }
 
-    // 如果没开 TUN，检查系统代理
-    if getIniConfig("system_proxy_enabled") == "true" {
-        return StateProxy // 返回蓝色
+    // 优先级 2: 如果想开系统代理
+    if proxyIntent {
+        return StateProxy // 蓝色
     }
 
-    return StateDefault // 返回默认色（开机状态）
+    // 优先级 3: 只有全关了，才准许返回原本色
+    return StateDefault
 }
 func main() {
 	var err error
@@ -643,68 +643,53 @@ func monitorKernelDaemon() {
     }
 }
 func monitorIconState() {
+    // 变量提升声明，防止 goto 跳过定义导致编译失败
     var failCount int
-    // 将必要的变量提前声明以避免 goto 编译错误（如果后续还需要用到 goto）
-    var ifaces []net.Interface
-    var i net.Interface
+    var curr int
+    var running bool
 
     for {
         if atomic.LoadInt32(&isReallyExiting) == 1 { return }
 
-        // 1. 物理检查：进程是否运行
-        running := isProcessRunning("mihomo.exe")
-        
+        // --- 1. 物理层判定：进程不在，立即显红 (Stop) ---
+        running = isProcessRunning("mihomo.exe")
         if !running {
-            // 进程没了，最高优先级：红灯
             failCount = 0
-            tunErrorCounter = 0
+            tunErrorCounter = 0 
             if lastState != StateStop {
-                updateIconByState(StateStop)
+                updateIconByState(StateStop) // 切换红色
                 lastState = StateStop
             }
-        } else {
-            // 2. 进程在，获取业务状态
-            curr := checkSystemState()
-
-            // 3. 特殊处理：TUN 缓冲期保护
-            // 逻辑：如果 local 设置要开 TUN，但网卡还没出来，且在 8 秒内
-            isTunMode := (getIniConfig("tun_enabled") == "true")
-            hasTun := false
-            ifaces, _ = net.Interfaces()
-            for _, i = range ifaces {
-                if isTunInterfaceMatch(i.Name) {
-                    hasTun = true
-                    break
-                }
-            }
-
-            // --- 状态修正屏蔽层 ---
-            if isTunMode && !hasTun && tunErrorCounter > 0 && tunErrorCounter <= 8 {
-                // 在缓冲期内，我们“假装”状态没变，维持 lastState，不更新图标
-                // 这样就消除了从 Tun -> Default -> Tun 的闪烁
-            } else {
-                // 4. 正常更新逻辑
-                // 如果 API 报错返回了 StateStop，我们由于进程还在，将其修正为 Default 或保持
-                if curr == StateStop {
-                    failCount++
-                    if failCount > 5 {
-                        curr = StateDefault
-                    } else {
-                        // 暂时保持现状
-                        curr = lastState
-                    }
-                } else {
-                    failCount = 0
-                }
-
-                // 最终执行更新
-                if curr != lastState {
-                    updateIconByState(curr)
-                    lastState = curr
-                }
-            }
+            goto SleepNext 
         }
 
+        // --- 2. 进程在，获取大脑决策结果 ---
+        curr = checkSystemState()
+
+        // --- 3. 容错保护：防止 API 抖动导致红灯误报 ---
+        // 只有进程真的不在时才准显红。如果进程在，API 报错(curr=Default)时应维持原状
+        if curr == StateStop || (curr == StateDefault && (getIniConfig("tun_enabled") == "true" || getIniConfig("system_proxy_enabled") == "true")) {
+            failCount++
+            if failCount <= 5 {
+                // 5秒内 API 不通，冻结图标不更新，保持 lastState
+                goto SleepNext
+            }
+            // 超过5秒还是不通，curr 会保持为 Default (原本色)
+        } else {
+            failCount = 0
+        }
+
+        // --- 4. 状态平滑切换 ---
+        if curr != lastState {
+            // 兜底：进程在，绝对不允许变红
+            if curr == StateStop {
+                curr = StateDefault
+            }
+            updateIconByState(curr)
+            lastState = curr
+        }
+
+    SleepNext:
         time.Sleep(1 * time.Second)
     }
 }
