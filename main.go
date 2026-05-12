@@ -520,16 +520,20 @@ func monitorKernelDaemon() {
 }
 
 func monitorIconState() {
-	var failCount int
-	var curr int
+	var (
+		failCount int
+		curr      int
+		lastState int
+		ifaces    []net.Interface // 【修复：将变量声明提到外部】
+		err       error
+	)
 
 	for {
 		if atomic.LoadInt32(&isReallyExiting) == 1 {
 			return
 		}
 
-		// --- 1. 物理进程判定 (最高优先级) ---
-		// 规则 3：进程挂了 -> 毫无疑问直接 Stop
+		// 1. 物理进程判定
 		if !isProcessRunning("mihomo.exe") {
 			failCount = 0
 			if lastState != StateStop {
@@ -539,31 +543,28 @@ func monitorIconState() {
 			goto LoopEnd
 		}
 
-		// --- 2. 获取业务与网卡事实 ---
 		curr = checkSystemState()
 		
 		isTunMode := (getIniConfig("tun_enabled") == "true")
 		hasTun := false
-		ifaces, _ := net.Interfaces()
-		for _, i := range ifaces {
-			if isTunInterfaceMatch(i.Name) {
-				if (i.Flags & net.FlagUp) != 0 {
-					hasTun = true
-					break
+		
+		// 【修复：这里只赋值，不使用 := 声明】
+		ifaces, err = net.Interfaces()
+		if err == nil {
+			for _, i := range ifaces {
+				if isTunInterfaceMatch(i.Name) {
+					if (i.Flags & net.FlagUp) != 0 {
+						hasTun = true
+						break
+					}
 				}
 			}
 		}
 
-		// --- 3. 核心判定分水岭 ---
-
-		// 检查是否存在“业务违和”或“通讯中断”
+		// 3. 核心逻辑判定
 		if (isTunMode && !hasTun) || curr == StateStop {
-			// 进程没挂，给宽限机会
 			failCount++
-
 			if failCount <= 5 {
-				// 机会期内：显示业务降级 (Proxy/Default)
-				// 规则 2：业务降级，但尚可接受
 				backState := curr
 				if backState == StateStop {
 					if getIniConfig("system_proxy_enabled") == "true" {
@@ -577,19 +578,13 @@ func monitorIconState() {
 					lastState = backState
 				}
 			} else {
-				// --- 机会一过，判定压倒性状态 ---
-				
-				// 规则 4：StateError 的唯一窗口
-				// 只有当内核通讯完全正常(curr非Stop) 且 明确要求开启TUN 且 依然没网卡
-				// 这种情况属于“内核活着但网卡配置错误”，显示 Error
+				// 机会期满判定
 				if curr != StateStop && isTunMode && !hasTun {
 					if lastState != StateError {
 						updateIconByState(StateError)
 						lastState = StateError
 					}
 				} else {
-					// 规则 3：机会一过，压倒性 Stop
-					// 只要通讯还是断的，或者不满足 Error 的特定条件，直接判死刑变灰
 					if lastState != StateStop {
 						updateIconByState(StateStop)
 						lastState = StateStop
@@ -597,7 +592,6 @@ func monitorIconState() {
 				}
 			}
 		} else {
-			// --- 规则 1：完美运行 ---
 			failCount = 0
 			if curr != lastState {
 				updateIconByState(curr)
@@ -605,7 +599,7 @@ func monitorIconState() {
 			}
 		}
 
-	LoopEnd:
+	LoopEnd: // 现在 goto 跳到这里是安全的，因为后面没有跳过任何声明
 		time.Sleep(1 * time.Second)
 	}
 }
