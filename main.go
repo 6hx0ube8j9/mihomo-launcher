@@ -133,8 +133,8 @@ func checkSystemState() int {
         if localTunConfig && (!kernelTunEnabled || !hasTunOnSystem) {
             tunErrorCounter++
             if tunErrorCounter <= 8 {
-                // 缓冲期内保持现状
-                goto EndDecision // 建议用 goto 跳出，或者直接按你原样 return
+                // 缓冲期内保持现状，跳转到末尾进行 UI 判定
+                goto EndDecision 
             }
 
             // 8秒到了，优先判定是否为“外部手动关闭”
@@ -145,11 +145,8 @@ func checkSystemState() int {
                 // 联动 UI 菜单去掉勾选
                 if mTun != nil { mTun.Uncheck() }
 
-                // 动态回退状态
-                if getIniConfig("system_proxy_enabled") == "true" {
-                    return StateProxy
-                }
-                return StateDefault
+                // 此时配置已经改了，跳转到末尾让它自动判定回退到 Proxy 还是 Default
+                goto EndDecision
             }
 
             // 如果内核配置还是 true，但物理网卡死活不出来，这才是真正的异常
@@ -162,20 +159,21 @@ func checkSystemState() int {
 
         // --- 场景 B：配置没开，但内核/物理已经开了 (外部开启感知) ---
         if !localTunConfig && kernelTunEnabled && hasTunOnSystem {
-            // 【你的逻辑 3】：外部开启了 TUN -> 修改 INI 同步
             saveIniConfig("tun_enabled", "true")
             tunErrorCounter = 0
+            if mTun != nil { mTun.Check() }
         }
 
         // --- 场景 C：配置要开，但内核被外部关了 (外部关闭感知) ---
         if localTunConfig && !kernelTunEnabled && hasTunOnSystem {
-            // 【你的逻辑 2】：内核未重启但 YAML 变 false -> 修改 INI 同步
             saveIniConfig("tun_enabled", "false")
             tunErrorCounter = 0
+            if mTun != nil { mTun.Uncheck() }
         }
     }
 
     // 4. UI 最终判定逻辑
+EndDecision: // <--- 这里的标签解决了编译报错
     globalLastHasTun = hasTunOnSystem 
     currentTunPlan := (getIniConfig("tun_enabled") == "true")
 
@@ -187,6 +185,7 @@ func checkSystemState() int {
         return StateError 
     }
 
+    // 如果 TUN 没开，判定系统代理状态
     if getIniConfig("system_proxy_enabled") == "true" {
         return StateProxy
     }
