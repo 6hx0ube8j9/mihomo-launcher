@@ -524,8 +524,10 @@ func monitorIconState() {
 		failCount int
 		curr      int
 		lastState int
-		ifaces    []net.Interface // 【修复：将变量声明提到外部】
+		ifaces    []net.Interface
 		err       error
+		// 【修复点 1】：将 hasTun 提到 goto 之前声明
+		hasTun    bool 
 	)
 
 	for {
@@ -540,15 +542,17 @@ func monitorIconState() {
 				updateIconByState(StateStop)
 				lastState = StateStop
 			}
-			goto LoopEnd
+			goto LoopEnd // 现在跳过的是赋值，不是声明，编译通过
 		}
 
+		// 2. 获取业务状态
 		curr = checkSystemState()
 		
 		isTunMode := (getIniConfig("tun_enabled") == "true")
-		hasTun := false
 		
-		// 【修复：这里只赋值，不使用 := 声明】
+		// 【修复点 2】：这里直接赋值，不要用 hasTun := false
+		hasTun = false 
+		
 		ifaces, err = net.Interfaces()
 		if err == nil {
 			for _, i := range ifaces {
@@ -561,10 +565,11 @@ func monitorIconState() {
 			}
 		}
 
-		// 3. 核心逻辑判定
+		// 3. 核心判定逻辑
 		if (isTunMode && !hasTun) || curr == StateStop {
 			failCount++
 			if failCount <= 5 {
+				// 机会期：显示降级状态
 				backState := curr
 				if backState == StateStop {
 					if getIniConfig("system_proxy_enabled") == "true" {
@@ -578,7 +583,7 @@ func monitorIconState() {
 					lastState = backState
 				}
 			} else {
-				// 机会期满判定
+				// 机会期满：判定 Error 或压倒性 Stop
 				if curr != StateStop && isTunMode && !hasTun {
 					if lastState != StateError {
 						updateIconByState(StateError)
@@ -592,6 +597,7 @@ func monitorIconState() {
 				}
 			}
 		} else {
+			// 一切正常
 			failCount = 0
 			if curr != lastState {
 				updateIconByState(curr)
@@ -599,7 +605,7 @@ func monitorIconState() {
 			}
 		}
 
-	LoopEnd: // 现在 goto 跳到这里是安全的，因为后面没有跳过任何声明
+	LoopEnd:
 		time.Sleep(1 * time.Second)
 	}
 }
