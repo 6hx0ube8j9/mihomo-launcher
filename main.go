@@ -1036,20 +1036,22 @@ func checkSystemState() int {
             }
         }
         
+        // 核心修改 1：网卡在，直接返回 TUN
         if hasTun {
             return StateTun
         }
         
-        // --- 此处原本是 return StateStop ---
-        // 现在删掉它，什么都不做，逻辑会继续往下走
-        // 这样即便网卡没起，也会去判断 SystemProxy 或返回 Default
+        // 核心修改 2：【重要】这里不要写任何 return！
+        // 原本你这里可能有 return StateStop，现在删掉它。
+        // 只要 API 是通的，我们就允许它向下流转去判断 Proxy 或 Default。
     }
 
-    // 5. 检查系统代理 (如果上面 TUN 没 return，就会流转到这里)
+    // 5. 检查系统代理 (如果上面 TUN 没 return，逻辑会自然流到这里)
     if getIniConfig("system_proxy_enabled") == "true" {
         return StateProxy
     }
 
+    // 6. 最终兜底状态 (内核活着，但既没 TUN 也没 Proxy)
     return StateDefault
 }
 
