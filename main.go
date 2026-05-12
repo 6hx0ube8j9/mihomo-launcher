@@ -59,7 +59,8 @@ var (
     isKernelActive       int32
     isFocusing           int32
     manualUpdateTrigger  int32
-    isReallyExiting      int32 // 0: 运行中, 1: 准备退出 (统一原子化)
+    isReallyExiting      int32 
+	lastClickTime        int64
 
     // --- 4. 流程控制与计数 ---
     exitOnce        sync.Once
@@ -322,14 +323,36 @@ func onReady() {
     setProxyRegistry(getIniConfig("system_proxy_enabled") == "true")
     updateIconByState(StateStop)
 
-    // 托盘图标点击事件
     systray.SetOnClick(func(menu systray.IMenu) {
+        // A. 初始化锁保护：如果内核还没起来（或正在重启），点图标不响应，防止弹出 404 网页
+        if atomic.LoadInt32(&isSystemInitializing) == 1 {
+            return
+        }
+
+        // B. 时间戳防抖：利用全局 lastClickTime 限制 1 秒内只允许触发一次
+        now := time.Now().UnixNano()
+        // 1000ms = 1秒
+        if now - atomic.LoadInt64(&lastClickTime) < int64(1000 * time.Millisecond) {
+            return
+        }
+        atomic.StoreInt64(&lastClickTime, now)
+
+        // C. 执行原本的打开逻辑
         go launchWebUI()
     })
 
     // 菜单项初始化
     mWeb := systray.AddMenuItem("进入 Web 面板", "")
-    mWeb.Click(func() { go launchWebUI() })
+    mWeb.Click(func() { 
+        // 菜单点击通常也建议加上同样的防抖保护
+        now := time.Now().UnixNano()
+        if now - atomic.LoadInt64(&lastClickTime) < int64(1000 * time.Millisecond) {
+            return
+        }
+        atomic.StoreInt64(&lastClickTime, now)
+
+        go launchWebUI() 
+    })
 
     systray.AddSeparator()
 
@@ -418,8 +441,6 @@ func onReady() {
         systray.Quit()
     })
 
-    // 【核心保护】所有菜单初始化完成，解除锁定
-    atomic.StoreInt32(&isSystemInitializing, 0)
 }
 
 func onExit() {
