@@ -689,8 +689,7 @@ func monitorIconState() {
                 }
             }
 
-        // --- 第四步：通用容错逻辑 (针对非 TUN 模式或正常态) ---
-        UseFailCountLogic:
+
             if curr == StateStop {
                 failCount++
                 if failCount > 5 {
