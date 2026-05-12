@@ -644,82 +644,67 @@ func monitorKernelDaemon() {
 }
 func monitorIconState() {
     var failCount int
-    var curr int
-    var isTunMode bool
-    var hasTun bool
+    // 将必要的变量提前声明以避免 goto 编译错误（如果后续还需要用到 goto）
     var ifaces []net.Interface
     var i net.Interface
 
     for {
         if atomic.LoadInt32(&isReallyExiting) == 1 { return }
 
-        // --- 1. 最高优先级：Stop (红色) ---
-        // 只要进程不在，不管 8 秒不 8 秒，直接报红。
-        if !isProcessRunning("mihomo.exe") {
+        // 1. 物理检查：进程是否运行
+        running := isProcessRunning("mihomo.exe")
+        
+        if !running {
+            // 进程没了，最高优先级：红灯
             failCount = 0
-            tunErrorCounter = 0 
+            tunErrorCounter = 0
             if lastState != StateStop {
                 updateIconByState(StateStop)
                 lastState = StateStop
             }
-            goto SleepNext 
-        }
-
-        // --- 2. 获取大脑决策 ---
-        curr = checkSystemState()
-
-        // --- 3. 核心优先级：TUN 缓冲保护 ---
-        isTunMode = (getIniConfig("tun_enabled") == "true")
-        hasTun = false 
-        ifaces, _ = net.Interfaces()
-        for _, i = range ifaces {
-            if isTunInterfaceMatch(i.Name) {
-                hasTun = true
-                break
-            }
-        }
-
-        if isTunMode && !hasTun {
-            // 【关键修改】：8 秒缓冲期内“冻结”UI
-            if tunErrorCounter > 0 && tunErrorCounter <= 8 {
-                // 如果之前是 Tun (绿色)，现在网卡暂时没了，
-                // 我们不切换到 Default，而是直接“跳过”本次更新，让图标留在绿色。
-                goto SleepNext
-            }
-
-            // 8 秒过后依然没网卡：显黄色 (Error)
-            if curr == StateError {
-                if lastState != StateError {
-                    updateIconByState(StateError)
-                    lastState = StateError
-                }
-                goto SleepNext
-            }
-        }
-
-        // --- 4. 其它状态按优先级切换 (Tun > Proxy > Default) ---
-        
-        // 处理 API 暂时断连的情况
-        if curr == StateStop {
-            failCount++
-            if failCount > 5 {
-                // API 长期不通，才降级
-                curr = StateDefault 
-            } else {
-                // 5 秒内 API 抖动，冻结状态不更新
-                goto SleepNext
-            }
         } else {
-            failCount = 0
+            // 2. 进程在，获取业务状态
+            curr := checkSystemState()
+
+            // 3. 特殊处理：TUN 缓冲期保护
+            // 逻辑：如果 local 设置要开 TUN，但网卡还没出来，且在 8 秒内
+            isTunMode := (getIniConfig("tun_enabled") == "true")
+            hasTun := false
+            ifaces, _ = net.Interfaces()
+            for _, i = range ifaces {
+                if isTunInterfaceMatch(i.Name) {
+                    hasTun = true
+                    break
+                }
+            }
+
+            // --- 状态修正屏蔽层 ---
+            if isTunMode && !hasTun && tunErrorCounter > 0 && tunErrorCounter <= 8 {
+                // 在缓冲期内，我们“假装”状态没变，维持 lastState，不更新图标
+                // 这样就消除了从 Tun -> Default -> Tun 的闪烁
+            } else {
+                // 4. 正常更新逻辑
+                // 如果 API 报错返回了 StateStop，我们由于进程还在，将其修正为 Default 或保持
+                if curr == StateStop {
+                    failCount++
+                    if failCount > 5 {
+                        curr = StateDefault
+                    } else {
+                        // 暂时保持现状
+                        curr = lastState
+                    }
+                } else {
+                    failCount = 0
+                }
+
+                // 最终执行更新
+                if curr != lastState {
+                    updateIconByState(curr)
+                    lastState = curr
+                }
+            }
         }
 
-        // 执行最终状态更新
-        if curr != lastState {
-            updateIconByState(curr)
-            lastState = curr
-        }
-
-    SleepNext:
         time.Sleep(1 * time.Second)
     }
 }
