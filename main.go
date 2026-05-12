@@ -528,8 +528,8 @@ func monitorIconState() {
 			return
 		}
 
-		// --- 1. 物理进程判定 ---
-		// 只要内核进程没了，直接显示 Stop (灰色)，不报错，重置计数器
+		// --- 1. 物理进程判定 (最高优先级) ---
+		// 规则 3：进程挂了 -> 毫无疑问直接 Stop
 		if !isProcessRunning("mihomo.exe") {
 			failCount = 0
 			if lastState != StateStop {
@@ -539,10 +539,9 @@ func monitorIconState() {
 			goto LoopEnd
 		}
 
-		// --- 2. 进程在，开始获取业务状态 ---
+		// --- 2. 获取业务与网卡事实 ---
 		curr = checkSystemState()
-
-		// --- 3. 物理网卡判定 (增加 FlagUp 状态捕捉) ---
+		
 		isTunMode := (getIniConfig("tun_enabled") == "true")
 		hasTun := false
 		ifaces, _ := net.Interfaces()
@@ -555,44 +554,54 @@ func monitorIconState() {
 			}
 		}
 
-		// --- 4. 核心逻辑判定 ---
-		
-		// 场景 A：TUN 模式但网卡没了
-		if isTunMode && !hasTun {
-			// 即使是重载配置或启动中，只要进程还在，我们就进入宽限期逻辑
-			goto UseFailCountLogic
-		}
+		// --- 3. 核心判定分水岭 ---
 
-		// 场景 B：API 返回了停止/异常信号 (StateStop)
-		if curr == StateStop {
-			// 说明进程在，但 API 连不上（可能在重载或卡顿），进入宽限期
-			goto UseFailCountLogic
-		}
+		// 检查是否存在“业务违和”或“通讯中断”
+		if (isTunMode && !hasTun) || curr == StateStop {
+			// 进程没挂，给宽限机会
+			failCount++
 
-		// 场景 C：一切正常 (StateTun, StateProxy, StateDefault)
-		// 立即清除计数并更新图标
-		failCount = 0
-		if curr != lastState {
-			updateIconByState(curr)
-			lastState = curr
-		}
-		goto LoopEnd
-
-	UseFailCountLogic:
-		// 进程在，但业务暂时中断的“宽限期”
-		failCount++
-
-		if failCount <= 5 {
-			// 5秒内：保持灰色 (StateStop)，给内核重载或初始化的时间
-			if lastState != StateStop {
-				updateIconByState(StateStop)
-				lastState = StateStop
+			if failCount <= 5 {
+				// 机会期内：显示业务降级 (Proxy/Default)
+				// 规则 2：业务降级，但尚可接受
+				backState := curr
+				if backState == StateStop {
+					if getIniConfig("system_proxy_enabled") == "true" {
+						backState = StateProxy
+					} else {
+						backState = StateDefault
+					}
+				}
+				if lastState != backState {
+					updateIconByState(backState)
+					lastState = backState
+				}
+			} else {
+				// --- 机会一过，判定压倒性状态 ---
+				
+				// 规则 4：StateError 的唯一窗口
+				// 只有当内核通讯完全正常(curr非Stop) 且 明确要求开启TUN 且 依然没网卡
+				// 这种情况属于“内核活着但网卡配置错误”，显示 Error
+				if curr != StateStop && isTunMode && !hasTun {
+					if lastState != StateError {
+						updateIconByState(StateError)
+						lastState = StateError
+					}
+				} else {
+					// 规则 3：机会一过，压倒性 Stop
+					// 只要通讯还是断的，或者不满足 Error 的特定条件，直接判死刑变灰
+					if lastState != StateStop {
+						updateIconByState(StateStop)
+						lastState = StateStop
+					}
+				}
 			}
 		} else {
-			// 超过5秒：进程虽在但业务持续异常，判定为真故障，变红 (StateError)
-			if lastState != StateError {
-				updateIconByState(StateError)
-				lastState = StateError
+			// --- 规则 1：完美运行 ---
+			failCount = 0
+			if curr != lastState {
+				updateIconByState(curr)
+				lastState = curr
 			}
 		}
 
