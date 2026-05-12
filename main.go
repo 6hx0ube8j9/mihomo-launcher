@@ -956,22 +956,43 @@ func reloadConfigFile() {
 
 func checkSystemState() int {
     // 1. 尝试连接内核 API
-    _, err := doAPIRequest("GET", "", nil) 
+    body, err := doAPIRequest("GET", "/configs", nil) 
     if err != nil {
-        return StateStop // 发出信号：API 暂时不可用
+        return StateStop // API 连不上，说明内核彻底没起，不触发对齐
     }
 
-    // 2. API 成功，重置逻辑锁
+    if atomic.LoadInt32(&isSystemInitializing) == 0 {
+        var currentConf struct {
+            Tun struct {
+                Enable bool `json:"enable"`
+            } `json:"tun"`
+            Mode string `json:"mode"`
+        }
+        
+        if err := json.Unmarshal(body, &currentConf); err == nil {
+            // 对齐 TUN 状态：如果 Web 端改了，Launcher 跟着改
+            iniTun := getIniConfig("tun_enabled") == "true"
+            if currentConf.Tun.Enable != iniTun {
+                saveIniConfig("tun_enabled", fmt.Sprint(currentConf.Tun.Enable))
+                if mTun != nil {
+                    if currentConf.Tun.Enable { mTun.Check() } else { mTun.Uncheck() }
+                }
+            }
+            // 对齐 Mode 状态（可选，顺手把模式也对齐了）
+            if currentConf.Mode != "" && currentConf.Mode != getIniConfig("mode") {
+                saveIniConfig("mode", currentConf.Mode)
+            }
+        }
+    }
+
     if atomic.LoadInt32(&isSystemInitializing) == 1 {
         atomic.StoreInt32(&isSystemInitializing, 0)
     }
 
-    // 3. 首次同步逻辑 (保持不变)
     if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
         go syncConfigToKernel()
     }
 
-    // 4. 检查网卡
     if getIniConfig("tun_enabled") == "true" {
         hasTun := false
         ifaces, _ := net.Interfaces()
@@ -985,7 +1006,10 @@ func checkSystemState() int {
             return StateTun
         }
         
-        // 网卡还没出来时，我们也返回 StateStop 信号，交给外面的计数器去“等”
+        // 只有初始化彻底完成，且 INI 坚持要开但没网卡，才报 Error
+        if atomic.LoadInt32(&isSystemInitializing) == 0 {
+            return StateStop 
+        }
         return StateStop 
     }
 
