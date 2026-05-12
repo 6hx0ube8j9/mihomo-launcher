@@ -643,7 +643,6 @@ func monitorKernelDaemon() {
     }
 }
 func monitorIconState() {
-    // 【变量提升区】将所有变量声明提前，彻底解决 goto 报错
     var failCount int
     var curr int
     var isTunMode bool
@@ -654,24 +653,24 @@ func monitorIconState() {
     for {
         if atomic.LoadInt32(&isReallyExiting) == 1 { return }
 
-        // --- 1. 物理层判定：进程不在，立即显红 (Stop) ---
+        // --- 1. 最高优先级：Stop (红色) ---
+        // 只要进程不在，不管 8 秒不 8 秒，直接报红。
         if !isProcessRunning("mihomo.exe") {
             failCount = 0
             tunErrorCounter = 0 
             if lastState != StateStop {
-                updateIconByState(StateStop) // 切换红色
+                updateIconByState(StateStop)
                 lastState = StateStop
             }
             goto SleepNext 
         }
 
-        // --- 2. 进程在，获取大脑决策结果 ---
-        curr = checkSystemState() // 注意：这里改用 = 而不是 :=
+        // --- 2. 获取大脑决策 ---
+        curr = checkSystemState()
 
-        // --- 3. 针对 TUN 模式开启中的黄色 (Error) 容错处理 ---
+        // --- 3. 核心优先级：TUN 缓冲保护 ---
         isTunMode = (getIniConfig("tun_enabled") == "true")
         hasTun = false 
-        
         ifaces, _ = net.Interfaces()
         for _, i = range ifaces {
             if isTunInterfaceMatch(i.Name) {
@@ -681,43 +680,46 @@ func monitorIconState() {
         }
 
         if isTunMode && !hasTun {
-            // 8 秒缓冲期内：显示 Default (原本色)
+            // 【关键修改】：8 秒缓冲期内“冻结”UI
             if tunErrorCounter > 0 && tunErrorCounter <= 8 {
-                if lastState != StateDefault {
-                    updateIconByState(StateDefault)
-                    lastState = StateDefault
-                }
+                // 如果之前是 Tun (绿色)，现在网卡暂时没了，
+                // 我们不切换到 Default，而是直接“跳过”本次更新，让图标留在绿色。
                 goto SleepNext
             }
 
-            // 8 秒过后，API 通了但没网卡：显黄色 (Error)
+            // 8 秒过后依然没网卡：显黄色 (Error)
             if curr == StateError {
                 if lastState != StateError {
-                    updateIconByState(StateError) // 切换黄色
+                    updateIconByState(StateError)
                     lastState = StateError
                 }
                 goto SleepNext
             }
         }
 
-        // --- 4. 通用状态切换 ---
+        // --- 4. 其它状态按优先级切换 (Tun > Proxy > Default) ---
+        
+        // 处理 API 暂时断连的情况
         if curr == StateStop {
             failCount++
             if failCount > 5 {
+                // API 长期不通，才降级
                 curr = StateDefault 
             } else {
+                // 5 秒内 API 抖动，冻结状态不更新
                 goto SleepNext
             }
         } else {
             failCount = 0
         }
 
+        // 执行最终状态更新
         if curr != lastState {
             updateIconByState(curr)
             lastState = curr
         }
 
-    SleepNext: // 现在 goto 随便跳，因为上面已经没有任何声明语句了
+    SleepNext:
         time.Sleep(1 * time.Second)
     }
 }
