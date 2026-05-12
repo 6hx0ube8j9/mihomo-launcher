@@ -520,99 +520,85 @@ func monitorKernelDaemon() {
 }
 
 func monitorIconState() {
-    // 局部复用/声明必要变量，确保 goto 不会跨越声明
-    var (
-        curr      int
-        isTunMode bool
-        hasTun    bool
-        ifaces    []net.Interface
-        err       error
-        backState int
-    )
+	for {
+		if atomic.LoadInt32(&isReallyExiting) == 1 { return }
 
-    for {
-        if atomic.LoadInt32(&isReallyExiting) == 1 {
-            return
-        }
+		// --- 1. 物理层判定：进程不在 ---
+		if !isProcessRunning("mihomo.exe") {
+			// 【优化点】：如果系统正处于“初始化锁”状态，说明是我们主动重启导致的进程暂时消失
+			// 此时我们不应该变灰(Stop)，而是应该执行“机会期”的回退逻辑
+			if atomic.LoadInt32(&isSystemInitializing) == 1 {
+				goto GracePeriodLogic // 跳过 Stop，进入宽限期处理
+			}
 
-        // --- 1. 物理层判定 ---
-        if !isProcessRunning("mihomo.exe") {
-            tunErrorCounter = 0 // 进程没了，重置计数器
-            if lastState != StateStop {
-                updateIconByState(StateStop)
-                lastState = StateStop
-            }
-            goto LoopSleep
-        }
+			// 否则，是真的挂了
+			tunErrorCounter = 0 
+			if lastState != StateStop {
+				updateIconByState(StateStop)
+				lastState = StateStop
+			}
+			goto SleepLabel
+		}
 
-        // --- 2. 获取业务与网卡事实 ---
-        curr = checkSystemState()
-        isTunMode = (getIniConfig("tun_enabled") == "true")
-        hasTun = false
+	GracePeriodLogic:
+		{
+			curr := checkSystemState()
+			isTun := (getIniConfig("tun_enabled") == "true")
+			hasTun := false
+			
+			// 物理网卡检测
+			ifaces, _ := net.Interfaces()
+			for _, i := range ifaces {
+				if isTunInterfaceMatch(i.Name) && (i.Flags&net.FlagUp) != 0 {
+					hasTun = true
+					break
+				}
+			}
 
-        ifaces, err = net.Interfaces()
-        if err == nil {
-            for _, i := range ifaces {
-                if isTunInterfaceMatch(i.Name) {
-                    if (i.Flags & net.FlagUp) != 0 {
-                        hasTun = true
-                        break
-                    }
-                }
-            }
-        }
+			// --- 2. 核心判定：判定是否进入 5秒宽限期 ---
+			// 触发条件：1. 进程不在但初始化中；2. 开启TUN但没网卡；3. API断开
+			if (atomic.LoadInt32(&isSystemInitializing) == 1) || (isTun && !hasTun) || curr == StateStop {
+				tunErrorCounter++
+				
+				if tunErrorCounter <= 5 {
+					// 【回退逻辑】：显示 Proxy/Default，图标保持彩色，不闪灰色
+					back := curr
+					if back == StateStop {
+						if getIniConfig("system_proxy_enabled") == "true" {
+							back = StateProxy
+						} else {
+							back = StateDefault
+						}
+					}
+					if lastState != back {
+						updateIconByState(back)
+						lastState = back
+					}
+				} else {
+					// 【机会期满】：执行最终裁决
+					target := StateStop
+					// 只有内核活着但网卡没出来，才变红
+					if curr != StateStop && isTun && !hasTun {
+						target = StateError
+					}
+					if lastState != target {
+						updateIconByState(target)
+						lastState = target
+					}
+				}
+			} else {
+				// --- 正常态：一切就绪 ---
+				tunErrorCounter = 0
+				if curr != lastState {
+					updateIconByState(curr)
+					lastState = curr
+				}
+			}
+		}
 
-        // --- 3. 核心判定逻辑 ---
-        
-        // 判定条件：TUN开启但网卡没影，或者 API 连不上 (StateStop)
-        if (isTunMode && !hasTun) || curr == StateStop {
-            tunErrorCounter++ // 使用你现有的变量
-
-            if tunErrorCounter <= 5 {
-                // 【宽限期内】：尝试回退到降级状态 (Proxy/Default)
-                backState = curr
-                if backState == StateStop {
-                    if getIniConfig("system_proxy_enabled") == "true" {
-                        backState = StateProxy
-                    } else {
-                        backState = StateDefault
-                    }
-                }
-                
-                if lastState != backState {
-                    updateIconByState(backState)
-                    lastState = backState
-                }
-            } else {
-                // 【宽限期满】：执行最终裁决
-                
-                // 情况 A：内核通讯正常(API通) 但网卡持续缺失 -> 业务违和 (Error红)
-                if curr != StateStop && isTunMode && !hasTun {
-                    if lastState != StateError {
-                        updateIconByState(StateError)
-                        lastState = StateError
-                    }
-                } else {
-                    // 情况 B：压倒性 Stop (灰)
-                    // API 依然不通，或者不符合红灯条件
-                    if lastState != StateStop {
-                        updateIconByState(StateStop)
-                        lastState = StateStop
-                    }
-                }
-            }
-        } else {
-            // --- 4. 一切正常 ---
-            tunErrorCounter = 0 // 重置计数器
-            if curr != lastState {
-                updateIconByState(curr)
-                lastState = curr
-            }
-        }
-
-    LoopSleep:
-        time.Sleep(1 * time.Second)
-    }
+	SleepLabel:
+		time.Sleep(1 * time.Second)
+	}
 }
 
 func watchTunState() {
