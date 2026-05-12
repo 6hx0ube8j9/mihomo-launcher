@@ -643,20 +643,25 @@ func monitorKernelDaemon() {
     }
 }
 func monitorIconState() {
+    // 【手术 1】将变量声明提到最前面，防止 goto 跳过声明
     var failCount int
+    var ifaces []net.Interface
+    var hasTun bool
 
     for {
         if atomic.LoadInt32(&isReallyExiting) == 1 { return }
 
         // --- 1. 物理层判定：进程不在，立即显红 (Stop) ---
         if !isProcessRunning("mihomo.exe") {
-            failCount = 0
+            // 既然进程不在，重置计数器
+            failCount = 0 
             tunErrorCounter = 0 
             if lastState != StateStop {
-                updateIconByState(StateStop) // 切换为红色图标
+                updateIconByState(StateStop) // 切换红色
                 lastState = StateStop
             }
-            goto SleepNext // 进程没了，不跑后面的 API 判定
+            // 使用跳转，因为变量声明已经在最上面了，不会报错
+            goto SleepNext 
         }
 
         // --- 2. 进程在，获取大脑决策结果 ---
@@ -664,8 +669,8 @@ func monitorIconState() {
 
         // --- 3. 针对 TUN 模式开启中的黄色 (Error) 容错处理 ---
         isTunMode := (getIniConfig("tun_enabled") == "true")
-        hasTun := false
-        ifaces, _ := net.Interfaces()
+        hasTun = false // 重置状态
+        ifaces, _ = net.Interfaces() // 这里不再用 := 声明
         for _, i := range ifaces {
             if isTunInterfaceMatch(i.Name) {
                 hasTun = true
@@ -674,7 +679,7 @@ func monitorIconState() {
         }
 
         if isTunMode && !hasTun {
-            // 8 秒缓冲期内：我们不报黄色，先显示 Default 或保持现状
+            // 8 秒缓冲期内：显 Default (原本色)
             if tunErrorCounter > 0 && tunErrorCounter <= 8 {
                 if lastState != StateDefault {
                     updateIconByState(StateDefault)
@@ -686,19 +691,29 @@ func monitorIconState() {
             // 8 秒过后，API 通了但没网卡：显黄色 (Error)
             if curr == StateError {
                 if lastState != StateError {
-                    updateIconByState(StateError) // 切换为黄色图标
+                    updateIconByState(StateError) // 切换黄色
                     lastState = StateError
                 }
                 goto SleepNext
             }
         }
 
-        // --- 4. 通用状态切换 (Tun绿色, Proxy蓝色, Default原本色) ---
-        if curr != lastState {
-            // 兜底逻辑：如果大脑返回了 Stop 但进程其实在，强制降级为 Default 避免图标错位
-            if curr == StateStop {
-                curr = StateDefault
+        // --- 4. 通用状态切换 (使用 failCount 防止逻辑丢失) ---
+        if curr == StateStop {
+            // 虽然进程在，但大脑如果返回 Stop (通常是 API 挂了)，我们进入 failCount 计数
+            failCount++
+            if failCount > 5 {
+                // 如果持续 5 秒 API 都不通，图标变回 Default，而不是 Stop 红
+                curr = StateDefault 
+            } else {
+                // 5 秒内保持之前的状态，不更新图标
+                goto SleepNext
             }
+        } else {
+            failCount = 0
+        }
+
+        if curr != lastState {
             updateIconByState(curr)
             lastState = curr
         }
