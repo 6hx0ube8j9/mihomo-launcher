@@ -525,56 +525,60 @@ func monitorIconState() {
 			return
 		}
 
-		// --- 1. 物理进程判定 ---
-		if !isProcessRunning("mihomo.exe") {
-			// 只有在非初始化期间发现进程没了，才判定为真正的停止
-			if atomic.LoadInt32(&isSystemInitializing) == 0 {
+		// A. 预取初始化锁状态
+		isInit := atomic.LoadInt32(&isSystemInitializing) == 1
+		// B. 获取物理事实
+		curr := checkSystemState()
+
+		// --- 核心判定逻辑 ---
+
+		if isInit {
+			// 【场景：重启/初始化中】
+			// 此时死守 Proxy/Default 状态，无视进程是否消失，无视 API 是否断开
+			target := StateDefault
+			if getIniConfig("system_proxy_enabled") == "true" {
+				target = StateProxy
+			}
+			
+			if lastState != target {
+				updateIconByState(target)
+				lastState = target
+			}
+			// 初始化期间，错误计数器强行归零
+			tunErrorCounter = 0
+
+		} else {
+			// 【场景：正常运行模式】
+			
+			// 1. 物理层判定：进程彻底不在了
+			if !isProcessRunning("mihomo.exe") {
 				tunErrorCounter = 0
 				if lastState != StateStop {
 					updateIconByState(StateStop)
 					lastState = StateStop
 				}
-				goto SleepLabel
-			}
-			// 初始化期间如果进程还没起来，不进入上面的变灰逻辑，继续向下走 checkSystemState 获取降级态
-		}
-
-		// --- 2. 业务状态判定 ---
-		{
-			// 利用 {} 局部作用域规避 goto 声明冲突
-			curr := checkSystemState()
-
-			if curr == StateStop {
-				// 此时的 Stop 是经过过滤的“真实异常”
-				tunErrorCounter++
-				if tunErrorCounter > 5 {
-					if lastState != StateStop {
-						updateIconByState(StateStop)
-						lastState = StateStop
+			} else {
+				// 2. 进程在，判定业务逻辑
+				if curr == StateStop {
+					// 只有非初始化期间的断连，才进入 5 秒缓冲
+					tunErrorCounter++
+					if tunErrorCounter > 5 {
+						if lastState != StateStop {
+							updateIconByState(StateStop)
+							lastState = StateStop
+						}
+					}
+				} else {
+					// 状态正常 (Tun / Proxy / Default)
+					tunErrorCounter = 0
+					if curr != lastState {
+						updateIconByState(curr)
+						lastState = curr
 					}
 				}
-			} else if curr == StateTun {
-				// TUN 正常，重置计数器并更新
-				tunErrorCounter = 0
-				if lastState != StateTun {
-					updateIconByState(StateTun)
-					lastState = StateTun
-				}
-			} else {
-				// 降级态 (Proxy/Default)
-				// 注意：在宽限期内，我们允许图标保持降级色
-				if curr != lastState {
-					updateIconByState(curr)
-					lastState = curr
-				}
-				// 只有在非初始化时才清空计数器，防止在宽限期内反复横跳
-				if atomic.LoadInt32(&isSystemInitializing) == 0 {
-					tunErrorCounter = 0
-				}
 			}
 		}
 
-	SleepLabel:
 		time.Sleep(1 * time.Second)
 	}
 }
@@ -964,7 +968,7 @@ func reloadConfigFile() {
 func checkSystemState() int {
 	// 1. 尝试连接内核 API
 	body, err := doAPIRequest("GET", "/configs", nil)
-	// 注意：err != nil 说明 API 不通，此时判定为内核加载中或崩溃
+	// err != nil 说明 API 连不上
 
 	// 2. 物理网卡状态捕捉
 	hasTun := false
@@ -978,7 +982,7 @@ func checkSystemState() int {
 		}
 	}
 
-	// 3. 只有在非初始化状态下，才同步 Web 端的配置到本地 INI
+	// 3. 只有在非初始化状态下，才同步 Web 配置
 	if atomic.LoadInt32(&isSystemInitializing) == 0 {
 		var currentConf struct {
 			Tun struct {
@@ -988,7 +992,6 @@ func checkSystemState() int {
 		}
 
 		if err == nil && json.Unmarshal(body, &currentConf) == nil {
-			// 对齐 TUN 状态
 			iniTun := getIniConfig("tun_enabled") == "true"
 			if currentConf.Tun.Enable != iniTun {
 				saveIniConfig("tun_enabled", fmt.Sprint(currentConf.Tun.Enable))
@@ -996,21 +999,17 @@ func checkSystemState() int {
 					if currentConf.Tun.Enable { mTun.Check() } else { mTun.Uncheck() }
 				}
 			}
-			// 对齐 Mode 状态
 			if currentConf.Mode != "" && currentConf.Mode != getIniConfig("mode") {
 				saveIniConfig("mode", currentConf.Mode)
 			}
 		}
 	}
 
-	// 4. 延迟解锁逻辑：API通了 且 (不需要TUN 或 TUN网卡已UP) 才解锁
-	isInit := atomic.LoadInt32(&isSystemInitializing) == 1
-	if isInit {
+	// 4. 【核心锁逻辑】：API通了 且 (不需要TUN 或 网卡已UP) 自动解锁
+	if atomic.LoadInt32(&isSystemInitializing) == 1 {
 		needTun := getIniConfig("tun_enabled") == "true"
-		// 解锁条件：API必须通(err==nil) 且 (没开TUN 或 网卡已就绪)
 		if err == nil && (!needTun || hasTun) {
 			atomic.StoreInt32(&isSystemInitializing, 0)
-			isInit = false // 瞬时更新局部变量
 		}
 	}
 
@@ -1019,20 +1018,16 @@ func checkSystemState() int {
 		go syncConfigToKernel()
 	}
 
-	// 5. 最终状态判定 (二选一降级逻辑)
-	// 如果是 TUN 模式
+	// 5. 最终物理状态返回 (供 monitor 判定)
+	if err != nil {
+		return StateStop
+	}
 	if getIniConfig("tun_enabled") == "true" {
 		if hasTun {
 			return StateTun
 		}
-		// 【关键】：初始化期间或 API 波动期间，绝不返回 Stop，返回降级态
-		if isInit || err != nil {
-			goto Fallback
-		}
 		return StateStop
 	}
-
-Fallback:
 	if getIniConfig("system_proxy_enabled") == "true" {
 		return StateProxy
 	}
