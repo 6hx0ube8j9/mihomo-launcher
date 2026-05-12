@@ -61,12 +61,11 @@ var (
     manualUpdateTrigger  int32
     isReallyExiting      int32 
 	lastClickTime        int64
-	failCount int
-	lastState int
 
     // --- 4. 流程控制与计数 ---
     exitOnce        sync.Once
     lastState       = -1
+	failCount       int
     tunErrorCounter = 0
 
     // --- 5. UI 菜单组件 ---
