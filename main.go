@@ -643,35 +643,37 @@ func monitorKernelDaemon() {
     }
 }
 func monitorIconState() {
-    // 【手术 1】将变量声明提到最前面，防止 goto 跳过声明
+    // 【变量提升区】将所有变量声明提前，彻底解决 goto 报错
     var failCount int
-    var ifaces []net.Interface
+    var curr int
+    var isTunMode bool
     var hasTun bool
+    var ifaces []net.Interface
+    var i net.Interface
 
     for {
         if atomic.LoadInt32(&isReallyExiting) == 1 { return }
 
         // --- 1. 物理层判定：进程不在，立即显红 (Stop) ---
         if !isProcessRunning("mihomo.exe") {
-            // 既然进程不在，重置计数器
-            failCount = 0 
+            failCount = 0
             tunErrorCounter = 0 
             if lastState != StateStop {
                 updateIconByState(StateStop) // 切换红色
                 lastState = StateStop
             }
-            // 使用跳转，因为变量声明已经在最上面了，不会报错
             goto SleepNext 
         }
 
         // --- 2. 进程在，获取大脑决策结果 ---
-        curr := checkSystemState()
+        curr = checkSystemState() // 注意：这里改用 = 而不是 :=
 
         // --- 3. 针对 TUN 模式开启中的黄色 (Error) 容错处理 ---
-        isTunMode := (getIniConfig("tun_enabled") == "true")
-        hasTun = false // 重置状态
-        ifaces, _ = net.Interfaces() // 这里不再用 := 声明
-        for _, i := range ifaces {
+        isTunMode = (getIniConfig("tun_enabled") == "true")
+        hasTun = false 
+        
+        ifaces, _ = net.Interfaces()
+        for _, i = range ifaces {
             if isTunInterfaceMatch(i.Name) {
                 hasTun = true
                 break
@@ -679,7 +681,7 @@ func monitorIconState() {
         }
 
         if isTunMode && !hasTun {
-            // 8 秒缓冲期内：显 Default (原本色)
+            // 8 秒缓冲期内：显示 Default (原本色)
             if tunErrorCounter > 0 && tunErrorCounter <= 8 {
                 if lastState != StateDefault {
                     updateIconByState(StateDefault)
@@ -698,15 +700,12 @@ func monitorIconState() {
             }
         }
 
-        // --- 4. 通用状态切换 (使用 failCount 防止逻辑丢失) ---
+        // --- 4. 通用状态切换 ---
         if curr == StateStop {
-            // 虽然进程在，但大脑如果返回 Stop (通常是 API 挂了)，我们进入 failCount 计数
             failCount++
             if failCount > 5 {
-                // 如果持续 5 秒 API 都不通，图标变回 Default，而不是 Stop 红
                 curr = StateDefault 
             } else {
-                // 5 秒内保持之前的状态，不更新图标
                 goto SleepNext
             }
         } else {
@@ -718,7 +717,7 @@ func monitorIconState() {
             lastState = curr
         }
 
-    SleepNext:
+    SleepNext: // 现在 goto 随便跳，因为上面已经没有任何声明语句了
         time.Sleep(1 * time.Second)
     }
 }
