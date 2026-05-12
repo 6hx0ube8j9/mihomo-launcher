@@ -103,72 +103,85 @@ const (
 )
 
 func checkSystemState() int {
-    // 1. 获取物理现实 (网卡)
-    currentHasTun := isTunInterfaceExist()
-    globalLastHasTun = currentHasTun // 更新共识，供剑客 2/3 使用
-
-    // 2. 获取配置意愿 (INI)
-    iniEnabled := getIniConfig("tun_enabled") == "true"
-
-    // 3. 排除法：如果正在同步或系统初始化，直接进入“装傻”模式
-    // 借鉴版逻辑：不报警、不改配置、不 PATCH
-    if atomic.LoadInt32(&isSyncing) == 1 || isSystemInitializing {
-        tunErrorCounter = 0 // 状态变更中，重置计数器
-        return StateStop    // 返回一个中间态，UI 维持原样
+    // 1. 获取物理事实
+    hasTunOnSystem := false
+    ifaces, _ := net.Interfaces()
+    for _, i := range ifaces {
+        if isTunInterfaceMatch(i.Name) {
+            hasTunOnSystem = true
+            break
+        }
     }
 
-    // --- 核心纠偏逻辑开始 ---
+    // 2. 检查内核通信
+    resp, err := doAPIRequest("GET", "/configs", nil)
+    if err != nil {
+        tunErrorCounter = 0 // 内核不通时重置计数器
+        return StateStop 
+    }
 
-    // 逻辑 A：配置要开，但网卡没了
-    if iniEnabled && !currentHasTun {
-        // 借鉴版缓冲：给 8 秒考察期 (假设 checkSystemState 每秒执行一次)
-        tunErrorCounter++
-        if tunErrorCounter <= 8 {
-            return StateStop // 缓冲期内，不报错，不纠偏
-        }
+    // 3. 核心决策逻辑
+    isBusy := atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1
+    
+    if !isBusy {
+        respStr := string(resp)
+        // 判定内核 YAML 里的真实状态
+        kernelTunEnabled := strings.Contains(respStr, `"tun":`) && strings.Contains(respStr, `"enable":true`)
+        localTunConfig := (getIniConfig("tun_enabled") == "true")
 
-        // 灵魂拷问：探测内核真相 (你的核心思路)
-        yamlState, err := fetchRemoteYaml()
-        if err == nil {
-            // 情况 A1：内核在线，且 YAML 也是 false
-            // 【你的定夺】：说明是外部 Dashboard 关的，承认现实，修改账本
-            if !yamlState.TunEnabled {
-                saveIniConfig("tun_enabled", "false")
-                tunErrorCounter = 0
-                return StateStop
+        // --- 场景 A：配置要开，但物理网卡或内核配置不符 ---
+        if localTunConfig && (!kernelTunEnabled || !hasTunOnSystem) {
+            // 借鉴版保护：给 8 秒缓冲时间
+            tunErrorCounter++
+            if tunErrorCounter <= 8 {
+                // 缓冲期内，不纠偏，UI 维持 StateDefault 或上一个状态
+                return StateDefault 
             }
-            
-            // 情况 A2：内核在线，YAML 也是 true，但网卡就是没了
-            // 【骨架版暴力纠偏】：内核没丢配置，系统网卡层崩了，立即拉起
-            go syncConfigToKernel()
-            return StateError // 暂时亮红灯，等待拉起成功
-        } else {
-            // 情况 A3：API 探测失败 (内核可能正在重启或已崩溃)
-            // 维持红灯，但不改配置，等待内核自愈
-            return StateError 
-        }
-    }
 
-    // 逻辑 B：配置是关，但网卡出现了 (外部开启)
-    if !iniEnabled && currentHasTun {
-        // 再次探测 API 确认
-        yamlState, err := fetchRemoteYaml()
-        if err == nil && yamlState.TunEnabled {
-            // 【你的逻辑】：发现外部开启了 TUN，修改 INI 追随现实
+            // 保护期过后，执行你的“内核判断”纠偏逻辑
+            if !kernelTunEnabled {
+                // 【你的逻辑 1】：内核没开 -> 立即暴力拉起
+                go syncConfigToKernel() 
+                return StateError
+            }
+            // 如果内核开了 (kernelTunEnabled) 但网卡没出来，报红灯
+            if !hasTunOnSystem {
+                return StateError
+            }
+        }
+
+        // --- 场景 B：配置没开，但内核/物理已经开了 (外部开启感知) ---
+        if !localTunConfig && kernelTunEnabled && hasTunOnSystem {
+            // 【你的逻辑 3】：外部开启了 TUN -> 修改 INI 同步
             saveIniConfig("tun_enabled", "true")
             tunErrorCounter = 0
-            return StateRunning
+        }
+
+        // --- 场景 C：配置要开，但内核被外部关了 (外部关闭感知) ---
+        if localTunConfig && !kernelTunEnabled && hasTunOnSystem {
+            // 【你的逻辑 2】：内核未重启但 YAML 变 false -> 修改 INI 同步
+            saveIniConfig("tun_enabled", "false")
+            tunErrorCounter = 0
         }
     }
 
-    // 逻辑 C：正常态对齐
-    if iniEnabled && currentHasTun {
-        tunErrorCounter = 0 // 状态完美，重置计数
-        return StateRunning
+    // 4. UI 最终判定逻辑
+    globalLastHasTun = hasTunOnSystem 
+    currentTunPlan := (getIniConfig("tun_enabled") == "true")
+
+    if currentTunPlan {
+        if hasTunOnSystem { 
+            tunErrorCounter = 0 // 状态完美，重置计数器
+            return StateTun 
+        }
+        return StateError 
     }
 
-    tunErrorCounter = 0
-    return StateStop
+    if getIniConfig("system_proxy_enabled") == "true" {
+        return StateProxy
+    }
+
+    return StateDefault
 }
 func main() {
 	var err error
@@ -624,122 +637,151 @@ func monitorKernelDaemon() {
     }
 }
 func monitorIconState() {
-    // 1. 获取决策中心的最终状态
-    // 此调用包含了：网卡检测、8秒缓冲、API 探测、以及必要时的暴力拉起
-    state := checkSystemState()
+    var failCount int
 
-    // 2. 根据状态切换 UI 表现
-    switch state {
-    case StateRunning:
-        // 状态：一切正常，TUN 已就绪
-        systray.SetIcon(iconGreen)
-        systray.SetTooltip(APP_NAME + " - 运行中 (TUN 已开启)")
-        
-        // 确保菜单勾选状态与事实一致
-        if mTun != nil {
-            mTun.Check()
-            mTun.Enable() // 允许用户操作
-        }
+    for {
+        if atomic.LoadInt32(&isReallyExiting) == 1 { return }
 
-    case StateStop:
-        // 状态：已停止 或 处于 8 秒缓冲期/同步中
-        // 如果是正在同步 (isSyncing)，我们可以让图标变成灰色或黄色（如果有的话）
-        if atomic.LoadInt32(&isSyncing) == 1 || isSystemInitializing {
-            systray.SetIcon(iconGray)
-            systray.SetTooltip(APP_NAME + " - 状态切换中...")
-            if mTun != nil {
-                mTun.Disabled() // 正在处理时，禁用菜单防止用户连续点击
+        // 1. 物理层判定：进程不在，直接灰色
+        if !isProcessRunning("mihomo.exe") {
+            failCount = 0
+            tunErrorCounter = 0 // 进程都没了，重置所有计数器
+            if lastState != StateStop {
+                updateIconByState(StateStop)
+                lastState = StateStop
             }
         } else {
-            systray.SetIcon(iconGray)
-            systray.SetTooltip(APP_NAME + " - 未运行")
-            if mTun != nil {
-                mTun.Uncheck()
-                mTun.Enable()
+            // --- 第一步：执行联动函数 ---
+            // curr 获取的是大脑 checkSystemState 的决策结果
+            curr := checkSystemState()
+
+            // --- 第二步：物理网卡真实状态捕捉 ---
+            isTunMode := (getIniConfig("tun_enabled") == "true")
+            hasTun := false
+            ifaces, _ := net.Interfaces()
+            for _, i := range ifaces {
+                if isTunInterfaceMatch(i.Name) {
+                    hasTun = true
+                    break
+                }
+            }
+
+            // --- 第三步：针对 TUN 模式的特殊 UI 处理 ---
+            if isTunMode && !hasTun {
+                // 如果大脑还在“保护期”内 (tunErrorCounter > 0)，
+                // 我们让 UI 表现为 StateStop (灰色)，给用户一种“正在加载”的视觉感
+                if tunErrorCounter > 0 && tunErrorCounter <= 8 {
+                    if lastState != StateStop {
+                        updateIconByState(StateStop)
+                        lastState = StateStop
+                    }
+                    goto SleepNext
+                }
+
+                // 如果保护期过了，或者 checkSystemState 报了 StateError
+                if curr == StateError {
+                    failCount = 0 
+                    if lastState != StateError {
+                        updateIconByState(StateError)
+                        lastState = StateError
+                    }
+                    goto SleepNext
+                }
+            }
+
+        // --- 第四步：通用容错逻辑 (针对非 TUN 模式或正常态) ---
+        UseFailCountLogic:
+            if curr == StateStop {
+                failCount++
+                if failCount > 5 {
+                    if lastState != StateError {
+                        updateIconByState(StateError)
+                        lastState = StateError
+                    }
+                }
+            } else {
+                failCount = 0
+                if curr != lastState {
+                    updateIconByState(curr)
+                    lastState = curr
+                }
             }
         }
 
-    case StateError:
-        // 状态：超过 8 秒缓冲后，API 确认失败或网卡依然缺失
-        systray.SetIcon(iconRed)
-        systray.SetTooltip(APP_NAME + " - 异常: TUN 网卡未就绪")
-        
-        // 报错时依然允许用户尝试手动点击开关进行“暴力重置”
-        if mTun != nil {
-            mTun.Enable()
-        }
-
-    default:
-        // 保底处理
-        systray.SetIcon(iconGray)
+    SleepNext:
+        time.Sleep(1 * time.Second)
     }
-
-    // 3. 联动执行“后勤存档”
-    // watchTunState 会根据 globalLastHasTun 和 tunErrorCounter 决定是否更新 INI
-    watchTunState()
 }
 
 func watchTunState() {
-    // 1. 只有当状态发生明确变化时，才考虑操作磁盘，避免频繁 IO
-    // currentHasTun 已经在 checkSystemState 中通过全局变量 globalLastHasTun 更新
-    currentHasTun := globalLastHasTun
+    ticker := time.NewTicker(3 * time.Second)
+    defer ticker.Stop()
     
-    // 2. 核心拦截：如果正在同步、初始化或处于 8 秒缓冲期内，观察员保持静默
-    // 理由：防止在内核重启、网卡还没稳住时，误把配置改掉
-    if atomic.LoadInt32(&isSyncing) == 1 || isSystemInitializing || tunErrorCounter > 0 {
-        return
-    }
+    for {
+        select {
+        case <-ticker.C:
+            if atomic.LoadInt32(&isReallyExiting) == 1 { return }
+            
+            // 如果正在初始化、同步中，或者处于【8秒保护期内】，跳过
+            // 【手术点 1】引入 tunErrorCounter 判定，保护期内不准修改磁盘配置
+            isBusy := atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1
+            if isBusy || tunErrorCounter > 0 {
+                continue
+            }
 
-    // 3. 获取当前账本状态
-    iniEnabled := getIniConfig("tun_enabled") == "true"
+            // 1. 探测物理网卡事实
+            currentHasTun := false
+            ifaces, err := net.Interfaces()
+            if err == nil {
+                for _, i := range ifaces {
+                    if isTunInterfaceMatch(i.Name) {
+                        currentHasTun = true
+                        break
+                    }
+                }
+            }
 
-    // --- 逻辑分叉：对齐账本 ---
+            // 2. 检查事实与“上一次记录”是否相符
+            if currentHasTun != globalLastHasTun {
+                
+                // 仅在内核活跃时处理变更
+                if atomic.LoadInt32(&isKernelActive) == 1 {
+                    
+                    // 【手术点 2】双重确认：确保不是瞬时抖动
+                    // 再次检查 tunErrorCounter，确保 checkSystemState 已经确认过这不是重启延迟
+                    if tunErrorCounter == 0 {
+                        globalLastHasTun = currentHasTun
+                        
+                        atomic.StoreInt32(&hasFirstSynced, 1) 
+                        
+                        // 将事实同步回磁盘配置
+                        saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
 
-    if currentHasTun && !iniEnabled {
-        // 【你的逻辑 3】：物理网卡有了，但账本写着 false
-        // 此时 checkSystemState 已经确认过 API 为 true，观察员直接补单
-        log.Println("[Watch] 发现外部开启的 TUN 网卡，同步更新本地配置...")
-        saveIniConfig("tun_enabled", "true")
-        
-        // 联动 UI：确保菜单勾选状态同步
-        if mTun != nil {
-            mTun.Check()
+                        // 立即执行 UI 强刷
+                        newState := checkSystemState()
+                        syncUIAppearance(newState)
+                    }
+                }
+            }
         }
-
-    } else if !currentHasTun && iniEnabled {
-        // 【你的逻辑 2】：网卡没了，但账本写着 true
-        // 能够走到这一步，说明 checkSystemState 已经确认过 API 变为了 false（外部关闭）
-        // 且已经度过了 8 秒缓冲期
-        log.Println("[Watch] 检测到外部关闭行为，账本回退为 false...")
-        saveIniConfig("tun_enabled", "false")
-        
-        // 联动 UI
-        if mTun != nil {
-            mTun.Uncheck()
-        }
     }
-    
-    // 如果两者一致（True-True 或 False-False），则什么都不做，保持静默
 }
 func syncConfigToKernel() {
-    // 1. 抢锁：防止多个纠偏任务同时跑
     if !atomic.CompareAndSwapInt32(&isSyncing, 0, 1) {
         return
     }
-    // 2. 释放：确保最终解锁，并把系统初始化状态设为 false
-    defer func() {
-        atomic.StoreInt32(&isSyncing, 0)
-        isSystemInitializing = false 
-    }()
+    defer atomic.StoreInt32(&isSyncing, 0)
 
-    isSystemInitializing = true
-    // 3. 强力保护：防止网络请求意外卡死导致 UI 永远无法操作
-    timer := time.AfterFunc(10*time.Second, func() { 
-        isSystemInitializing = false 
-    })
+    atomic.StoreInt32(&isSystemInitializing, 1)
+    // 保护：如果函数因为意外卡死，10秒后强制解除初始化状态
+    timer := time.AfterFunc(10*time.Second, func() { atomic.StoreInt32(&isSystemInitializing, 0) })
     defer timer.Stop()
 
-    // ... 获取配置和拼接 payload 的逻辑 ...
+    tunEnabled := getIniConfig("tun_enabled") == "true"
+    payload := map[string]interface{}{
+        "mode": getIniConfig("mode"),
+        "tun":  map[string]bool{"enable": tunEnabled},
+    }
 
     success := false
     for i := 0; i < 3; i++ {
@@ -748,17 +790,24 @@ func syncConfigToKernel() {
             success = true
             break 
         }
+        // 如果失败，等待一段时间重试
         time.Sleep(time.Duration(i+1) * 500 * time.Millisecond)
     }
 
     if success {
-        // --- 关键修补点 ---
-        // 同步成功了，立即清空大脑的错误计数器，让图标瞬间变绿
+        // --- 【关键手术点】 ---
+        // 既然同步成功了，立即清空 8 秒计数器。
+        // 这能确保 checkSystemState 在下一轮循环时直接通过，UI 瞬间恢复正常。
         tunErrorCounter = 0 
-        
-        // 给内核一点点时间创建网卡接口
+
+        if mTun != nil {
+            if tunEnabled { mTun.Check() } else { mTun.Uncheck() }
+        }
+        // 同步成功后稍微稳一下状态
         time.Sleep(500 * time.Millisecond)
     }
+
+    atomic.StoreInt32(&isSystemInitializing, 0)
 }
 
 func doAPIRequest(method, path string, payload interface{}) ([]byte, error) {
