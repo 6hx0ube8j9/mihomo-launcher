@@ -520,65 +520,86 @@ func monitorKernelDaemon() {
 }
 
 func monitorIconState() {
+	var failCount int
+	var curr int // 【修复：在此处提前声明 curr】
+
 	for {
 		if atomic.LoadInt32(&isReallyExiting) == 1 {
 			return
 		}
 
-		// A. 预取初始化锁状态
-		isInit := atomic.LoadInt32(&isSystemInitializing) == 1
-		// B. 获取物理事实
-		curr := checkSystemState()
-
-		// --- 核心判定逻辑 ---
-
-		if isInit {
-			// 【场景：重启/初始化中】
-			// 此时死守 Proxy/Default 状态，无视进程是否消失，无视 API 是否断开
-			target := StateDefault
-			if getIniConfig("system_proxy_enabled") == "true" {
-				target = StateProxy
+		// 1. 物理层判定
+		if !isProcessRunning("mihomo.exe") {
+			failCount = 0
+			curr = StateStop // 【赋值而非重声明】
+			if lastState != StateStop {
+				updateIconByState(StateStop)
+				lastState = StateStop
 			}
-			
-			if lastState != target {
-				updateIconByState(target)
-				lastState = target
-			}
-			// 初始化期间，错误计数器强行归零
-			tunErrorCounter = 0
-
 		} else {
-			// 【场景：正常运行模式】
-			
-			// 1. 物理层判定：进程彻底不在了
-			if !isProcessRunning("mihomo.exe") {
-				tunErrorCounter = 0
-				if lastState != StateStop {
-					updateIconByState(StateStop)
-					lastState = StateStop
+			// --- 第一步：执行联动函数 ---
+			curr = checkSystemState() // 【赋值而非重声明】
+
+			// --- 第二步：物理网卡捕捉 ---
+			isTunMode := (getIniConfig("tun_enabled") == "true")
+			hasTun := false
+			ifaces, _ := net.Interfaces()
+			for _, i := range ifaces {
+				if isTunInterfaceMatch(i.Name) {
+					hasTun = true
+					break
 				}
-			} else {
-				// 2. 进程在，判定业务逻辑
-				if curr == StateStop {
-					// 只有非初始化期间的断连，才进入 5 秒缓冲
-					tunErrorCounter++
-					if tunErrorCounter > 5 {
-						if lastState != StateStop {
-							updateIconByState(StateStop)
-							lastState = StateStop
-						}
-					}
-				} else {
-					// 状态正常 (Tun / Proxy / Default)
-					tunErrorCounter = 0
+			}
+
+			// --- 第三步：逻辑判定 ---
+			if isTunMode && !hasTun {
+				if atomic.LoadInt32(&isSystemInitializing) == 1 {
+					goto UseFailCountLogic
+				}
+				if curr != StateTun {
+					failCount = 0
 					if curr != lastState {
 						updateIconByState(curr)
 						lastState = curr
 					}
+				} else {
+					goto UseFailCountLogic
+				}
+			} else {
+				failCount = 0
+				if curr != lastState {
+					updateIconByState(curr)
+					lastState = curr
 				}
 			}
 		}
 
+		goto LoopEnd
+
+	UseFailCountLogic:
+		// 此时 curr 已经是全局可见的了，不会再报 undefined
+		if curr == StateStop {
+			failCount++
+			if failCount > 5 {
+				if lastState != StateError {
+					updateIconByState(StateError)
+					lastState = StateError
+				}
+			} else {
+				if curr != lastState {
+					updateIconByState(curr)
+					lastState = curr
+				}
+			}
+		} else {
+			failCount = 0
+			if curr != lastState {
+				updateIconByState(curr)
+				lastState = curr
+			}
+		}
+
+	LoopEnd:
 		time.Sleep(1 * time.Second)
 	}
 }
@@ -966,72 +987,70 @@ func reloadConfigFile() {
 }
 
 func checkSystemState() int {
-	// 1. 尝试连接内核 API
-	body, err := doAPIRequest("GET", "/configs", nil)
-	// err != nil 说明 API 连不上
+    // 1. 尝试连接内核 API
+    body, err := doAPIRequest("GET", "/configs", nil) 
+    if err != nil {
+        return StateStop // API 连不上，说明内核彻底没起，不触发对齐
+    }
 
-	// 2. 物理网卡状态捕捉
-	hasTun := false
-	ifaces, _ := net.Interfaces()
-	for _, i := range ifaces {
-		if isTunInterfaceMatch(i.Name) {
-			if (i.Flags & net.FlagUp) != 0 {
-				hasTun = true
-				break
-			}
-		}
-	}
+    if atomic.LoadInt32(&isSystemInitializing) == 0 {
+        var currentConf struct {
+            Tun struct {
+                Enable bool `json:"enable"`
+            } `json:"tun"`
+            Mode string `json:"mode"`
+        }
+        
+        if err := json.Unmarshal(body, &currentConf); err == nil {
+            // 对齐 TUN 状态：如果 Web 端改了，Launcher 跟着改
+            iniTun := getIniConfig("tun_enabled") == "true"
+            if currentConf.Tun.Enable != iniTun {
+                saveIniConfig("tun_enabled", fmt.Sprint(currentConf.Tun.Enable))
+                if mTun != nil {
+                    if currentConf.Tun.Enable { mTun.Check() } else { mTun.Uncheck() }
+                }
+            }
+            // 对齐 Mode 状态（可选，顺手把模式也对齐了）
+            if currentConf.Mode != "" && currentConf.Mode != getIniConfig("mode") {
+                saveIniConfig("mode", currentConf.Mode)
+            }
+        }
+    }
 
-	// 3. 只有在非初始化状态下，才同步 Web 配置
-	if atomic.LoadInt32(&isSystemInitializing) == 0 {
-		var currentConf struct {
-			Tun struct {
-				Enable bool `json:"enable"`
-			} `json:"tun"`
-			Mode string `json:"mode"`
-		}
+    if atomic.LoadInt32(&isSystemInitializing) == 1 {
+        atomic.StoreInt32(&isSystemInitializing, 0)
+    }
 
-		if err == nil && json.Unmarshal(body, &currentConf) == nil {
-			iniTun := getIniConfig("tun_enabled") == "true"
-			if currentConf.Tun.Enable != iniTun {
-				saveIniConfig("tun_enabled", fmt.Sprint(currentConf.Tun.Enable))
-				if mTun != nil {
-					if currentConf.Tun.Enable { mTun.Check() } else { mTun.Uncheck() }
-				}
-			}
-			if currentConf.Mode != "" && currentConf.Mode != getIniConfig("mode") {
-				saveIniConfig("mode", currentConf.Mode)
-			}
-		}
-	}
+    if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
+        go syncConfigToKernel()
+    }
 
-	// 4. 【核心锁逻辑】：API通了 且 (不需要TUN 或 网卡已UP) 自动解锁
-	if atomic.LoadInt32(&isSystemInitializing) == 1 {
-		needTun := getIniConfig("tun_enabled") == "true"
-		if err == nil && (!needTun || hasTun) {
-			atomic.StoreInt32(&isSystemInitializing, 0)
-		}
-	}
 
-	// 首次同步逻辑
-	if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
-		go syncConfigToKernel()
-	}
+    if getIniConfig("tun_enabled") == "true" {
+        hasTun := false
+        ifaces, _ := net.Interfaces()
+        for _, i := range ifaces {
+            if isTunInterfaceMatch(i.Name) {
+                hasTun = true
+                break
+            }
+        }
+        
+        if hasTun {
+            return StateTun
+        }
+        
+        // --- 此处原本是 return StateStop ---
+        // 现在删掉它，什么都不做，逻辑会继续往下走
+        // 这样即便网卡没起，也会去判断 SystemProxy 或返回 Default
+    }
 
-	// 5. 最终物理状态返回 (供 monitor 判定)
-	if err != nil {
-		return StateStop
-	}
-	if getIniConfig("tun_enabled") == "true" {
-		if hasTun {
-			return StateTun
-		}
-		return StateStop
-	}
-	if getIniConfig("system_proxy_enabled") == "true" {
-		return StateProxy
-	}
-	return StateDefault
+    // 5. 检查系统代理 (如果上面 TUN 没 return，就会流转到这里)
+    if getIniConfig("system_proxy_enabled") == "true" {
+        return StateProxy
+    }
+
+    return StateDefault
 }
 
 func isAdmin() bool {
