@@ -131,21 +131,31 @@ func checkSystemState() int {
 
         // --- 场景 A：配置要开，但物理网卡或内核配置不符 ---
         if localTunConfig && (!kernelTunEnabled || !hasTunOnSystem) {
-            // 借鉴版保护：给 8 秒缓冲时间
             tunErrorCounter++
             if tunErrorCounter <= 8 {
-                // 缓冲期内，不纠偏，UI 维持 StateDefault 或上一个状态
-                return StateDefault 
+                // 缓冲期内保持现状
+                goto EndDecision // 建议用 goto 跳出，或者直接按你原样 return
             }
 
-            // 保护期过后，执行你的“内核判断”纠偏逻辑
+            // 8秒到了，优先判定是否为“外部手动关闭”
             if !kernelTunEnabled {
-                // 【你的逻辑 1】：内核没开 -> 立即暴力拉起
-                go syncConfigToKernel() 
-                return StateError
+                saveIniConfig("tun_enabled", "false")
+                tunErrorCounter = 0
+                
+                // 联动 UI 菜单去掉勾选
+                if mTun != nil { mTun.Uncheck() }
+
+                // 动态回退状态
+                if getIniConfig("system_proxy_enabled") == "true" {
+                    return StateProxy
+                }
+                return StateDefault
             }
-            // 如果内核开了 (kernelTunEnabled) 但网卡没出来，报红灯
+
+            // 如果内核配置还是 true，但物理网卡死活不出来，这才是真正的异常
             if !hasTunOnSystem {
+                // 触发暴力拉起
+                go syncConfigToKernel()
                 return StateError
             }
         }
@@ -689,7 +699,7 @@ func monitorIconState() {
                 }
             }
 
-
+        // --- 第四步：通用容错逻辑 (针对非 TUN 模式或正常态) ---
             if curr == StateStop {
                 failCount++
                 if failCount > 5 {
