@@ -976,45 +976,38 @@ func reloadConfigFile() {
 }
 
 func checkSystemState() int {
-    // 1. 尝试连接内核 API
-    body, err := doAPIRequest("GET", "/configs", nil) 
+    // 1. 获取内核实时状态
+    body, err := doAPIRequest("GET", "/configs", nil)
     if err != nil {
-        return StateStop // API 连不上，说明内核彻底没起，不触发对齐
+        return StateStop 
     }
 
+    // 2. 状态对齐逻辑 (这里必须先跑完，且不能动锁)
+    iniTun := getIniConfig("tun_enabled") == "true"
+    
     if atomic.LoadInt32(&isSystemInitializing) == 0 {
         var currentConf struct {
-            Tun struct {
-                Enable bool `json:"enable"`
-            } `json:"tun"`
-            Mode string `json:"mode"`
+            Tun struct { Enable bool `json:"enable"` } `json:"tun"`
         }
-        
         if err := json.Unmarshal(body, &currentConf); err == nil {
-            // 对齐 TUN 状态：如果 Web 端改了，Launcher 跟着改
-            iniTun := getIniConfig("tun_enabled") == "true"
-            if currentConf.Tun.Enable != iniTun {
-                saveIniConfig("tun_enabled", fmt.Sprint(currentConf.Tun.Enable))
-                if mTun != nil {
-                    if currentConf.Tun.Enable { mTun.Check() } else { mTun.Uncheck() }
-                }
-            }
-            // 对齐 Mode 状态（可选，顺手把模式也对齐了）
-            if currentConf.Mode != "" && currentConf.Mode != getIniConfig("mode") {
-                saveIniConfig("mode", currentConf.Mode)
+            // 如果 Web 端关了，Launcher 强制跟进，不许报错
+            if !currentConf.Tun.Enable && iniTun {
+                saveIniConfig("tun_enabled", "false")
+                if mTun != nil { mTun.Uncheck() }
+                iniTun = false // 【关键】立即更新局部变量，防止后面的逻辑误判
             }
         }
     }
 
-    if atomic.LoadInt32(&isSystemInitializing) == 1 {
-        atomic.StoreInt32(&isSystemInitializing, 0)
-    }
+    // --- 原本在这里的 atomic.Store(..., 0) 必须删除 ---
 
+    // 3. 首次同步逻辑（保持原样）
     if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
         go syncConfigToKernel()
     }
 
-    if getIniConfig("tun_enabled") == "true" {
+    // 4. 网卡检测逻辑 (使用上面对齐后的 iniTun 变量)
+    if iniTun { 
         hasTun := false
         ifaces, _ := net.Interfaces()
         for _, i := range ifaces {
@@ -1027,9 +1020,9 @@ func checkSystemState() int {
             return StateTun
         }
         
-        // 只有初始化彻底完成，且 INI 坚持要开但没网卡，才报 Error
+        // 只有当“初始化彻底锁释放”且“确认要开TUN却没网卡”时，才报 Error
         if atomic.LoadInt32(&isSystemInitializing) == 0 {
-            return StateStop 
+            return StateStop // 这里如果是你定义的具体错误状态，请按需返回
         }
         return StateStop 
     }
