@@ -612,7 +612,7 @@ func watchTunState() {
 			break
 		}
 	}
-    atomic.StoreInt32(&hasFirstSynced, 1)
+
 	for {
 		select {
 		case <-ticker.C:
