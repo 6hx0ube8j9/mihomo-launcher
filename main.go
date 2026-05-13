@@ -112,6 +112,19 @@ const (
     debugPort      = "52719"
 )
 
+func init() {
+    u32 := windows.NewLazySystemDLL("user32.dll")
+    procSetContext := u32.NewProc("SetProcessDpiAwarenessContext")
+    if procSetContext.Find() == nil {
+        _, _, _ = procSetContext.Call(uintptr(0xfffffffc))
+    } else {
+        procSetAware := u32.NewProc("SetProcessDPIAware")
+        if procSetAware.Find() == nil {
+            _, _, _ = procSetAware.Call()
+        }
+    }
+}
+
 func main() {
     atomic.StoreInt32(&isSystemInitializing, 1)
 	var err error
