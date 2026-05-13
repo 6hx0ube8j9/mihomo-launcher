@@ -227,12 +227,11 @@ func focusWindowSilky(targetHwnd uintptr) {
 }
 
 func launchWebUI() {
-
     apiAddr := getIniConfig("external-controller")
     secret := getIniConfig("secret")
     proxyAddr := getIniConfig("proxy_address")
     
-    // URL 构造
+    // 1. URL 构造 (保持不变)
     baseUI := strings.TrimRight(apiAddr, "/")
     if !strings.HasPrefix(baseUI, "http") {
         baseUI = "http://" + baseUI
@@ -241,24 +240,21 @@ func launchWebUI() {
     if port == "" { host, port = "127.0.0.1", "9090" }
     finalURL := fmt.Sprintf("%s/ui/?hostname=%s&port=%s&secret=%s#/proxies", baseUI, host, port, secret)
 
-    // 1. 探测阶段：通过 CDP 端口寻找是否已经有打开的 UI
+    // 2. 探测与复用逻辑
     client := &http.Client{Timeout: 300 * time.Millisecond}
     isPortOccupied := false
     
     if resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%s/json", debugPort)); err == nil {
-        isPortOccupied = true // 端口有响应
+        isPortOccupied = true 
         defer resp.Body.Close()
         var targets []map[string]interface{}
         if err := json.NewDecoder(resp.Body).Decode(&targets); err == nil {
             for _, t := range targets {
                 pURL, _ := t["url"].(string)
-                // 识别特征：URL 中包含 /ui/ 或 setup
                 if strings.Contains(pURL, "/ui/") || strings.Contains(pURL, "setup") {
                     id, _ := t["id"].(string)
-                    // 激活该标签页（前端跳转）
                     client.Get(fmt.Sprintf("http://127.0.0.1:%s/json/activate/%s", debugPort, id))
                     
-                    // 异步置顶窗口
                     go func() {
                         time.Sleep(100 * time.Millisecond)
                         var targetHwnd uintptr
@@ -268,21 +264,19 @@ func launchWebUI() {
                             if windows.UTF16ToString(buf[:]) == "Chrome_WidgetWin_1" {
                                 if vis, _, _ := procIsWindowVisible.Call(hwnd); vis != 0 {
                                     targetHwnd = hwnd
-                                    return 0 // 找到即停止
+                                    return 0 
                                 }
                             }
                             return 1
                         }), 0)
-                        if targetHwnd != 0 {
-                            focusWindowSilky(targetHwnd)
-                        }
+                        if targetHwnd != 0 { focusWindowSilky(targetHwnd) }
                     }()
-                    return // 【核心：发现目标 UI，复用并退出函数】
+                    return 
                 }
             }
         }
     } else {
-        // 如果 Get 报错，进一步通过 Dial 确认端口是否真的被占用（可能不是 HTTP 服务）
+        // 只有当 HTTP 探测失败时，才通过 Dial 确认是否被非 HTTP 进程占用
         conn, dialErr := net.DialTimeout("tcp", "127.0.0.1:"+debugPort, 50*time.Millisecond)
         if dialErr == nil {
             conn.Close()
@@ -290,22 +284,29 @@ func launchWebUI() {
         }
     }
 
-    // 2. 精细化清场：如果端口被占用但没能通过上面的识别逻辑，说明是干扰进程
+    // 3. 精细化清场
     if isPortOccupied {
-        // 仅杀掉占用指定调试端口的进程，手术式打击
         killCmd := fmt.Sprintf("for /f \"tokens=5\" %%a in ('netstat -aon ^| findstr :%s ^| findstr LISTENING') do taskkill /F /PID %%a", debugPort)
         _ = exec.Command("cmd", "/c", killCmd).Run()
-        time.Sleep(150 * time.Millisecond) // 等待系统回收端口
+        time.Sleep(150 * time.Millisecond) 
     }
 
-    // 2. 查找可用浏览器阶段
+    // 4. 浏览器查找 (按照 Edge(x86) -> Chrome -> Brave 优化顺序)
     var browserPath string
     potentialPaths := []string{
+        // Edge 默认路径 (x86 是 64位系统的默认存放点)
         filepath.Join(os.Getenv("ProgramFiles(x86)"), `Microsoft\Edge\Application\msedge.exe`),
         filepath.Join(os.Getenv("ProgramFiles"), `Microsoft\Edge\Application\msedge.exe`),
-        filepath.Join(os.Getenv("ProgramFiles(x86)"), `Google\Chrome\Application\chrome.exe`),
+        
+        // Chrome 标准路径
         filepath.Join(os.Getenv("ProgramFiles"), `Google\Chrome\Application\chrome.exe`),
+        filepath.Join(os.Getenv("ProgramFiles(x86)"), `Google\Chrome\Application\chrome.exe`),
         filepath.Join(os.Getenv("LocalAppData"), `Google\Chrome\Application\chrome.exe`),
+
+        // Brave 标准路径
+        filepath.Join(os.Getenv("ProgramFiles"), `BraveSoftware\Brave-Browser\Application\brave.exe`),
+        filepath.Join(os.Getenv("LocalAppData"), `BraveSoftware\Brave-Browser\Application\brave.exe`),
+        filepath.Join(os.Getenv("ProgramFiles(x86)"), `BraveSoftware\Brave-Browser\Application\brave.exe`),
     }
 
     for _, p := range potentialPaths {
@@ -315,10 +316,9 @@ func launchWebUI() {
         }
     }
 
-    // 3. 启动执行阶段
+    // 5. 启动阶段
     if browserPath != "" {
-        // 使用独立的用户数据目录，防止污染用户日常使用的浏览器
-        userDataDir := filepath.Join(baseDir, "WebCache") // 建议通用命名
+        userDataDir := filepath.Join(baseDir, "WebCache")
         _ = os.MkdirAll(userDataDir, 0755)
 
         args := []string{
@@ -330,20 +330,18 @@ func launchWebUI() {
             "--no-first-run",
         }
         cmd := exec.Command(browserPath, args...)
-		if err := cmd.Start(); err == nil {
-		    if hJob != 0 {
-			    hp, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
-			    if err == nil {
-				    _ = windows.AssignProcessToJobObject(hJob, hp)
-					_ = windows.CloseHandle(hp)
-				}
-			}
-		}	
+        if err := cmd.Start(); err == nil && hJob != 0 {
+            // 精简了 AssignProcessToJobObject 的写法
+            if hp, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid)); err == nil {
+                _ = windows.AssignProcessToJobObject(hJob, hp)
+                _ = windows.CloseHandle(hp)
+            }
+        }    
     } else {
-        // 兜底：用系统默认浏览器直接打开
         _ = exec.Command("cmd", "/c", "start", "", finalURL).Start()
     }
 }
+
 func onReady() {
     // 1. 【核心保护】一进入函数立即开启初始化锁
     atomic.StoreInt32(&isSystemInitializing, 1)
@@ -463,7 +461,19 @@ func onReady() {
         sniffAndSolidifyConfig()
         reloadConfigFile()
     })
+    mEditConfig := mMoreRoot.AddSubMenuItem("编辑 config.yaml", "")
+    mEditConfig.Click(func() {
+        now := time.Now().UnixNano()
+        if now - atomic.LoadInt64(&lastClickTime) < int64(1000 * time.Millisecond) {
+            return
+        }
+        atomic.StoreInt64(&lastClickTime, now)
 
+        configPath := filepath.Join(baseDir, "config.yaml")
+        windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(configPath), nil, nil, windows.SW_SHOWNORMAL)
+        // 这里原本多了一个 }，已删除
+    })
+	
     systray.AddSeparator()
 
     mExit := systray.AddMenuItem("关闭程序", "")
@@ -516,15 +526,14 @@ func monitorKernelDaemon() {
 	target := filepath.Join(baseDir, "mihomo.exe")
 	absBaseDir, _ := filepath.Abs(baseDir)
 	for {
-		if atomic.LoadInt32(&isReallyExiting) == 1 {
-			return
-		}
+		if atomic.LoadInt32(&isReallyExiting) == 1 { return }
 		if !isProcessRunning("mihomo.exe") {
 			atomic.StoreInt32(&isSystemInitializing, 1)
 			atomic.StoreInt32(&hasFirstSynced, 0)
 			atomic.StoreInt32(&isKernelActive, 0)
+			
 			KillProcessByName("mihomo.exe")
-			time.Sleep(500 * time.Millisecond)
+			time.Sleep(200 * time.Millisecond)
 			cmd := exec.Command(target, "-d", ".")
 			cmd.Dir = absBaseDir
 			cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
@@ -541,7 +550,8 @@ func monitorKernelDaemon() {
 					_ = c.Wait()
 					atomic.StoreInt32(&isKernelActive, 0)
 				}(cmd)
-				time.Sleep(1500 * time.Millisecond)
+				
+				time.Sleep(1000 * time.Millisecond)
 				atomic.StoreInt32(&isSystemInitializing, 0)
 			} else {
 				atomic.StoreInt32(&isSystemInitializing, 0)
