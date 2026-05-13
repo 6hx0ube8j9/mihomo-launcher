@@ -562,72 +562,78 @@ func monitorKernelDaemon() {
 }
 
 func checkSystemState() int {
-	iniTunEnabled := getIniConfig("tun_enabled") == "true"
-	iniProxyEnabled := getIniConfig("system_proxy_enabled") == "true"
-	isInit := atomic.LoadInt32(&isSystemInitializing) == 1
-	
-	// 1. 内核通信判定
-	body, err := doAPIRequest("GET", "/configs", nil)
-	if err != nil {
-		return StateStop 
-	}
+    iniTunEnabled := getIniConfig("tun_enabled") == "true"
+    iniProxyEnabled := getIniConfig("system_proxy_enabled") == "true"
+    isInit := atomic.LoadInt32(&isSystemInitializing) == 1
+    
+    // 1. 内核通信判定
+    body, err := doAPIRequest("GET", "/configs", nil)
+    if err != nil {
+        return StateStop 
+    }
 
-	// 2. 激活内核同步（仅在第一次连通时触发）
-	if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
-		atomic.StoreInt32(&isKernelActive, 1)
-		go syncConfigToKernel()
-	}
+    // 2. 提前解析 API 内容（为了判定“意图对齐”）
+    var currentConf struct {
+        Tun struct { Enable bool `json:"enable"` } `json:"tun"`
+        Mode string `json:"mode"`
+    }
+    unmarshalErr := json.Unmarshal(body, &currentConf)
 
-	// 3. 状态对齐：增加 !isInit 保护
-	// 重启内核瞬间，内核返回的是默认配置，如果不加 !isInit，会把本地正常的 ini 配置覆盖掉
-	if !isInit {
-		var currentConf struct {
-			Tun struct { Enable bool `json:"enable"` } `json:"tun"`
-			Mode string `json:"mode"`
-		}
-		if err := json.Unmarshal(body, &currentConf); err == nil {
-			if currentConf.Mode != "" && currentConf.Mode != getIniConfig("mode") {
-				saveIniConfig("mode", currentConf.Mode)
-			}        
-			if currentConf.Tun.Enable != iniTunEnabled {
-				saveIniConfig("tun_enabled", fmt.Sprint(currentConf.Tun.Enable))
-				iniTunEnabled = currentConf.Tun.Enable
-				if mTun != nil {
-					if iniTunEnabled { mTun.Check() } else { mTun.Uncheck() }
-				}
-			}
-		}
-	}
+    // 3. 激活内核同步（仅在第一次连通时触发）
+    if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
+        atomic.StoreInt32(&isKernelActive, 1)
+        go syncConfigToKernel()
+    }
 
-	// 4. 判定路径 A：未开启 TUN
-	if !iniTunEnabled {
-		// 已经确定是 Proxy 或 Default 模式，可以安全结束初始化状态
-		if isInit { atomic.StoreInt32(&isSystemInitializing, 0) }
-		
-		if iniProxyEnabled { return StateProxy }
-		return StateDefault
-	}
+    // 4. 精准解锁与状态对齐
+    if unmarshalErr == nil {
+        // 【核心修改】：意图对齐才解锁
+        // 只有当内核返回的 TUN 状态和我们 INI 里的设置一致时，才认为初始化完成
+        if isInit && currentConf.Tun.Enable == iniTunEnabled {
+            atomic.StoreInt32(&isSystemInitializing, 0)
+            isInit = false // 立即更新局部变量，让下面的逻辑能进 !isInit 分支
+        }
 
-	// 5. 判定路径 B：开启了 TUN 且正在初始化 (给网卡 3-5 秒缓冲期)
-	// 这是解决重启瞬间变色不一致的关键：此时 API 通了但网卡可能还没出来
-	if isInit { 
-		return StateTun 
-	}
+        // 只有在非初始化保护期，才允许内核配置反向同步到 INI
+        if !isInit {
+            if currentConf.Mode != "" && currentConf.Mode != getIniConfig("mode") {
+                saveIniConfig("mode", currentConf.Mode)
+            }        
+            if currentConf.Tun.Enable != iniTunEnabled {
+                saveIniConfig("tun_enabled", fmt.Sprint(currentConf.Tun.Enable))
+                iniTunEnabled = currentConf.Tun.Enable
+                if mTun != nil {
+                    if iniTunEnabled { mTun.Check() } else { mTun.Uncheck() }
+                }
+            }
+        }
+    }
 
-	// 6. 判定路径 C：TUN 稳定期，执行物理网卡校验
-	hasTun := false
-	ifaces, _ := net.Interfaces()
-	for _, i := range ifaces {
-		if isTunInterfaceMatch(i.Name) {
-			hasTun = true
-			break
-		}
-	}
+    // 5. 判定路径 A：未开启 TUN
+    if !iniTunEnabled {
+        if iniProxyEnabled { return StateProxy }
+        return StateDefault
+    }
 
-	if hasTun { return StateTun }
+    // 6. 判定路径 B：开启了 TUN 且正在初始化 (API 还没返回 true，或者锁还没解)
+    if isInit { 
+        return StateTun 
+    }
 
-	// 物理网卡确实不存在，且已过初始化期，才报 Error
-	return StateError 
+    // 7. 判定路径 C：TUN 稳定期，执行物理网卡校验
+    hasTun := false
+    ifaces, _ := net.Interfaces()
+    for _, i := range ifaces {
+        if isTunInterfaceMatch(i.Name) {
+            hasTun = true
+            break
+        }
+    }
+
+    if hasTun { return StateTun }
+
+    // 物理网卡不存在，且已解锁，返回 Error 交给 monitorIconState 的 5秒逻辑处理
+    return StateError 
 }
 
 func monitorIconState() {
