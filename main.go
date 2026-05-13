@@ -625,32 +625,39 @@ func checkSystemState() int {
 func monitorIconState() {
     var failCount int
     for {
-        // 优先级 1：进程物理判定 (对齐原版最高优先级)
+        if atomic.LoadInt32(&isReallyExiting) == 1 { return }
+
+        // 获取当前旧状态 (从 int 转 int32 内存地址读取)
+        oldState := atomic.LoadInt32((*int32)(unsafe.Pointer(&lastState)))
+
+        // 优先级 1：进程物理判定
         if !isProcessRunning("mihomo.exe") {
             failCount = 0
-            if atomic.LoadInt32(&lastState) != int32(StateStop) {
-                updateIconByState(StateStop)
-                atomic.StoreInt32(&lastState, int32(StateStop))
+            curr := StateStop
+            if int32(curr) != oldState {
+                updateIconByState(curr)
+                atomic.StoreInt32((*int32)(unsafe.Pointer(&lastState)), int32(curr))
             }
         } else {
             // 优先级 2：逻辑信号
             curr := checkSystemState()
 
+            // 优先级 3：Error 判定 (内核在跑但信号是 Error 或 Stop)
             if curr == StateError || (curr == StateStop && isProcessRunning("mihomo.exe")) {
                 failCount++
                 if failCount > 5 {
-                    curr = StateError // 5秒后正式确认为错误
+                    curr = StateError
                 } else {
-                    curr = int(atomic.LoadInt32(&lastState)) // 缓冲期，保持原样
+                    curr = int(oldState) // 5秒内保持原样
                 }
             } else {
-                failCount = 0 // 状态正常（Tun/Proxy），清零计数
+                failCount = 0
             }
 
             // 更新 UI
-            if int32(curr) != atomic.LoadInt32(&lastState) {
+            if int32(curr) != atomic.LoadInt32((*int32)(unsafe.Pointer(&lastState))) {
                 updateIconByState(curr)
-                atomic.StoreInt32(&lastState, int32(curr))
+                atomic.StoreInt32((*int32)(unsafe.Pointer(&lastState)), int32(curr))
             }
         }
         time.Sleep(1 * time.Second)
