@@ -168,8 +168,9 @@ func main() {
 		systray.Quit()
 	}()
 
-	KillProcessByName("mihomo.exe")
-	time.Sleep(200 * time.Millisecond)
+    KillProcessByName("mihomo.exe")
+    exec.Command("cmd", "/c", "for /f \"tokens=5\" %a in ('netstat -aon ^| findstr :"+debugPort+" ^| findstr LISTENING') do taskkill /F /PID %a").Run()
+    time.Sleep(200 * time.Millisecond)
 
 	initJobObject()
 	sniffAndSolidifyConfig()
