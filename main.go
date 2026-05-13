@@ -28,7 +28,7 @@ import (
 var iconFs embed.FS
 
 const (
-	APP_MUTEX    = "Global\\MihomoLauncher_Unique_Mutex"
+	APP_MUTEX    = "Mihomo_Unique_Mutex"
 	CONFIG_FILE  = "mihomo-launcher.ini"
 	REG_RUN      = `Software\Microsoft\Windows\CurrentVersion\Run`
 	REG_PROXY    = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
