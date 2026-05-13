@@ -169,7 +169,6 @@ func main() {
 	}()
 
     KillProcessByName("mihomo.exe")
-    exec.Command("cmd", "/c", "for /f \"tokens=5\" %a in ('netstat -aon ^| findstr :"+debugPort+" ^| findstr LISTENING') do taskkill /F /PID %a").Run()
     time.Sleep(200 * time.Millisecond)
 
 	initJobObject()
@@ -244,7 +243,10 @@ func launchWebUI() {
 
     // 1. 探测阶段：通过 CDP 端口寻找是否已经有打开的 UI
     client := &http.Client{Timeout: 300 * time.Millisecond}
+    isPortOccupied := false
+    
     if resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%s/json", debugPort)); err == nil {
+        isPortOccupied = true // 端口有响应
         defer resp.Body.Close()
         var targets []map[string]interface{}
         if err := json.NewDecoder(resp.Body).Decode(&targets); err == nil {
@@ -256,7 +258,7 @@ func launchWebUI() {
                     // 激活该标签页（前端跳转）
                     client.Get(fmt.Sprintf("http://127.0.0.1:%s/json/activate/%s", debugPort, id))
                     
-                    // 异步置顶窗口（后台寻找 HWND）
+                    // 异步置顶窗口
                     go func() {
                         time.Sleep(100 * time.Millisecond)
                         var targetHwnd uintptr
@@ -275,10 +277,25 @@ func launchWebUI() {
                             focusWindowSilky(targetHwnd)
                         }
                     }()
-                    return // 激活成功，直接退出函数
+                    return // 【核心：发现目标 UI，复用并退出函数】
                 }
             }
         }
+    } else {
+        // 如果 Get 报错，进一步通过 Dial 确认端口是否真的被占用（可能不是 HTTP 服务）
+        conn, dialErr := net.DialTimeout("tcp", "127.0.0.1:"+debugPort, 50*time.Millisecond)
+        if dialErr == nil {
+            conn.Close()
+            isPortOccupied = true
+        }
+    }
+
+    // 2. 精细化清场：如果端口被占用但没能通过上面的识别逻辑，说明是干扰进程
+    if isPortOccupied {
+        // 仅杀掉占用指定调试端口的进程，手术式打击
+        killCmd := fmt.Sprintf("for /f \"tokens=5\" %%a in ('netstat -aon ^| findstr :%s ^| findstr LISTENING') do taskkill /F /PID %%a", debugPort)
+        _ = exec.Command("cmd", "/c", killCmd).Run()
+        time.Sleep(150 * time.Millisecond) // 等待系统回收端口
     }
 
     // 2. 查找可用浏览器阶段
