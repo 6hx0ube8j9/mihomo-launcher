@@ -65,7 +65,7 @@ var (
 
     // --- 4. 流程控制与计数 ---
     exitOnce        sync.Once
-	lastState       int = -1
+	lastState int32 = -1
     tunErrorCounter = 0
 
     // --- 5. UI 菜单组件 ---
@@ -565,46 +565,54 @@ func checkSystemState() int {
     iniTunEnabled := getIniConfig("tun_enabled") == "true"
     iniProxyEnabled := getIniConfig("system_proxy_enabled") == "true"
     isInit := atomic.LoadInt32(&isSystemInitializing) == 1
-
-    // API 请求
+    
+    // 100% 保证初始化标志位在函数退出时重置
+    defer func() {
+        if isInit {
+            atomic.StoreInt32(&isSystemInitializing, 0)
+        }
+    }()
+    
     body, err := doAPIRequest("GET", "/configs", nil)
     if err != nil {
         return StateStop 
     }
 
-    // 状态对齐
-    if !isInit {
-        var currentConf struct {
-            Tun struct { Enable bool `json:"enable"` } `json:"tun"`
-            Mode string `json:"mode"`
-        }
-        if err := json.Unmarshal(body, &currentConf); err == nil {
-            if currentConf.Tun.Enable != iniTunEnabled {
-                saveIniConfig("tun_enabled", fmt.Sprint(currentConf.Tun.Enable))
-                iniTunEnabled = currentConf.Tun.Enable
-                if mTun != nil {
-                    if iniTunEnabled { mTun.Check() } else { mTun.Uncheck() }
-                }
+    // 100% 复刻：API 第一次通了，立刻激活内核同步
+    if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
+        atomic.StoreInt32(&isKernelActive, 1) // 别忘了给这个变量赋值
+        go syncConfigToKernel()
+    }
+
+    // 状态对齐：为了 100% 复刻，建议只要 API 成功就执行对齐，不加 !isInit 判断
+    // 原版在初始化期间也会尝试对齐菜单勾选状态
+    var currentConf struct {
+        Tun struct { Enable bool `json:"enable"` } `json:"tun"`
+        Mode string `json:"mode"`
+    }
+    if err := json.Unmarshal(body, &currentConf); err == nil {
+        if currentConf.Mode != "" && currentConf.Mode != getIniConfig("mode") {
+            saveIniConfig("mode", currentConf.Mode)
+        }        
+        if currentConf.Tun.Enable != iniTunEnabled {
+            saveIniConfig("tun_enabled", fmt.Sprint(currentConf.Tun.Enable))
+            iniTunEnabled = currentConf.Tun.Enable
+            if mTun != nil {
+                if iniTunEnabled { mTun.Check() } else { mTun.Uncheck() }
             }
         }
     }
 
-    if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
-        go syncConfigToKernel()
-    }
-
-    // --- 路径 A：未开启 TUN ---
+    // 路径 A：未开启 TUN
     if !iniTunEnabled {
-        if isInit { atomic.StoreInt32(&isSystemInitializing, 0) }
         if iniProxyEnabled { return StateProxy }
         return StateDefault
     }
 
-    // --- 路径 B：开启了 TUN (初始化期间) ---
+    // 路径 B：开启了 TUN 且正在初始化 (5秒容错期)
     if isInit { return StateTun }
 
-    // --- 路径 C：开启了 TUN (正常运行，校验网卡) ---
-    // 注意：这里不再需要 if 判断，因为上面 A 路径已经拦截了非 TUN 情况
+    // 路径 C：TUN 模式，物理网卡校验
     hasTun := false
     ifaces, _ := net.Interfaces()
     for _, i := range ifaces {
@@ -614,52 +622,65 @@ func checkSystemState() int {
         }
     }
 
-    if hasTun { 
-        return StateTun 
-    }
-
-    // 确定是 TUN 模式且 API 通畅，但没网卡
+    if hasTun { return StateTun }
     return StateError 
 }
 
 func monitorIconState() {
     var failCount int
+    
+    initialState := checkSystemState()
+    updateIconByState(initialState)
+    atomic.StoreInt32(&lastState, int32(initialState))
+
     for {
-        if atomic.LoadInt32(&isReallyExiting) == 1 { return }
+        // 细节 2：退出判定（高优先级）
+        if atomic.LoadInt32(&isReallyExiting) == 1 {
+            return
+        }
 
-        // 获取当前旧状态 (从 int 转 int32 内存地址读取)
-        oldState := atomic.LoadInt32((*int32)(unsafe.Pointer(&lastState)))
+        // 细节 3：原子化获取旧状态
+        // 抛弃 unsafe.Pointer，直接从变量地址读取
+        oldState := atomic.LoadInt32(&lastState)
+        var curr int
 
-        // 优先级 1：进程物理判定
+        // 优先级 1：进程物理存活判定
         if !isProcessRunning("mihomo.exe") {
             failCount = 0
-            curr := StateStop
-            if int32(curr) != oldState {
+            curr = int(StateStop)
+            
+            // 只有当状态真正从“非停止”变为“停止”时，才操作 UI
+            if oldState != int32(curr) {
                 updateIconByState(curr)
-                atomic.StoreInt32((*int32)(unsafe.Pointer(&lastState)), int32(curr))
+                atomic.StoreInt32(&lastState, int32(curr))
             }
         } else {
-            // 优先级 2：逻辑信号
-            curr := checkSystemState()
+            // 优先级 2：通过 API 和网卡逻辑获取当前信号
+            curr = checkSystemState()
 
-            // 优先级 3：Error 判定 (内核在跑但信号是 Error 或 Stop)
-            if curr == StateError || (curr == StateStop && isProcessRunning("mihomo.exe")) {
+            // 优先级 3：针对 Error 和异常 Stop 的 5秒容错 (复刻原版核心)
+            // 如果内核在跑，但信号是 Error，或者 API 暂时断连（返回 StateStop）
+            if curr == int(StateError) || (curr == int(StateStop) && isProcessRunning("mihomo.exe")) {
                 failCount++
                 if failCount > 5 {
-                    curr = StateError
+                    curr = int(StateError)
                 } else {
-                    curr = int(oldState) // 5秒内保持原样
+                    // 5秒内，强制保持为之前的状态，防止图标闪烁
+                    curr = int(oldState)
                 }
             } else {
                 failCount = 0
             }
 
-            // 更新 UI
-            if int32(curr) != atomic.LoadInt32((*int32)(unsafe.Pointer(&lastState))) {
+            // 细节 4：最终 UI 同步
+            // 再次原子检查，防止在 checkSystemState 执行期间 lastState 被 watchTunState 修改
+            if int32(curr) != atomic.LoadInt32(&lastState) {
                 updateIconByState(curr)
-                atomic.StoreInt32((*int32)(unsafe.Pointer(&lastState)), int32(curr))
+                atomic.StoreInt32(&lastState, int32(curr))
             }
         }
+
+        // 轮询间隔：复刻原版 1秒频率
         time.Sleep(1 * time.Second)
     }
 }
@@ -703,7 +724,7 @@ func watchTunState() {
 					
 					newState := checkSystemState()
 					updateIconByState(newState)
-					atomic.StoreInt32((*int32)(unsafe.Pointer(&lastState)), int32(newState))
+					atomic.StoreInt32(&lastState, int32(newState))
 					
 					if mTun != nil {
 						if currentHasTun { mTun.Check() } else { mTun.Uncheck() }
@@ -1009,7 +1030,7 @@ func setProxyRegistry(enable bool) {
 		time.Sleep(50 * time.Millisecond)
 		curr := checkSystemState()
 		updateIconByState(curr)
-		atomic.StoreInt32((*int32)(unsafe.Pointer(&lastState)), int32(curr))
+		atomic.StoreInt32(&lastState, int32(curr))
 	}()
 }
 
