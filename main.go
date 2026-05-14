@@ -640,83 +640,75 @@ func checkSystemState() int {
 
 
 func monitorIconState() {
-	var failCount int
-	// 注意：lastState 建议定义在循环外，以保持状态追踪
-	for {
-		// 1. 退出判定
-		if atomic.LoadInt32(&isReallyExiting) == 1 {
-			return
-		}
+    var failCount int
+    for {
+        if atomic.LoadInt32(&isReallyExiting) == 1 {
+            return
+        }
 
-		var curr int // 统一声明 curr，确保所有逻辑分支可见
+        var curr int 
 
-		// 2. 物理层判定：进程是否运行
-		if !isProcessRunning("mihomo.exe") {
-			failCount = 0
-			curr = StateStop
-			if lastState != StateStop {
-				updateIconByState(StateStop)
-				lastState = StateStop
-			}
-		} else {
-			// --- 第一步：执行联动函数获取当前逻辑状态 ---
-			curr = checkSystemState()
+        if !isProcessRunning("mihomo.exe") {
+            failCount = 0
+            curr = StateStop
+            // 修复：使用 int32(curr) 进行比较
+            if atomic.LoadInt32(&lastState) != int32(StateStop) {
+                updateIconByState(StateStop)
+                atomic.StoreInt32(&lastState, int32(StateStop))
+            }
+        } else {
+            curr = checkSystemState()
 
-			// --- 第二步：物理网卡捕捉 ---
-			isTunMode := (getIniConfig("tun_enabled") == "true")
-			hasTun := false
-			ifaces, _ := net.Interfaces()
-			for _, i := range ifaces {
-				if isTunInterfaceMatch(i.Name) {
-					hasTun = true
-					break
-				}
-			}
+            isTunMode := (getIniConfig("tun_enabled") == "true")
+            hasTun := false
+            ifaces, _ := net.Interfaces()
+            for _, i := range ifaces {
+                if isTunInterfaceMatch(i.Name) {
+                    hasTun = true
+                    break
+                }
+            }
 
-			// --- 第三步：逻辑判定与容错 ---
-			// 触发容错逻辑的条件：开启了TUN但没网卡 (且处于初始化或当前本应是TUN状态)
-			shouldUseFailCount := false
-			if isTunMode && !hasTun {
-				if atomic.LoadInt32(&isSystemInitializing) == 1 || curr == StateTun {
-					shouldUseFailCount = true
-				}
-			}
+            shouldUseFailCount := false
+            if isTunMode && !hasTun {
+                if atomic.LoadInt32(&isSystemInitializing) == 1 || curr == StateTun {
+                    shouldUseFailCount = true
+                }
+            }
 
-			if shouldUseFailCount {
-				// 进入原本 UseFailCountLogic 的逻辑
-				if curr == StateStop {
-					failCount++
-					if failCount > 5 {
-						if lastState != StateError {
-							updateIconByState(StateError)
-							lastState = StateError
-						}
-					} else {
-						if curr != lastState {
-							updateIconByState(curr)
-							lastState = curr
-						}
-					}
-				} else {
-					failCount = 0
-					if curr != lastState {
-						updateIconByState(curr)
-						lastState = curr
-					}
-				}
-			} else {
-				// 正常路径：直接更新状态
-				failCount = 0
-				if curr != lastState {
-					updateIconByState(curr)
-					lastState = curr
-				}
-			}
-		}
-
-		// 4. 轮询间隔
-		time.Sleep(1 * time.Second)
-	}
+            if shouldUseFailCount {
+                if curr == StateStop {
+                    failCount++
+                    if failCount > 5 {
+                        // 修复：读取原子变量并转换比较
+                        if atomic.LoadInt32(&lastState) != int32(StateError) {
+                            updateIconByState(StateError)
+                            atomic.StoreInt32(&lastState, int32(StateError))
+                        }
+                    } else {
+                        // 修复：比较 int 和 int32
+                        if int32(curr) != atomic.LoadInt32(&lastState) {
+                            updateIconByState(curr)
+                            atomic.StoreInt32(&lastState, int32(curr))
+                        }
+                    }
+                } else {
+                    failCount = 0
+                    if int32(curr) != atomic.LoadInt32(&lastState) {
+                        updateIconByState(curr)
+                        atomic.StoreInt32(&lastState, int32(curr))
+                    }
+                }
+            } else {
+                failCount = 0
+                if int32(curr) != atomic.LoadInt32(&lastState) {
+                    updateIconByState(curr)
+                    atomic.StoreInt32(&lastState, int32(curr))
+                }
+            }
+        }
+        time.Sleep(1 * time.Second)
+    }
 }
 
 func watchTunState() {
@@ -764,7 +756,7 @@ func watchTunState() {
 					saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
 					newState := checkSystemState()
 					updateIconByState(newState)
-					lastState = newState 
+					atomic.StoreInt32(&lastState, int32(newState))
 					if mTun != nil {
 						if currentHasTun {
 							mTun.Check()
