@@ -721,64 +721,64 @@ func monitorIconState() {
 }
 
 func watchTunState() {
-    ticker := time.NewTicker(3 * time.Second)
-    defer ticker.Stop()
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
 
-    var lastHasTun bool
-    ifaces, _ := net.Interfaces()
-    for _, i := range ifaces {
-        if isTunInterfaceMatch(i.Name) {
-            lastHasTun = true
-            break
-        }
-    }
+	var lastHasTun bool
+	ifaces, _ := net.Interfaces()
+	for _, i := range ifaces {
+		if isTunInterfaceMatch(i.Name) {
+			lastHasTun = true
+			break
+		}
+	}
 
-    for {
-        select {
-        case <-ticker.C:
-            if atomic.LoadInt32(&isReallyExiting) == 1 {
-                return
-            }
+	for {
+		select {
+		case <-ticker.C:
+			if atomic.LoadInt32(&isReallyExiting) == 1 {
+				return
+			}
 
-            if atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1 {
-                continue
-            }
+			if atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1 {
+				continue
+			}
 
-            currentHasTun := false
-            currentIfaces, err := net.Interfaces()
-            if err != nil {
-                continue
-            }
+			currentHasTun := false
+			currentIfaces, err := net.Interfaces()
+			if err != nil {
+				continue
+			}
 
-            for _, i := range currentIfaces {
-                if isTunInterfaceMatch(i.Name) {
-                    currentHasTun = true
-                    break
-                }
-            }
+			for _, i := range currentIfaces {
+				if isTunInterfaceMatch(i.Name) {
+					currentHasTun = true
+					break
+				}
+			}
 
-            if currentHasTun != lastHasTun {
-                if atomic.LoadInt32(&isKernelActive) == 1 && atomic.LoadInt32(&isReallyExiting) == 0 {
-                    
-                    lastHasTun = currentHasTun
-                    atomic.StoreInt32(&hasFirstSynced, 1)
-                    saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
-                    newState := checkSystemState()
-                    updateIconByState(int(newState))
-                    atomic.StoreInt32(&lastState, newState)
-                    if mTun != nil {
-                        if currentHasTun {
-                            mTun.Check()
-                        } else {
-                            mTun.Uncheck()
-                        }
-                    }
-                    
-                }
-            }
-        }
-    }
-} 
+			if currentHasTun != lastHasTun {
+				if atomic.LoadInt32(&isKernelActive) == 1 && atomic.LoadInt32(&isReallyExiting) == 0 {
+					
+					lastHasTun = currentHasTun
+					atomic.StoreInt32(&hasFirstSynced, 1)
+					saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
+					newState := checkSystemState()
+					updateIconByState(int(newState))
+					atomic.StoreInt32(&lastState, newState)
+					if mTun != nil {
+						if currentHasTun {
+							mTun.Check()
+						} else {
+							mTun.Uncheck()
+						}
+					}
+					
+				}
+			}
+		}
+	}
+}
 
 func syncConfigToKernel() {
 	if !atomic.CompareAndSwapInt32(&isSyncing, 0, 1) {
