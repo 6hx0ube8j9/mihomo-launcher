@@ -598,28 +598,26 @@ func checkSystemState() int32 {
     }
     
     if err := json.Unmarshal(body, &currentConf); err == nil {
-        // A. 自动解锁逻辑：内核状态与意图对齐时解除初始化锁
-        if isInit {
+        
+        // --- 修补 A: 实时检查初始化状态，对齐失败立即跳出 ---
+        if atomic.LoadInt32(&isSystemInitializing) == 1 {
             if currentConf.Tun.Enable == targetTun {
                 atomic.StoreInt32(&isSystemInitializing, 0)
-                isInit = false
+                // 解锁成功，可以继续向下走反写逻辑
             } else {
-                // 不对齐则尝试补推配置
                 go syncConfigToKernel()
+                return reportState(targetTun, targetProxy) // 立即跳出，绝不向下执行反写
             }
         }
 
-        // B. 反写保护逻辑：只有非初始化阶段才允许反写 INI
-        if !isInit && atomic.LoadInt32(&isSystemInitializing) == 0 {
-            // 模式反写
+        // --- 修补 B: 二次确认，确保此时已完全解锁 ---
+        if atomic.LoadInt32(&isSystemInitializing) == 0 {
             if currentConf.Mode != "" && currentConf.Mode != getIniConfig("mode") {
                 saveIniConfig("mode", currentConf.Mode)
             }
-            // TUN 状态反写
             if currentConf.Tun.Enable != targetTun {
                 saveIniConfig("tun_enabled", fmt.Sprint(currentConf.Tun.Enable))
-                targetTun = currentConf.Tun.Enable // 同步快照以便最后 return
-                // 保持对 UI 勾选框 mTun 的引用
+                targetTun = currentConf.Tun.Enable 
                 if mTun != nil {
                     if targetTun { mTun.Check() } else { mTun.Uncheck() }
                 }
@@ -627,14 +625,9 @@ func checkSystemState() int32 {
         }
     }
 
-    // --- 3. 优先级输出 ---
-    // 严格按照 TUN > Proxy > Default 优先级返回
-    if targetTun {
-        return int32(StateTun)
-    }
-    if targetProxy {
-        return int32(StateProxy)
-    }
+    // 最后的优先级返回 (建议提取成小函数或保持原样)
+    if targetTun   { return int32(StateTun) }
+    if targetProxy { return int32(StateProxy) }
     return int32(StateDefault)
 }
 
