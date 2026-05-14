@@ -62,6 +62,7 @@ var (
     manualUpdateTrigger  int32
     isReallyExiting      int32 
 	lastClickTime        int64
+	stateMismatchCount   int32
 
     // --- 4. 流程控制与计数 ---
     exitOnce        sync.Once
@@ -611,24 +612,42 @@ func checkSystemState() int32 {
 				return getState(targetTun, targetProxy) 
 			}
 		}
+		
+        if atomic.LoadInt32(&isSystemInitializing) == 0 {
+            // 判定内核状态与本地配置是否有差异
+            hasDiff := (currentConf.Mode != "" && currentConf.Mode != getIniConfig("mode")) || 
+                       (currentConf.Tun.Enable != targetTun)
 
-		// 修补 B: 反写逻辑 (仅在非初始化状态执行)
-		if atomic.LoadInt32(&isSystemInitializing) == 0 {
-			if currentConf.Mode != "" && currentConf.Mode != getIniConfig("mode") {
-				saveIniConfig("mode", currentConf.Mode)
-			}
-			if currentConf.Tun.Enable != targetTun {
-				saveIniConfig("tun_enabled", fmt.Sprint(currentConf.Tun.Enable))
-				targetTun = currentConf.Tun.Enable
-				if mTun != nil {
-					if targetTun { mTun.Check() } else { mTun.Uncheck() }
-				}
-			}
-		}
-	}
+            if hasDiff {
+                // 1. 发现差异，利用现有的 tunErrorCounter 计数
+                tunErrorCounter++
 
-	return getState(targetTun, targetProxy)
-} 
+                // 2. 防抖阈值：只有连续 3 次检查都不一致，才判定为外部修改并反写
+                if tunErrorCounter >= 3 {
+                    if currentConf.Mode != "" && currentConf.Mode != getIniConfig("mode") {
+                        saveIniConfig("mode", currentConf.Mode)
+                    }
+                    if currentConf.Tun.Enable != targetTun {
+                        saveIniConfig("tun_enabled", fmt.Sprint(currentConf.Tun.Enable))
+                        targetTun = currentConf.Tun.Enable
+                        if mTun != nil {
+                            if targetTun { mTun.Check() } else { mTun.Uncheck() }
+                        }
+                    }
+                    tunErrorCounter = 0 // 反写完成，重置计数
+                } else {
+                    // 3. 计数未达标时，保持 UI 意图，拦截本次反写
+                    return getState(targetTun, targetProxy)
+                }
+            } else {
+                // 4. 状态一致，说明内核已稳，立刻清零计数器
+                tunErrorCounter = 0
+            }
+        }
+    }
+
+    return getState(targetTun, targetProxy)
+}
 
 func monitorIconState() {
 	var successCounter int 
