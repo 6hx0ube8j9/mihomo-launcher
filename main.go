@@ -566,32 +566,29 @@ func checkSystemState() int {
     iniProxyEnabled := getIniConfig("system_proxy_enabled") == "true"
     isInit := atomic.LoadInt32(&isSystemInitializing) == 1
 
-    // 1. 内核通信
     body, err := doAPIRequest("GET", "/configs", nil)
     if err != nil {
         return StateStop
     }
 
-    // 2. 提前解析（A优势：意图对齐）
     var currentConf struct {
         Tun  struct { Enable bool `json:"enable"` } `json:"tun"`
         Mode string `json:"mode"`
     }
     unmarshalErr := json.Unmarshal(body, &currentConf)
 
-    // 3. 首次同步
     if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
         atomic.StoreInt32(&isKernelActive, 1)
         go syncConfigToKernel()
     }
 
-    // 4. 精准对齐（A核心）
+    // 加强锁保护
     if unmarshalErr == nil {
         if isInit && currentConf.Tun.Enable == iniTunEnabled {
             atomic.StoreInt32(&isSystemInitializing, 0)
             isInit = false
         }
-        if !isInit {
+        if !isInit && atomic.LoadInt32(&isSystemInitializing) == 0 {
             if currentConf.Mode != "" && currentConf.Mode != getIniConfig("mode") {
                 saveIniConfig("mode", currentConf.Mode)
             }
@@ -599,11 +596,7 @@ func checkSystemState() int {
                 saveIniConfig("tun_enabled", fmt.Sprint(currentConf.Tun.Enable))
                 iniTunEnabled = currentConf.Tun.Enable
                 if mTun != nil {
-                    if iniTunEnabled {
-                        mTun.Check()
-                    } else {
-                        mTun.Uncheck()
-                    }
+                    if iniTunEnabled { mTun.Check() } else { mTun.Uncheck() }
                 }
             }
         }
@@ -611,19 +604,15 @@ func checkSystemState() int {
         atomic.StoreInt32(&isSystemInitializing, 0)
     }
 
-    // 5. 状态判定（A路径）
     if !iniTunEnabled {
-        if iniProxyEnabled {
-            return StateProxy
-        }
+        if iniProxyEnabled { return StateProxy }
         return StateDefault
     }
 
-    if isInit {
+    if isInit || atomic.LoadInt32(&isSystemInitializing) == 1 {
         return StateTun
     }
 
-    // TUN物理校验
     hasTun := false
     ifaces, _ := net.Interfaces()
     for _, i := range ifaces {
