@@ -562,73 +562,68 @@ func monitorKernelDaemon() {
 }
 
 func checkSystemState() int {
-    // 1. 获取当前意图与状态
+    // 1. 获取当前意图
     iniTunEnabled := getIniConfig("tun_enabled") == "true"
-    iniProxyEnabled := getIniConfig("system_proxy_enabled") == "true"
+    iniProxyEnabled := getIniConfig("system_proxy_enabled") == "true" // 补充漏掉的变量
     isInit := atomic.LoadInt32(&isSystemInitializing) == 1
 
     // 2. 尝试连接内核
     body, err := doAPIRequest("GET", "/configs", nil)
     if err != nil {
-        // 【修复逻辑】：重启瞬间 API 不通，若在初始化中则保持 StateTun，防止 UI 闪红
-        if isInit {
-            return StateTun
-        }
-        return StateStop
+        if isInit { return StateTun } 
+        return StateStop 
     }
 
-    // 3. 意图对齐与数据解析
+    // 3. 核心修复逻辑：解析并判定
     var currentConf struct {
-        Tun struct {
-            Enable bool `json:"enable"`
-        } `json:"tun"`
-        Mode string `json:"mode"`
+        Tun struct { Enable bool `json:"enable"` } `json:"tun"`
+        Mode string `json:"mode"` // 增加 Mode 字段用于反向同步
     }
-
+    
     if err := json.Unmarshal(body, &currentConf); err == nil {
-        // 【核心修复】：意图判定与解锁机制
+        // --- 意图判定区 ---
         if isInit {
             if currentConf.Tun.Enable == iniTunEnabled {
-                // 状态对齐了，安全解锁
+                // 状态对齐，解锁！
                 atomic.StoreInt32(&isSystemInitializing, 0)
-                isInit = false // 局部变量同步更新，允许进入下方反向同步逻辑
+                // 【核心优化】：解锁瞬间不立刻去查网卡，直接报 TUN，防止物理网卡加载延迟导致的 Error
+                return StateTun 
             } else {
-                // 状态还没对齐（内核还没加载完 TUN），继续保持初始化锁
-                // 强制返回 StateTun，避免 monitorIconState 进入 5秒报错逻辑
+                // 还没对齐，继续等待
                 return StateTun
             }
         }
 
-        // 非初始化期间（或刚解锁），执行稳健的反向同步
+        // --- 稳定期反向同步 (B版本的精华) ---
+        // 只有非初始化时，才允许内核状态覆盖本地配置
         if !isInit {
-            // 同步 TUN 状态
             if currentConf.Tun.Enable != iniTunEnabled {
                 saveIniConfig("tun_enabled", fmt.Sprint(currentConf.Tun.Enable))
-                iniTunEnabled = currentConf.Tun.Enable
+                iniTunEnabled = currentConf.Tun.Enable // 更新局部变量
                 if mTun != nil {
                     if iniTunEnabled { mTun.Check() } else { mTun.Uncheck() }
                 }
             }
-            // 同步 Mode 状态
+            // 同步模式 (如 Global/Rule)
             if currentConf.Mode != "" && currentConf.Mode != getIniConfig("mode") {
                 saveIniConfig("mode", currentConf.Mode)
             }
         }
     }
 
-    // 4. 首次连通任务触发
+    // 4. 首次连通触发同步
     if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
         atomic.StoreInt32(&isKernelActive, 1)
         go syncConfigToKernel()
     }
 
-    // 5. 最终物理状态判定
+    // 5. 最终判定路径
     if !iniTunEnabled {
         if iniProxyEnabled { return StateProxy }
         return StateDefault
     }
 
-    // TUN 模式下的网卡校验
+    // 判定物理网卡
     hasTun := false
     ifaces, _ := net.Interfaces()
     for _, i := range ifaces {
@@ -638,15 +633,11 @@ func checkSystemState() int {
         }
     }
 
-    if hasTun {
-        return StateTun
-    }
+    if hasTun { return StateTun }
 
-    // 【容错判定】：开启了 TUN 但物理网卡未就绪
-    if isInit {
-        return StateTun // 初始化中，视为正常等待
-    }
-    return StateError // 已解锁但仍无网卡，触发 5秒红标逻辑
+    // 兜底：如果没网卡，但在初始化保护期就给过，否则报错进入5秒容错
+    if isInit { return StateTun }
+    return StateError
 }
 
 func monitorIconState() {
@@ -686,6 +677,7 @@ func monitorIconState() {
         time.Sleep(1 * time.Second)
     }
 }
+
 func watchTunState() {
     ticker := time.NewTicker(3 * time.Second)
     defer ticker.Stop()
