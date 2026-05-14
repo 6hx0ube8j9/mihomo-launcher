@@ -481,6 +481,8 @@ func onReady() {
         atomic.StoreInt32(&isReallyExiting, 1)
         systray.Quit()
     })
+	go monitorKernelDaemon()
+	go checkSystemState()
 
 }
 
@@ -557,30 +559,32 @@ func monitorKernelDaemon() {
 }
 
 func checkSystemState() int32 {
-    // --- 1. 入口快照：锁定用户原始意图 ---
-    // 这里对齐你原有的 getIniConfig 逻辑，保持引用一致
+    // --- 1. 入口快照：锁定用户在 INI 中的原始意图 ---
     targetTun := getIniConfig("tun_enabled") == "true"
     targetProxy := getIniConfig("system_proxy_enabled") == "true"
-    isInit := atomic.LoadInt32(&isSystemInitializing) == 1
-
-    // --- 2. 获取内核实时状态 ---
-    // 保持对 doAPIRequest 的原有引用
-    body, err := doAPIRequest("GET", "/configs", nil)
     
-    // 如果 API 失败（内核挂了或正在重启）
-    if err != nil {
-        // 探测进程是否还在，如果进程都没了，那是彻底停止
-        if !isProcessRunning("mihomo.exe") {
-            atomic.StoreInt32(&isKernelActive, 0)
-            return int32(StateStop)
-        }
-        // 进程还在但 API 失败，保持当前意图状态，等待 monitorIconState 去发现异常
+    // 内部状态计算闭包（替代原本不存在的 reportState）
+    // 这样在函数内任何地方需要返回状态时逻辑是一致的
+    getState := func() int32 {
         if targetTun { return int32(StateTun) }
         if targetProxy { return int32(StateProxy) }
         return int32(StateDefault)
     }
 
-    // 首次同步逻辑（保持你原有的 hasFirstSynced 引用）
+    // --- 2. 获取内核实时状态 ---
+    body, err := doAPIRequest("GET", "/configs", nil)
+    
+    // 如果 API 失败（内核挂了、正在重启、或者端口还没同步对）
+    if err != nil {
+        if !isProcessRunning("mihomo.exe") {
+            atomic.StoreInt32(&isKernelActive, 0)
+            return int32(StateStop)
+        }
+        // 进程还在但连不上 API，先返回意图状态，让 UI 保持原样
+        return getState()
+    }
+
+    // 首次同步逻辑（确保内核启动后拿到 INI 里的 Mode 和 Tun 设置）
     if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
         atomic.StoreInt32(&isKernelActive, 1)
         go syncConfigToKernel() 
@@ -594,22 +598,26 @@ func checkSystemState() int32 {
     
     if err := json.Unmarshal(body, &currentConf); err == nil {
         
-        // --- 修补 A: 实时检查初始化状态，对齐失败立即跳出 ---
+        // --- 修补 A: 实时检查初始化状态 ---
         if atomic.LoadInt32(&isSystemInitializing) == 1 {
+            // 如果内核当前的 Tun 状态已经符合我们的预期了
             if currentConf.Tun.Enable == targetTun {
-                atomic.StoreInt32(&isSystemInitializing, 0)
-                // 解锁成功，可以继续向下走反写逻辑
+                atomic.StoreInt32(&isSystemInitializing, 0) // 解锁
+                // 解锁后不 return，继续向下走“反写逻辑”，确保 Mode 等信息也能同步
             } else {
+                // 状态还没对齐，继续推送到内核
                 go syncConfigToKernel()
-                return reportState(targetTun, targetProxy) // 立即跳出，绝不向下执行反写
+                return getState() // 锁定状态下，绝不向下执行反写 INI 的逻辑
             }
         }
 
-        // --- 修补 B: 二次确认，确保此时已完全解锁 ---
+        // --- 修补 B: 只有完全解锁状态下，才允许内核状态反向覆盖 INI ---
         if atomic.LoadInt32(&isSystemInitializing) == 0 {
+            // 同步 Mode 到 INI（如果用户在面板改了模式，托盘要记下来）
             if currentConf.Mode != "" && currentConf.Mode != getIniConfig("mode") {
                 saveIniConfig("mode", currentConf.Mode)
             }
+            // 同步 Tun 状态到 INI 和菜单勾选框
             if currentConf.Tun.Enable != targetTun {
                 saveIniConfig("tun_enabled", fmt.Sprint(currentConf.Tun.Enable))
                 targetTun = currentConf.Tun.Enable 
@@ -620,10 +628,8 @@ func checkSystemState() int32 {
         }
     }
 
-    // 最后的优先级返回 (建议提取成小函数或保持原样)
-    if targetTun   { return int32(StateTun) }
-    if targetProxy { return int32(StateProxy) }
-    return int32(StateDefault)
+    // --- 3. 最终返回当前状态给 monitorIconState ---
+    return getState()
 }
 
 func monitorIconState() {
@@ -961,7 +967,9 @@ func sniffAndSolidifyConfig() {
 		// 提取 API 密钥 (Secret)
 		if strings.HasPrefix(trimmed, "secret:") {
 			val := strings.Trim(strings.TrimPrefix(trimmed, "secret:"), " \"'")
-			saveIniConfig("secret", val)
+			if val != "" {
+			    saveIniConfig("secret", val)
+			}	
 		}
 	}
 }
