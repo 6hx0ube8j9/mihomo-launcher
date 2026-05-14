@@ -354,20 +354,15 @@ func onReady() {
     updateIconByState(StateStop)
 
     systray.SetOnClick(func(menu systray.IMenu) {
-        // A. 初始化锁保护：如果内核还没起来（或正在重启），点图标不响应，防止弹出 404 网页
         if atomic.LoadInt32(&isSystemInitializing) == 1 {
             return
         }
-
-        // B. 时间戳防抖：利用全局 lastClickTime 限制 1 秒内只允许触发一次
         now := time.Now().UnixNano()
         // 1000ms = 1秒
         if now - atomic.LoadInt64(&lastClickTime) < int64(1000 * time.Millisecond) {
             return
         }
         atomic.StoreInt64(&lastClickTime, now)
-
-        // C. 执行原本的打开逻辑
         go launchWebUI()
     })
 
@@ -477,7 +472,6 @@ func onReady() {
 
     mExit := systray.AddMenuItem("关闭程序", "")
     mExit.Click(func() {
-        // 【原子化替换】
         atomic.StoreInt32(&isReallyExiting, 1)
         systray.Quit()
     })
@@ -525,20 +519,28 @@ func monitorKernelDaemon() {
 	target := filepath.Join(baseDir, "mihomo.exe")
 	absBaseDir, _ := filepath.Abs(baseDir)
 	for {
+		// 1. 退出检查
 		if atomic.LoadInt32(&isReallyExiting) == 1 { return }
+		
 		if !isProcessRunning("mihomo.exe") {
+			// 2. 锁定初始化状态
 			atomic.StoreInt32(&isSystemInitializing, 1)
 			atomic.StoreInt32(&hasFirstSynced, 0)
 			atomic.StoreInt32(&isKernelActive, 0)
 			
 			KillProcessByName("mihomo.exe")
 			time.Sleep(200 * time.Millisecond)
+			
 			cmd := exec.Command(target, "-d", ".")
 			cmd.Dir = absBaseDir
 			cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+			
 			if err := cmd.Start(); err == nil {
 				atomic.StoreInt32(&isKernelActive, 1)
-				sniffAndSolidifyConfig()
+				
+				// --- 无损补全：如果你的业务需要启动时固化配置，请保留此行 ---
+				sniffAndSolidifyConfig() 
+
 				if hJob != 0 {
 					hp, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
 					if err == nil {
@@ -546,11 +548,18 @@ func monitorKernelDaemon() {
 						_ = windows.CloseHandle(hp)
 					}
 				}
+				
 				go func(c *exec.Cmd) {
 					_ = c.Wait()
 					atomic.StoreInt32(&isKernelActive, 0)
 				}(cmd)
-			}	
+				
+				// 3. 缓冲期，防止 checkSystemState 在 API 还没起来时误判
+				time.Sleep(1000 * time.Millisecond)
+			}
+			
+			// 4. 关键：释放锁，让 checkSystemState 恢复正常工作
+			atomic.StoreInt32(&isSystemInitializing, 0)
 		}
 		time.Sleep(2 * time.Second)
 	}
@@ -1164,6 +1173,7 @@ func getIniConfig(key string) string {
 }
 
 func saveIniConfig(key, val string) {
+    if key == "" || val == "" { return }
     configMu.Lock()
     // 1. 变化检测：如果不动，则不写
     if old, ok := configData[key]; ok && old == val && key != "" {
