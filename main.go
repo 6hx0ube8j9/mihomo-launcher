@@ -562,63 +562,56 @@ func monitorKernelDaemon() {
 }
 
 func checkSystemState() int {
-    body, err := doAPIRequest("GET", "/configs", nil) 
-    if err != nil {
-        // API 连不上，说明内核彻底没起，不执行任何同步，直接返回停止状态
-        return StateStop 
-    }
+	body, err := doAPIRequest("GET", "/configs", nil)
+	if err != nil { return StateStop }
 
-    // 只要 API 通了，尝试处理同步逻辑
-    var currentConf struct {
-        Tun struct { Enable bool `json:"enable"` } `json:"tun"`
-        Mode string `json:"mode"`
-    }
-    
-    if err := json.Unmarshal(body, &currentConf); err == nil {
-        // 【解锁逻辑】：B 版风格，API 通了就尝试解开初始化锁
-        if atomic.LoadInt32(&isSystemInitializing) == 1 {
-            atomic.StoreInt32(&isSystemInitializing, 0)
-        }
+	var currentConf struct {
+		Tun struct { Enable bool `json:"enable"` } `json:"tun"`
+		Mode string `json:"mode"`
+	}
+	
+	if json.Unmarshal(body, &currentConf) == nil {
+		iniTun := getIniConfig("tun_enabled") == "true"
 
-        // 【反向同步】：仅在稳定期（非初始化）处理 Web 端的微调
-        if atomic.LoadInt32(&isSystemInitializing) == 0 {
-            iniTun := (getIniConfig("tun_enabled") == "true")
-            if currentConf.Tun.Enable != iniTun {
-                // 这里加一道保险：必须物理网卡状态和 API 状态一致才写磁盘
-                hasTun := false
-                ifaces, _ := net.Interfaces()
-                for _, i := range ifaces {
-                    if isTunInterfaceMatch(i.Name) { hasTun = true; break }
-                }
-                if hasTun == currentConf.Tun.Enable {
-                    saveIniConfig("tun_enabled", fmt.Sprint(currentConf.Tun.Enable))
-                    if mTun != nil {
-                        if currentConf.Tun.Enable { mTun.Check() } else { mTun.Uncheck() }
-                    }
-                }
-            }
-            if currentConf.Mode != "" && currentConf.Mode != getIniConfig("mode") {
-                saveIniConfig("mode", currentConf.Mode)
-            }
-        }
-    }
+		if atomic.LoadInt32(&isSystemInitializing) == 1 {
+			// 初始化期间：API 状态必须对齐 INI 设定，才准解锁
+			if currentConf.Tun.Enable == iniTun {
+				atomic.StoreInt32(&isSystemInitializing, 0)
+			}
+		} else {
+			// 稳定期：反向同步
+			if currentConf.Tun.Enable != iniTun {
+				// 物理辅助存证
+				physHas := false
+				ifaces, _ := net.Interfaces()
+				for _, i := range ifaces { if isTunInterfaceMatch(i.Name) { physHas = true; break } }
+				
+				if physHas == currentConf.Tun.Enable {
+					saveIniConfig("tun_enabled", fmt.Sprint(currentConf.Tun.Enable))
+					if mTun != nil {
+						if currentConf.Tun.Enable { mTun.Check() } else { mTun.Uncheck() }
+					}
+				}
+			}
+		}
+	}
 
-    // 首次启动后的同步
-    if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
-        go syncConfigToKernel()
-    }
-
-    // 判定最终状态返回图标
-    if getIniConfig("tun_enabled") == "true" {
-        // 只要 INI 说是开启的，不论是因为正在初始化还是网卡已经到位，都给 StateTun
-        return StateTun 
-    }
-    
-    if getIniConfig("system_proxy_enabled") == "true" {
-        return StateProxy
-    }
-
-    return StateDefault
+	// 最终返回状态判定
+	isTunOn := getIniConfig("tun_enabled") == "true"
+	if isTunOn {
+		physHas := false
+		ifaces, _ := net.Interfaces()
+		for _, i := range ifaces { if isTunInterfaceMatch(i.Name) { physHas = true; break } }
+		
+		// 只要 INI 是开启的，且（网卡在 OR 还在初始化），就给 TUN 图标
+		if physHas || atomic.LoadInt32(&isSystemInitializing) == 1 {
+			return StateTun
+		}
+		return StateError
+	}
+	
+	if getIniConfig("system_proxy_enabled") == "true" { return StateProxy }
+	return StateDefault
 }
 
 func monitorIconState() {
@@ -673,56 +666,63 @@ func monitorIconState() {
 }
 
 func watchTunState() {
-    ticker := time.NewTicker(3 * time.Second)
-    defer ticker.Stop()
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
 
-    var lastHasTun bool
-    // 初始状态获取
-    ifaces, _ := net.Interfaces()
-    for _, i := range ifaces {
-        if isTunInterfaceMatch(i.Name) {
-            lastHasTun = true
-            break
-        }
-    }
+	var lastHasTun bool
+	ifaces, _ := net.Interfaces()
+	for _, i := range ifaces {
+		if isTunInterfaceMatch(i.Name) {
+			lastHasTun = true
+			break
+		}
+	}
 
-    for range ticker.C {
-        if atomic.LoadInt32(&isReallyExiting) == 1 { return }
+	for {
+		select {
+		case <-ticker.C:
+			if atomic.LoadInt32(&isReallyExiting) == 1 {
+				return
+			}
 
-        // 【防御点 1】初始化锁：重启中绝对不准进入逻辑
-        if atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1 {
-            continue
-        }
+			if atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1 {
+				continue
+			}
 
-        currentHasTun := false
-        ifaces, _ := net.Interfaces()
-        for _, i := range ifaces {
-            if isTunInterfaceMatch(i.Name) {
-                currentHasTun = true
-                break
-            }
-        }
+			currentHasTun := false
+			currentIfaces, err := net.Interfaces()
+			if err != nil {
+				continue
+			}
 
-        // 【防御点 2】边沿触发：物理状态必须发生改变
-        if currentHasTun != lastHasTun {
-            // 【关键保护】：必须确保内核 API 是通的，才承认这次物理改变
-            // 如果 API 报错，说明正在重启，网卡消失是暂时的，不准更新 lastHasTun，不准写 INI
-            if _, err := doAPIRequest("GET", "/configs", nil); err == nil {
-                lastHasTun = currentHasTun // 更新内存锚点
-                saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
-                
-                // 联动更新 UI
-                newState := checkSystemState()
-                if mTun != nil {
-                    if currentHasTun { mTun.Check() } else { mTun.Uncheck() }
-                }
-                if int32(newState) != atomic.LoadInt32(&lastState) {
-                    updateIconByState(newState)
-                    atomic.StoreInt32(&lastState, int32(newState))
-                }
-            }
-        }
-    }
+			for _, i := range currentIfaces {
+				if isTunInterfaceMatch(i.Name) {
+					currentHasTun = true
+					break
+				}
+			}
+
+			if currentHasTun != lastHasTun {
+				if atomic.LoadInt32(&isKernelActive) == 1 && atomic.LoadInt32(&isReallyExiting) == 0 {
+					
+					lastHasTun = currentHasTun
+					atomic.StoreInt32(&hasFirstSynced, 1)
+					saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
+					newState := checkSystemState()
+					updateIconByState(newState)
+					lastState = newState 
+					if mTun != nil {
+						if currentHasTun {
+							mTun.Check()
+						} else {
+							mTun.Uncheck()
+						}
+					}
+					
+				}
+			}
+		}
+	}
 }
 
 func syncConfigToKernel() {
