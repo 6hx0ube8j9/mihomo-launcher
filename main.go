@@ -607,31 +607,15 @@ func checkSystemState() int32 {
         }
     }
 
-    // 4. 路径判定
     if !iniTunEnabled {
         if iniProxyEnabled { return int32(StateProxy) }
         return int32(StateDefault)
     }
 
-    // 5. TUN 状态下的物理校验（性能优化：初始化期间跳过）
-    if isInit {
-        return int32(StateTun)
-    }
-
-    hasTun := false
-    ifaces, _ := net.Interfaces()
-    for _, i := range ifaces {
-        if isTunInterfaceMatch(i.Name) {
-            hasTun = true
-            break
-        }
-    }
-    // 注意：此处即便 hasTun 为 false 也回 StateTun，靠 monitorIconState 的 failCount 处理异常
     return int32(StateTun)
 }
 
 func monitorIconState() {
-    var failCount int
     for {
         if atomic.LoadInt32(&isReallyExiting) == 1 {
             return
@@ -640,7 +624,7 @@ func monitorIconState() {
         var curr int32 
 
         if !isProcessRunning("mihomo.exe") {
-            failCount = 0
+            tunErrorCounter = 0 // 重置全局计数器
             curr = int32(StateStop)
             if atomic.LoadInt32(&lastState) != curr {
                 updateIconByState(int(curr))
@@ -649,10 +633,10 @@ func monitorIconState() {
         } else {
             curr = checkSystemState()
 
-            // 物理网卡容错判定
             isTunMode := (getIniConfig("tun_enabled") == "true")
             hasTun := false
-            // 只有当开启了 TUN 且 checkSystemState 已经过初始化后，才进行网卡二次确认
+            
+            // 只有非初始化阶段才扫描网卡，压榨性能
             if isTunMode && atomic.LoadInt32(&isSystemInitializing) == 0 {
                 ifaces, _ := net.Interfaces()
                 for _, i := range ifaces {
@@ -662,22 +646,21 @@ func monitorIconState() {
                     }
                 }
             } else {
-                hasTun = true // 强制假设存在，避免在初始化阶段触发 failCount
+                hasTun = true 
             }
 
-            // 逻辑判定与容错
             shouldUseFailCount := (isTunMode && !hasTun) || (curr == int32(StateStop))
 
             if shouldUseFailCount {
-                failCount++
-                if failCount > 5 {
+                tunErrorCounter++ // 统一使用全局变量
+                if tunErrorCounter > 5 {
                     if atomic.LoadInt32(&lastState) != int32(StateError) {
                         updateIconByState(StateError)
                         atomic.StoreInt32(&lastState, int32(StateError))
                     }
                 }
             } else {
-                failCount = 0
+                tunErrorCounter = 0 // 状态正常，立即清零
                 if curr != atomic.LoadInt32(&lastState) {
                     updateIconByState(int(curr))
                     atomic.StoreInt32(&lastState, curr)
