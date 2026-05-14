@@ -534,12 +534,7 @@ func monitorKernelDaemon() {
 			atomic.StoreInt32(&isKernelActive, 0)
 			
 			KillProcessByName("mihomo.exe")
-            for i := 0; i < 10; i++ {
-                if !isProcessRunning("mihomo.exe") {
-                    break
-                }
-                time.Sleep(200 * time.Millisecond)
-            }			
+			time.Sleep(200 * time.Millisecond)
 			cmd := exec.Command(target, "-d", ".")
 			cmd.Dir = absBaseDir
 			cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
@@ -616,11 +611,11 @@ func checkSystemState() int32 {
 
         // --- 修补 B: 只有完全解锁状态下，才允许内核状态反向覆盖 INI ---
         if atomic.LoadInt32(&isSystemInitializing) == 0 {
-            kernelMode := currentConf.Mode
-			localMode := getIniConfig("mode")
-            if kernelMode != "" && kernelMode != localMode {  
-			    saveIniConfig("mode", kernelMode)
-			}
+            // 同步 Mode 到 INI（如果用户在面板改了模式，托盘要记下来）
+            if currentConf.Mode != "" && currentConf.Mode != getIniConfig("mode") {
+                saveIniConfig("mode", currentConf.Mode)
+            }
+            // 同步 Tun 状态到 INI 和菜单勾选框
             if currentConf.Tun.Enable != targetTun {
                 saveIniConfig("tun_enabled", fmt.Sprint(currentConf.Tun.Enable))
                 targetTun = currentConf.Tun.Enable 
@@ -1142,11 +1137,10 @@ func KillProcessByName(name string) {
         if strings.EqualFold(windows.UTF16ToString(pe.ExeFile[:]), name) {
             pid := pe.ProcessID
             if pid != uint32(os.Getpid()) {
-                h, err := windows.OpenProcess(windows.PROCESS_TERMINATE|windows.SYNCHRONIZE, false, pid)
+                h, err := windows.OpenProcess(windows.PROCESS_QUERY_INFORMATION|windows.PROCESS_TERMINATE, false, pid)
                 if err == nil {
+                    
                     _ = windows.TerminateProcess(h, 9)
-                    // 重点：等待进程真正退出，最多等 3 秒
-                    _, _ = windows.WaitForSingleObject(h, 3000) 
                     windows.CloseHandle(h)
                 }
             }
