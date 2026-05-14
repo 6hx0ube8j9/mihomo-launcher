@@ -451,7 +451,6 @@ func onReady() {
         atomic.StoreInt32(&isSystemInitializing, 1)
         atomic.StoreInt32(&hasFirstSynced, 0)
         KillProcessByName("mihomo.exe")
-		sniffAndSolidifyConfig()
     })
 
     mReload := mMoreRoot.AddSubMenuItem("重载配置文件", "")
@@ -481,8 +480,6 @@ func onReady() {
         atomic.StoreInt32(&isReallyExiting, 1)
         systray.Quit()
     })
-	go monitorKernelDaemon()
-	go checkSystemState()
 
 }
 
@@ -1171,12 +1168,6 @@ func getIniConfig(key string) string {
 }
 
 func saveIniConfig(key, val string) {
-    if key == "" || val == "" { return }
-    if atomic.LoadInt32(&isSystemInitializing) == 1 {
-        if key == "mode" || key == "tun_enabled" || key == "system_proxy_enabled" {
-            return 
-        }
-    }
     configMu.Lock()
     // 1. 变化检测：如果不动，则不写
     if old, ok := configData[key]; ok && old == val && key != "" {
