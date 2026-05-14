@@ -451,6 +451,7 @@ func onReady() {
         atomic.StoreInt32(&isSystemInitializing, 1)
         atomic.StoreInt32(&hasFirstSynced, 0)
         KillProcessByName("mihomo.exe")
+		sniffAndSolidifyConfig()
     })
 
     mReload := mMoreRoot.AddSubMenuItem("重载配置文件", "")
@@ -556,74 +557,69 @@ func monitorKernelDaemon() {
 }
 
 func checkSystemState() int32 {
-    // --- 1. 入口快照：锁定用户在 INI 中的原始意图 ---
-    targetTun := getIniConfig("tun_enabled") == "true"
-    targetProxy := getIniConfig("system_proxy_enabled") == "true"
+	// 1. 获取配置快照
+	targetTun := getIniConfig("tun_enabled") == "true"
+	targetProxy := getIniConfig("system_proxy_enabled") == "true"
 
-    getState := func() int32 {
-        if targetTun { return int32(StateTun) }
-        if targetProxy { return int32(StateProxy) }
-        return int32(StateDefault)
-    }
+	// 定义统一的返回逻辑
+	getState := func(tun, proxy bool) int32 {
+		if tun { return int32(StateTun) }
+		if proxy { return int32(StateProxy) }
+		return int32(StateDefault)
+	}
 
-    // --- 2. 获取内核实时状态 ---
-    body, err := doAPIRequest("GET", "/configs", nil)
-    
-    // 如果 API 失败（内核挂了、正在重启、或者端口还没同步对）
-    if err != nil {
-        if !isProcessRunning("mihomo.exe") {
-            atomic.StoreInt32(&isKernelActive, 0)
-            return int32(StateStop)
-        }
-        // 进程还在但连不上 API，先返回意图状态，让 UI 保持原样
-        return getState()
-    }
+	// 2. 获取实时状态
+	body, err := doAPIRequest("GET", "/configs", nil)
+	if err != nil {
+		if !isProcessRunning("mihomo.exe") {
+			atomic.StoreInt32(&isKernelActive, 0)
+			return int32(StateStop)
+		}
+		return getState(targetTun, targetProxy)
+	}
 
-    // 首次同步逻辑（确保内核启动后拿到 INI 里的 Mode 和 Tun 设置）
-    if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
-        atomic.StoreInt32(&isKernelActive, 1)
-        go syncConfigToKernel() 
-    }
+	// 首次同步
+	if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
+		atomic.StoreInt32(&isKernelActive, 1)
+		go syncConfigToKernel()
+	}
 
-    // 解析内核配置
-    var currentConf struct {
-        Tun  struct { Enable bool `json:"enable"` } `json:"tun"`
-        Mode string `json:"mode"`
-    }
-    
-    if err := json.Unmarshal(body, &currentConf); err == nil {
-        
-        // --- 修补 A: 实时检查初始化状态 ---
-        if atomic.LoadInt32(&isSystemInitializing) == 1 {
-            // 如果内核当前的 Tun 状态已经符合我们的预期了
-            if currentConf.Tun.Enable == targetTun {
-                atomic.StoreInt32(&isSystemInitializing, 0) // 解锁
-                // 解锁后不 return，继续向下走“反写逻辑”，确保 Mode 等信息也能同步
-            } else {
-                // 状态还没对齐，继续推送到内核
-                go syncConfigToKernel()
-                return getState() // 锁定状态下，绝不向下执行反写 INI 的逻辑
-            }
-        }
+	var currentConf struct {
+		Tun struct {
+			Enable bool `json:"enable"`
+		} `json:"tun"`
+		Mode string `json:"mode"`
+	}
 
-        // --- 修补 B: 只有完全解锁状态下，才允许内核状态反向覆盖 INI ---
-        if atomic.LoadInt32(&isSystemInitializing) == 0 {
-            // 同步 Mode 到 INI（如果用户在面板改了模式，托盘要记下来）
-            if currentConf.Mode != "" && currentConf.Mode != getIniConfig("mode") {
-                saveIniConfig("mode", currentConf.Mode)
-            }
-            // 同步 Tun 状态到 INI 和菜单勾选框
-            if currentConf.Tun.Enable != targetTun {
-                saveIniConfig("tun_enabled", fmt.Sprint(currentConf.Tun.Enable))
-                targetTun = currentConf.Tun.Enable 
-                if mTun != nil {
-                    if targetTun { mTun.Check() } else { mTun.Uncheck() }
-                }
-            }
-        }
-    }
-    return getState()
-}
+	if err := json.Unmarshal(body, &currentConf); err == nil {
+		// 修补 A: 初始化状态对齐
+		if atomic.LoadInt32(&isSystemInitializing) == 1 {
+			if currentConf.Tun.Enable == targetTun {
+				atomic.StoreInt32(&isSystemInitializing, 0)
+			} else {
+				go syncConfigToKernel()
+				// 这里假设你原本想调用自定义逻辑或直接返回
+				return getState(targetTun, targetProxy) 
+			}
+		}
+
+		// 修补 B: 反写逻辑 (仅在非初始化状态执行)
+		if atomic.LoadInt32(&isSystemInitializing) == 0 {
+			if currentConf.Mode != "" && currentConf.Mode != getIniConfig("mode") {
+				saveIniConfig("mode", currentConf.Mode)
+			}
+			if currentConf.Tun.Enable != targetTun {
+				saveIniConfig("tun_enabled", fmt.Sprint(currentConf.Tun.Enable))
+				targetTun = currentConf.Tun.Enable
+				if mTun != nil {
+					if targetTun { mTun.Check() } else { mTun.Uncheck() }
+				}
+			}
+		}
+	}
+
+	return getState(targetTun, targetProxy)
+} 
 
 func monitorIconState() {
 	var successCounter int 
