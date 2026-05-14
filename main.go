@@ -534,7 +534,12 @@ func monitorKernelDaemon() {
 			atomic.StoreInt32(&isKernelActive, 0)
 			
 			KillProcessByName("mihomo.exe")
-			time.Sleep(200 * time.Millisecond)
+            for i := 0; i < 10; i++ {
+                if !isProcessRunning("mihomo.exe") {
+                    break
+                }
+                time.Sleep(200 * time.Millisecond)
+            }			
 			cmd := exec.Command(target, "-d", ".")
 			cmd.Dir = absBaseDir
 			cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
@@ -1141,13 +1146,11 @@ func KillProcessByName(name string) {
         if strings.EqualFold(windows.UTF16ToString(pe.ExeFile[:]), name) {
             pid := pe.ProcessID
             if pid != uint32(os.Getpid()) {
-                h, err := windows.OpenProcess(windows.PROCESS_QUERY_INFORMATION|windows.PROCESS_TERMINATE, false, pid)
+                h, err := windows.OpenProcess(windows.PROCESS_TERMINATE|windows.SYNCHRONIZE, false, pid)
                 if err == nil {
-                    // 检查路径（可选）：确保只杀掉本程序目录下的内核
-                    // path, _ := getProcessPath(h) 
-                    // if strings.Contains(path, baseDir) { ... }
-                    
                     _ = windows.TerminateProcess(h, 9)
+                    // 重点：等待进程真正退出，最多等 3 秒
+                    _, _ = windows.WaitForSingleObject(h, 3000) 
                     windows.CloseHandle(h)
                 }
             }
