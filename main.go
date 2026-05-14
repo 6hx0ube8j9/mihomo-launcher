@@ -685,50 +685,77 @@ func monitorIconState() {
 }
 
 func watchTunState() {
-	ticker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop()
+    ticker := time.NewTicker(3 * time.Second)
+    defer ticker.Stop()
 
-	for {
-		select {
-		case <-ticker.C:
-			if atomic.LoadInt32(&isReallyExiting) == 1 { return }
-			
-			// 初始化或同步期间，不执行网卡反向写入配置，避免逻辑冲突
-			if atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1 {
-				continue
-			}
+    // 内存锚点：记录上一次已知的物理状态，避免重复触发 IO
+    lastPhysHasTun := false
+    // 启动时初次采样
+    ifaces, _ := net.Interfaces()
+    for _, i := range ifaces {
+        if isTunInterfaceMatch(i.Name) {
+            lastPhysHasTun = true
+            break
+        }
+    }
 
-			currentHasTun := false
-			ifaces, err := net.Interfaces()
-			if err == nil {
-				for _, i := range ifaces {
-					if isTunInterfaceMatch(i.Name) {
-						currentHasTun = true
-						break
-					}
-				}
-			}
+    for {
+        select {
+        case <-ticker.C:
+            if atomic.LoadInt32(&isReallyExiting) == 1 { return }
 
-			// 读取当前 INI 记录的状态
-			recordedTun := getIniConfig("tun_enabled") == "true"
+            // 【第一道防线】：初始化或同步期间，绝对闭嘴，不准改 INI
+            if atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1 {
+                continue
+            }
 
-			if currentHasTun != recordedTun {
-				if atomic.LoadInt32(&isKernelActive) == 1 {
-					// 将物理现状同步到配置
-					saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
-					
-					// 触发 UI 更新
-					newState := checkSystemState()
-					updateIconByState(newState)
-					atomic.StoreInt32(&lastState, int32(newState))
-					
-					if mTun != nil {
-						if currentHasTun { mTun.Check() } else { mTun.Uncheck() }
-					}
-				}
-			}
-		}
-	}
+            // 获取当前物理网卡状态
+            currentPhysHasTun := false
+            ifaces, _ := net.Interfaces()
+            for _, i := range ifaces {
+                if isTunInterfaceMatch(i.Name) {
+                    currentPhysHasTun = true
+                    break
+                }
+            }
+
+            // 【第二道防线】：只有物理状态发生切换时，才考虑同步
+            if currentPhysHasTun != lastPhysHasTun {
+                
+                // 【第三道防线：核心】：外部 Web 修改判定
+                // 请求内核 API，确认内核当前的真实意图
+                body, err := doAPIRequest("GET", "/configs", nil)
+                if err != nil {
+                    // API 报错说明内核可能在重启，此时物理网卡的消失是“虚假”的，跳过
+                    continue 
+                }
+
+                var currentConf struct {
+                    Tun struct { Enable bool `json:"enable"` } `json:"tun"`
+                }
+                if json.Unmarshal(body, &currentConf) == nil {
+                    // 只有【物理网卡状态】与【内核 API 状态】完全一致时，
+                    // 才证明这是用户在 Web 端的真实修改，而不是重启导致的瞬间丢失。
+                    if currentPhysHasTun == currentConf.Tun.Enable {
+                        
+                        lastPhysHasTun = currentPhysHasTun // 更新锚点
+                        
+                        // 执行写入：将 Web 端的修改同步到本地文件
+                        saveIniConfig("tun_enabled", fmt.Sprint(currentPhysHasTun))
+                        
+                        // 同步刷新 UI
+                        newState := checkSystemState()
+                        updateIconByState(newState)
+                        atomic.StoreInt32(&lastState, int32(newState))
+                        
+                        if mTun != nil {
+                            if currentPhysHasTun { mTun.Check() } else { mTun.Uncheck() }
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 func syncConfigToKernel() {
