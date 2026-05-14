@@ -685,63 +685,82 @@ func monitorIconState() {
 }
 
 func watchTunState() {
-	ticker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop()
+    ticker := time.NewTicker(3 * time.Second)
+    defer ticker.Stop()
 
-	var lastHasTun bool
-	ifaces, _ := net.Interfaces()
-	for _, i := range ifaces {
-		if isTunInterfaceMatch(i.Name) {
-			lastHasTun = true
-			break
-		}
-	}
+    // --- 核心：内存锚点 (借鉴 B 版本) ---
+    // 记录上一次物理网卡的真实状态，只有状态【改变】时才触发逻辑
+    lastPhysHasTun := false
+    ifaces, _ := net.Interfaces()
+    for _, i := range ifaces {
+        if isTunInterfaceMatch(i.Name) {
+            lastPhysHasTun = true
+            break
+        }
+    }
 
-	for {
-		select {
-		case <-ticker.C:
-			if atomic.LoadInt32(&isReallyExiting) == 1 {
-				return
-			}
+    for {
+        select {
+        case <-ticker.C:
+            if atomic.LoadInt32(&isReallyExiting) == 1 { return }
 
-			if atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1 {
-				continue
-			}
+            // 1. 【第一道防线】：锁保护
+            // 如果正在初始化，或者正在同步，绝对禁止改写 INI
+            if atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1 {
+                continue
+            }
 
-			currentHasTun := false
-			currentIfaces, err := net.Interfaces()
-			if err != nil {
-				continue
-			}
+            // 2. 物理采样
+            currentPhysHasTun := false
+            ifaces, _ := net.Interfaces()
+            for _, i := range ifaces {
+                if isTunInterfaceMatch(i.Name) {
+                    currentPhysHasTun = true
+                    break
+                }
+            }
 
-			for _, i := range currentIfaces {
-				if isTunInterfaceMatch(i.Name) {
-					currentHasTun = true
-					break
-				}
-			}
+            // 3. 【核心逻辑】：只有物理状态发生【切换】时才继续
+            // 这一步直接免疫了“内核重启期间网卡一直消失”产生的持续压力
+            if currentPhysHasTun != lastPhysHasTun {
+                
+                // 4. 【第二道防线】：API 验证 (防止重启瞬间误判)
+                body, err := doAPIRequest("GET", "/configs", nil)
+                if err != nil {
+                    // API 不通说明内核在重启或挂了，此时的物理变化是无效的，不更新锚点，直接跳过
+                    continue
+                }
 
-			if currentHasTun != lastHasTun {
-				if atomic.LoadInt32(&isKernelActive) == 1 && atomic.LoadInt32(&isReallyExiting) == 0 {
-					
-					lastHasTun = currentHasTun
-					atomic.StoreInt32(&hasFirstSynced, 1)
-					saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
-					newState := checkSystemState()
-					updateIconByState(newState)
-					lastState = newState 
-					if mTun != nil {
-						if currentHasTun {
-							mTun.Check()
-						} else {
-							mTun.Uncheck()
-						}
-					}
-					
-				}
-			}
-		}
-	}
+                var currentConf struct {
+                    Tun struct { Enable bool `json:"enable"` } `json:"tun"`
+                }
+                
+                if json.Unmarshal(body, &currentConf) == nil {
+                    // 5. 【第三道防线】：意图对齐
+                    // 只有当“物理现实”和“内核意图”达成一致，才确认为是 Web 端的修改
+                    if currentPhysHasTun == currentConf.Tun.Enable {
+                        
+                        // 更新内存锚点，确保这次变化只被处理一次
+                        lastPhysHasTun = currentPhysHasTun 
+                        
+                        // 6. 执行持久化
+                        saveIniConfig("tun_enabled", fmt.Sprint(currentPhysHasTun))
+                        
+                        // 7. 同步更新其他 UI 组件
+                        newState := checkSystemState()
+                        updateIconByState(newState)
+                        atomic.StoreInt32(&lastState, int32(newState))
+                        
+                        if mTun != nil {
+                            if currentPhysHasTun { mTun.Check() } else { mTun.Uncheck() }
+                        }
+                    }
+                    // 如果物理网卡消失了，但 API 说是 true，说明网卡还没加载好，
+                    // 我们不更新锚点，等下一个 3 秒再次判定，直到两者对齐。
+                }
+            }
+        }
+    }
 }
 
 func syncConfigToKernel() {
