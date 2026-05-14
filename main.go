@@ -448,18 +448,18 @@ func onReady() {
 
     mRestart := mMoreRoot.AddSubMenuItem("重启内核", "")
     mRestart.Click(func() {
-        // 【原子化替换】
         atomic.StoreInt32(&isSystemInitializing, 1)
         atomic.StoreInt32(&hasFirstSynced, 0)
         KillProcessByName("mihomo.exe")
+		sniffAndSolidifyConfig()
     })
 
     mReload := mMoreRoot.AddSubMenuItem("重载配置文件", "")
     mReload.Click(func() {
-        // 重载期间也加上保护锁
         atomic.StoreInt32(&isSystemInitializing, 1)
         sniffAndSolidifyConfig()
         reloadConfigFile()
+		go syncConfigToKernel()
     })
     mEditConfig := mMoreRoot.AddSubMenuItem("编辑 config.yaml", "")
     mEditConfig.Click(func() {
@@ -471,7 +471,6 @@ func onReady() {
 
         configPath := filepath.Join(baseDir, "config.yaml")
         windows.ShellExecute(0, nil, windows.StringToUTF16Ptr(configPath), nil, nil, windows.SW_SHOWNORMAL)
-        // 这里原本多了一个 }，已删除
     })
 	
     systray.AddSeparator()
@@ -539,6 +538,7 @@ func monitorKernelDaemon() {
 			cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 			if err := cmd.Start(); err == nil {
 				atomic.StoreInt32(&isKernelActive, 1)
+				sniffAndSolidifyConfig()
 				if hJob != 0 {
 					hp, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
 					if err == nil {
@@ -550,12 +550,7 @@ func monitorKernelDaemon() {
 					_ = c.Wait()
 					atomic.StoreInt32(&isKernelActive, 0)
 				}(cmd)
-				
-				time.Sleep(1000 * time.Millisecond)
-				atomic.StoreInt32(&isSystemInitializing, 0)
-			} else {
-				atomic.StoreInt32(&isSystemInitializing, 0)
-			}
+			}	
 		}
 		time.Sleep(2 * time.Second)
 	}
@@ -1175,6 +1170,12 @@ func getIniConfig(key string) string {
 }
 
 func saveIniConfig(key, val string) {
+    if key == "" || val == "" { return }
+    if atomic.LoadInt32(&isSystemInitializing) == 1 {
+        if key == "mode" || key == "tun_enabled" || key == "system_proxy_enabled" {
+            return 
+        }
+    }
     configMu.Lock()
     // 1. 变化检测：如果不动，则不写
     if old, ok := configData[key]; ok && old == val && key != "" {
