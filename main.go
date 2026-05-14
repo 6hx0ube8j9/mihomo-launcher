@@ -607,68 +607,69 @@ func checkSystemState() int32 {
         }
     }
 
-    if !iniTunEnabled {
-        if iniProxyEnabled { return int32(StateProxy) }
-        return int32(StateDefault)
-    }
-
-    return int32(StateTun)
+    if iniTunEnabled   { return int32(StateTun) }
+    if iniProxyEnabled { return int32(StateProxy) }
+    return int32(StateDefault)
 }
 
 func monitorIconState() {
-    for {
-        if atomic.LoadInt32(&isReallyExiting) == 1 {
-            return
-        }
+	var successCounter int 
 
-        var curr int32 
+	for {
+		if atomic.LoadInt32(&isReallyExiting) == 1 { return }
 
-        if !isProcessRunning("mihomo.exe") {
-            tunErrorCounter = 0 // 重置全局计数器
-            curr = int32(StateStop)
-            if atomic.LoadInt32(&lastState) != curr {
-                updateIconByState(int(curr))
-                atomic.StoreInt32(&lastState, curr)
-            }
-        } else {
-            curr = checkSystemState()
+		if !isProcessRunning("mihomo.exe") {
+			tunErrorCounter = 0
+			successCounter = 0
+			if atomic.LoadInt32(&lastState) != int32(StateStop) {
+				updateIconByState(StateStop)
+				atomic.StoreInt32(&lastState, int32(StateStop))
+			}
+		} else {
+			curr := checkSystemState() 
+			isTunMode := (getIniConfig("tun_enabled") == "true")
+			hasTun := true
+			if isTunMode && atomic.LoadInt32(&isSystemInitializing) == 0 {
+				hasTun = false
+				if ifaces, err := net.Interfaces(); err == nil {
+					for _, i := range ifaces {
+						if isTunInterfaceMatch(i.Name) {
+							hasTun = true
+							break
+						}
+					}
+				}
+			}
+			isBroken := (curr == int32(StateStop)) || (isTunMode && !hasTun)
 
-            isTunMode := (getIniConfig("tun_enabled") == "true")
-            hasTun := false
-            
-            // 只有非初始化阶段才扫描网卡，压榨性能
-            if isTunMode && atomic.LoadInt32(&isSystemInitializing) == 0 {
-                ifaces, _ := net.Interfaces()
-                for _, i := range ifaces {
-                    if isTunInterfaceMatch(i.Name) {
-                        hasTun = true
-                        break
-                    }
-                }
-            } else {
-                hasTun = true 
-            }
-
-            shouldUseFailCount := (isTunMode && !hasTun) || (curr == int32(StateStop))
-
-            if shouldUseFailCount {
-                tunErrorCounter++ // 统一使用全局变量
-                if tunErrorCounter > 5 {
-                    if atomic.LoadInt32(&lastState) != int32(StateError) {
-                        updateIconByState(StateError)
-                        atomic.StoreInt32(&lastState, int32(StateError))
-                    }
-                }
-            } else {
-                tunErrorCounter = 0 // 状态正常，立即清零
-                if curr != atomic.LoadInt32(&lastState) {
-                    updateIconByState(int(curr))
-                    atomic.StoreInt32(&lastState, curr)
-                }
-            }
-        }
-        time.Sleep(1 * time.Second)
-    }
+			if isBroken {
+				successCounter = 0 
+				
+				if tunErrorCounter < 5 { tunErrorCounter++ }
+				if tunErrorCounter > 2 {
+					targetState := int32(StateError)
+					if curr == int32(StateStop) {
+						targetState = int32(StateStop)
+					}
+					if atomic.LoadInt32(&lastState) != targetState {
+						updateIconByState(int(targetState))
+						atomic.StoreInt32(&lastState, targetState)
+					}
+				}
+			} else {
+				successCounter++
+				if tunErrorCounter <= 2 || successCounter >= 3 {
+					if successCounter >= 3 { tunErrorCounter = 0 }
+					
+					if atomic.LoadInt32(&lastState) != curr {
+						updateIconByState(int(curr))
+						atomic.StoreInt32(&lastState, curr)
+					}
+				}
+			}
+		}
+		time.Sleep(1 * time.Second)
+	}
 }
 
 func watchTunState() {
