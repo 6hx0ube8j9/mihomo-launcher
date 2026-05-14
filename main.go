@@ -604,8 +604,8 @@ func checkSystemState() int32 {
         }
     }
 
-    if iniTunEnabled   { return int32(StateTun) }
-    if iniProxyEnabled { return int32(StateProxy) }
+    if getIniConfig("tun_enabled") == "true" { return int32(StateTun) }
+    if getIniConfig("system_proxy_enabled") == "true" { return int32(StateProxy) }
     return int32(StateDefault)
 }
 
