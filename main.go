@@ -561,14 +561,14 @@ func monitorKernelDaemon() {
 	}
 }
 
-func checkSystemState() int {
+func checkSystemState() int32 {
     iniTunEnabled := getIniConfig("tun_enabled") == "true"
     iniProxyEnabled := getIniConfig("system_proxy_enabled") == "true"
     isInit := atomic.LoadInt32(&isSystemInitializing) == 1
 
     body, err := doAPIRequest("GET", "/configs", nil)
     if err != nil {
-        return StateStop
+        return int32(StateStop)
     }
 
     var currentConf struct {
@@ -582,7 +582,6 @@ func checkSystemState() int {
         go syncConfigToKernel()
     }
 
-    // 加强锁保护
     if unmarshalErr == nil {
         if isInit && currentConf.Tun.Enable == iniTunEnabled {
             atomic.StoreInt32(&isSystemInitializing, 0)
@@ -605,12 +604,12 @@ func checkSystemState() int {
     }
 
     if !iniTunEnabled {
-        if iniProxyEnabled { return StateProxy }
-        return StateDefault
+        if iniProxyEnabled { return int32(StateProxy) }
+        return int32(StateDefault)
     }
 
     if isInit || atomic.LoadInt32(&isSystemInitializing) == 1 {
-        return StateTun
+        return int32(StateTun)
     }
 
     hasTun := false
@@ -621,10 +620,7 @@ func checkSystemState() int {
             break
         }
     }
-    if hasTun {
-        return StateTun
-    }
-    return StateError
+    return int32(StateTun)
 }
 
 
@@ -635,19 +631,19 @@ func monitorIconState() {
             return
         }
 
-        var curr int 
+        var curr int32 // 修改为 int32，匹配 checkSystemState 的返回值
 
         if !isProcessRunning("mihomo.exe") {
             failCount = 0
-            curr = StateStop
-            // 修复：使用 int32(curr) 进行比较
-            if atomic.LoadInt32(&lastState) != int32(StateStop) {
-                updateIconByState(StateStop)
-                atomic.StoreInt32(&lastState, int32(StateStop))
+            curr = int32(StateStop)
+            if atomic.LoadInt32(&lastState) != curr {
+                updateIconByState(int(curr))
+                atomic.StoreInt32(&lastState, curr)
             }
         } else {
             curr = checkSystemState()
 
+            // 物理网卡判定逻辑（仅用于容错计数）
             isTunMode := (getIniConfig("tun_enabled") == "true")
             hasTun := false
             ifaces, _ := net.Interfaces()
@@ -660,39 +656,28 @@ func monitorIconState() {
 
             shouldUseFailCount := false
             if isTunMode && !hasTun {
-                if atomic.LoadInt32(&isSystemInitializing) == 1 || curr == StateTun {
+                if atomic.LoadInt32(&isSystemInitializing) == 1 || curr == int32(StateTun) {
                     shouldUseFailCount = true
                 }
             }
 
+            // 容错逻辑
             if shouldUseFailCount {
-                if curr == StateStop {
+                if curr == int32(StateStop) { // 这里的逻辑需检查 StateStop 定义
                     failCount++
                     if failCount > 5 {
-                        // 修复：读取原子变量并转换比较
                         if atomic.LoadInt32(&lastState) != int32(StateError) {
                             updateIconByState(StateError)
                             atomic.StoreInt32(&lastState, int32(StateError))
                         }
-                    } else {
-                        // 修复：比较 int 和 int32
-                        if int32(curr) != atomic.LoadInt32(&lastState) {
-                            updateIconByState(curr)
-                            atomic.StoreInt32(&lastState, int32(curr))
-                        }
-                    }
-                } else {
-                    failCount = 0
-                    if int32(curr) != atomic.LoadInt32(&lastState) {
-                        updateIconByState(curr)
-                        atomic.StoreInt32(&lastState, int32(curr))
                     }
                 }
             } else {
                 failCount = 0
-                if int32(curr) != atomic.LoadInt32(&lastState) {
-                    updateIconByState(curr)
-                    atomic.StoreInt32(&lastState, int32(curr))
+                // 标准状态更新：类型完全对齐
+                if curr != atomic.LoadInt32(&lastState) {
+                    updateIconByState(int(curr))
+                    atomic.StoreInt32(&lastState, curr)
                 }
             }
         }
@@ -745,7 +730,7 @@ func watchTunState() {
 					saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
 					newState := checkSystemState()
 					updateIconByState(newState)
-					atomic.StoreInt32(&lastState, int32(newState))
+					atomic.StoreInt32(&lastState, newState)
 					if mTun != nil {
 						if currentHasTun {
 							mTun.Check()
