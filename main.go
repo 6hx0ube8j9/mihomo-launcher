@@ -567,9 +567,7 @@ func checkSystemState() int32 {
     // --- 1. 入口快照：锁定用户在 INI 中的原始意图 ---
     targetTun := getIniConfig("tun_enabled") == "true"
     targetProxy := getIniConfig("system_proxy_enabled") == "true"
-    
-    // 内部状态计算闭包（替代原本不存在的 reportState）
-    // 这样在函数内任何地方需要返回状态时逻辑是一致的
+
     getState := func() int32 {
         if targetTun { return int32(StateTun) }
         if targetProxy { return int32(StateProxy) }
@@ -618,11 +616,11 @@ func checkSystemState() int32 {
 
         // --- 修补 B: 只有完全解锁状态下，才允许内核状态反向覆盖 INI ---
         if atomic.LoadInt32(&isSystemInitializing) == 0 {
-            // 同步 Mode 到 INI（如果用户在面板改了模式，托盘要记下来）
-            if currentConf.Mode != "" && currentConf.Mode != getIniConfig("mode") {
-                saveIniConfig("mode", currentConf.Mode)
-            }
-            // 同步 Tun 状态到 INI 和菜单勾选框
+            kernelMode := currentConf.Mode
+			localMode := getIniConfig("mode")
+            if kernelMode != "" && kernelMode != localMode {  
+			    saveIniConfig("mode", kernelMode)
+			}
             if currentConf.Tun.Enable != targetTun {
                 saveIniConfig("tun_enabled", fmt.Sprint(currentConf.Tun.Enable))
                 targetTun = currentConf.Tun.Enable 
@@ -632,8 +630,6 @@ func checkSystemState() int32 {
             }
         }
     }
-
-    // --- 3. 最终返回当前状态给 monitorIconState ---
     return getState()
 }
 
