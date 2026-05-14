@@ -562,51 +562,60 @@ func monitorKernelDaemon() {
 }
 
 func checkSystemState() int32 {
-    iniTunEnabled := getIniConfig("tun_enabled") == "true"
-    iniProxyEnabled := getIniConfig("system_proxy_enabled") == "true"
-    isInit := atomic.LoadInt32(&isSystemInitializing) == 1
+	configMu.RLock()
+	targetTun := configData["tun_enabled"] == "true"
+	targetProxy := configData["system_proxy_enabled"] == "true"
+	configMu.RUnlock()
+	
+	currentHasTun := false
+	ifaces, err := net.Interfaces()
+	if err == nil {
+		for _, i := range ifaces {
+			if isTunInterfaceMatch(i.Name) {
+				currentHasTun = true
+				break
+			}
+		}
+	}
 
-    body, err := doAPIRequest("GET", "/configs", nil)
-    if err != nil {
-        return int32(StateStop) 
-    }
+	apiConf, err := getKernelConfig()
+	
+	// --- 3. 核心逻辑处理与对齐 ---
+	if err == nil {
+		// A. 自动解锁逻辑：当内核实际状态与用户意图完全对齐时，解除初始化锁
+		if atomic.LoadInt32(&isSystemInitializing) == 1 {
+			// 如果内核返回的状态和我们 INI 想要的一致，说明对齐完成
+			if apiConf.Tun.Enable == targetTun {
+				atomic.StoreInt32(&isSystemInitializing, 0)
+			} else {
+				// 如果不对齐，尝试推一次配置（静默推送到内核）
+				go syncConfigToKernel(targetTun, targetProxy)
+			}
+		}
 
-    if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
-        atomic.StoreInt32(&isKernelActive, 1)
-        go syncConfigToKernel()
-    }
+		if atomic.LoadInt32(&isSystemInitializing) == 0 {
+			if apiConf.Tun.Enable != targetTun {
+				// 此时认为是用户通过 Web UI 进行了修改
+				saveIniConfig("tun_enabled", fmt.Sprint(apiConf.Tun.Enable))
+				// 仅仅记录日志或更新内存 map 即可，不干扰 targetTun 快照
+			}
+		}
+	} else {
+		isKernelActiveNow := isProcessRunning("mihomo.exe")
+		if !isKernelActiveNow {
+			atomic.StoreInt32(&isKernelActive, 0)
+			return StateStop
+		}
+	}
+	
+	if targetTun {
+		return StateTun
+	}
 
-    var currentConf struct {
-        Tun  struct { Enable bool `json:"enable"` } `json:"tun"`
-        Mode string `json:"mode"`
-    }
-    unmarshalErr := json.Unmarshal(body, &currentConf)
-
-    if unmarshalErr == nil {
-        hasSynced := atomic.LoadInt32(&hasFirstSynced) == 1
-
-        if isInit && hasSynced && currentConf.Tun.Enable == iniTunEnabled {
-            atomic.StoreInt32(&isSystemInitializing, 0)
-            isInit = false 
-        }
-
-        if !isInit && atomic.LoadInt32(&isSystemInitializing) == 0 {
-            if currentConf.Mode != "" && currentConf.Mode != getIniConfig("mode") {
-                saveIniConfig("mode", currentConf.Mode)
-            }
-            if currentConf.Tun.Enable != iniTunEnabled {
-                saveIniConfig("tun_enabled", fmt.Sprint(currentConf.Tun.Enable))
-                iniTunEnabled = currentConf.Tun.Enable
-                if mTun != nil {
-                    if iniTunEnabled { mTun.Check() } else { mTun.Uncheck() }
-                }
-            }
-        }
-    }
-
-    if getIniConfig("tun_enabled") == "true" { return int32(StateTun) }
-    if getIniConfig("system_proxy_enabled") == "true" { return int32(StateProxy) }
-    return int32(StateDefault)
+	if targetProxy {
+		return StateProxy
+	}
+	return StateDefault
 }
 
 func monitorIconState() {
