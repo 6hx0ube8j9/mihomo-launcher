@@ -710,7 +710,6 @@ func watchTunState() {
 					saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
 					newState := checkSystemState()
 					atomic.StoreInt32(&lastState, int32(newState))
-					lastState = newState 
 					if mTun != nil {
 						if currentHasTun {
 							mTun.Check()
