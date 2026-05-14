@@ -562,6 +562,7 @@ func monitorKernelDaemon() {
 }
 
 func checkSystemState() int32 {
+
     iniTunEnabled := getIniConfig("tun_enabled") == "true"
     iniProxyEnabled := getIniConfig("system_proxy_enabled") == "true"
     isInit := atomic.LoadInt32(&isSystemInitializing) == 1
@@ -729,7 +730,7 @@ func watchTunState() {
 					atomic.StoreInt32(&hasFirstSynced, 1)
 					saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
 					newState := checkSystemState()
-					updateIconByState(newState)
+					updateIconByState(int(newState))
 					atomic.StoreInt32(&lastState, newState)
 					if mTun != nil {
 						if currentHasTun {
@@ -1040,7 +1041,7 @@ func setProxyRegistry(enable bool) {
 	go func() {
 		time.Sleep(50 * time.Millisecond) // 留给磁盘 IO 一点时间
 		curr := checkSystemState()
-		updateIconByState(curr)
+		updateIconByState(int(curr))
 		atomic.StoreInt32(&lastState, int32(curr))
 	}()
 }
