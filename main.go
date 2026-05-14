@@ -670,56 +670,51 @@ func monitorIconState() {
 }
 
 func watchTunState() {
-    ticker := time.NewTicker(3 * time.Second)
-    defer ticker.Stop()
+	ticker := time.NewTicker(3 * time.Second)
+	defer ticker.Stop()
 
-    // 初始状态记录，避免启动时瞬间触发一次写入
-    var lastHasTun bool
-    ifaces, _ := net.Interfaces()
-    for _, i := range ifaces {
-        if isTunInterfaceMatch(i.Name) {
-            lastHasTun = true
-            break
-        }
-    }
+	var lastHasTun bool
+	ifaces, _ := net.Interfaces()
+	for _, i := range ifaces {
+		if isTunInterfaceMatch(i.Name) {
+			lastHasTun = true
+			break
+		}
+	}
 
-    for {
-        select {
-        case <-ticker.C:
-            if atomic.LoadInt32(&isReallyExiting) == 1 { return }
-            
-            // 核心保护：如果系统正在初始化或正在执行 API 同步，网卡监听暂时闭嘴
-            // 这样能防止 A 版本中常见的：内核还没改完配置，网卡监听就检测到变化并把配置改回去的 BUG
-            if atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1 {
-                continue
-            }
+	for {
+		select {
+		case <-ticker.C:
+			if atomic.LoadInt32(&isReallyExiting) == 1 {
+				return
+			}
 
-            currentHasTun := false
-            currentIfaces, err := net.Interfaces()
-            if err == nil {
-                for _, i := range currentIfaces {
-                    if isTunInterfaceMatch(i.Name) {
-                        currentHasTun = true
-                        break
-                    }
-                }
-            }
+			if atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1 {
+				continue
+			}
 
-            // 只有物理现状与上次记录不一致时，才触发同步
-            if currentHasTun != lastHasTun {
-                // 确保内核是活跃的，避免程序启动还没连通内核就去改配置
-                if atomic.LoadInt32(&isKernelActive) == 1 {
-                    lastHasTun = currentHasTun
-                    
-                    // 1. 同步配置到硬盘
-                    saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
-                    
-                    // 2. 强制触发一次 UI 状态更新 (使用原子操作保证一致性)
-                    newState := checkSystemState()
-                    updateIconByState(newState)
-                    atomic.StoreInt32(&lastState, int32(newState))
-                    
-                    // 3. 联动 UI 勾选框
+			currentHasTun := false
+			currentIfaces, err := net.Interfaces()
+			if err != nil {
+				continue
+			}
+
+			for _, i := range currentIfaces {
+				if isTunInterfaceMatch(i.Name) {
+					currentHasTun = true
+					break
+				}
+			}
+
+			if currentHasTun != lastHasTun {
+				if atomic.LoadInt32(&isKernelActive) == 1 && atomic.LoadInt32(&isReallyExiting) == 0 {
+					
+					lastHasTun = currentHasTun
+					atomic.StoreInt32(&hasFirstSynced, 1)
+					saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
+					newState := checkSystemState()
+					updateIconByState(newState)
+					atomic.StoreInt32(&lastState, int32(newState))
                     if mTun != nil {
                         if currentHasTun { mTun.Check() } else { mTun.Uncheck() }
                     }
