@@ -721,72 +721,64 @@ func monitorIconState() {
 }
 
 func watchTunState() {
-    ticker := time.NewTicker(3 * time.Second)
-    defer ticker.Stop()
+    ticker := time.NewTicker(3 * time.Second)
+    defer ticker.Stop()
 
-    var lastHasTun bool
-    // 初始状态采样
-    ifaces, _ := net.Interfaces()
-    for _, i := range ifaces {
-        if isTunInterfaceMatch(i.Name) {
-            lastHasTun = true
-            break
-        }
-    }
+    var lastHasTun bool
+    ifaces, _ := net.Interfaces()
+    for _, i := range ifaces {
+        if isTunInterfaceMatch(i.Name) {
+            lastHasTun = true
+            break
+        }
+    }
 
-    // 新增：连续一致计数器，用于防抖
-    confirmCount := 0
+    for {
+        select {
+        case <-ticker.C:
+            if atomic.LoadInt32(&isReallyExiting) == 1 {
+                return
+            }
 
-    for {
-        select {
-        case <-ticker.C:
-            if atomic.LoadInt32(&isReallyExiting) == 1 { return }
+            if atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1 {
+                continue
+            }
 
-            // 1. 严格锁定：系统初始化或同步中，不仅跳过，还要重置计数器
-            if atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1 {
-                confirmCount = 0 
-                continue
-            }
+            currentHasTun := false
+            currentIfaces, err := net.Interfaces()
+            if err != nil {
+                continue
+            }
 
-            // 2. 检查当前网卡
-            currentHasTun := false
-            currentIfaces, err := net.Interfaces()
-            if err != nil { continue }
-            for _, i := range currentIfaces {
-                if isTunInterfaceMatch(i.Name) {
-                    currentHasTun = true
-                    break
-                }
-            }
+            for _, i := range currentIfaces {
+                if isTunInterfaceMatch(i.Name) {
+                    currentHasTun = true
+                    break
+                }
+            }
 
-            // 3. 状态变化判定逻辑
-            if currentHasTun != lastHasTun {
-                confirmCount++
-                // 只有连续 2 次（约 6 秒）状态稳定变化，才认为是真的变了
-                if confirmCount >= 2 {
-                    if atomic.LoadInt32(&isKernelActive) == 1 {
-                        lastHasTun = currentHasTun
-                        confirmCount = 0 // 重置计数
-                        
-                        // --- 严格化修改：不要在这里 saveIniConfig ---
-                        // 让 checkSystemState 自动去对齐 API 状态和 UI
-                        newState := checkSystemState() 
-                        
-                        updateIconByState(int(newState))
-                        atomic.StoreInt32(&lastState, newState)
-                        
-                        if mTun != nil {
-                            if currentHasTun { mTun.Check() } else { mTun.Uncheck() }
-                        }
-                    }
-                }
-            } else {
-                // 状态回到了原点，清空确认计数
-                confirmCount = 0
-            }
-        }
-    }
-}
+            if currentHasTun != lastHasTun {
+                if atomic.LoadInt32(&isKernelActive) == 1 && atomic.LoadInt32(&isReallyExiting) == 0 {
+                    
+                    lastHasTun = currentHasTun
+                    atomic.StoreInt32(&hasFirstSynced, 1)
+                    saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
+                    newState := checkSystemState()
+                    updateIconByState(int(newState))
+                    atomic.StoreInt32(&lastState, newState)
+                    if mTun != nil {
+                        if currentHasTun {
+                            mTun.Check()
+                        } else {
+                            mTun.Uncheck()
+                        }
+                    }
+                    
+                }
+            }
+        }
+    }
+} 
 
 func syncConfigToKernel() {
 	if !atomic.CompareAndSwapInt32(&isSyncing, 0, 1) {
