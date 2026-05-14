@@ -650,123 +650,142 @@ func checkSystemState() int32 {
 }
 
 func monitorIconState() {
-	var successCounter int 
+    var successCounter int 
+    var iconErrorCounter int // 建议：使用独立的图标错误计数器，不要和防抖计数混用
 
-	for {
-		if atomic.LoadInt32(&isReallyExiting) == 1 { return }
+    for {
+        if atomic.LoadInt32(&isReallyExiting) == 1 { return }
 
-		if !isProcessRunning("mihomo.exe") {
-			tunErrorCounter = 0
-			successCounter = 0
-			if atomic.LoadInt32(&lastState) != int32(StateStop) {
-				updateIconByState(StateStop)
-				atomic.StoreInt32(&lastState, int32(StateStop))
-			}
-		} else {
-			curr := checkSystemState() 
-			isTunMode := (getIniConfig("tun_enabled") == "true")
-			hasTun := true
-			if isTunMode && atomic.LoadInt32(&isSystemInitializing) == 0 {
-				hasTun = false
-				if ifaces, err := net.Interfaces(); err == nil {
-					for _, i := range ifaces {
-						if isTunInterfaceMatch(i.Name) {
-							hasTun = true
-							break
-						}
-					}
-				}
-			}
-			isBroken := (curr == int32(StateStop)) || (isTunMode && !hasTun)
+        if !isProcessRunning("mihomo.exe") {
+            iconErrorCounter = 0
+            successCounter = 0
+            if atomic.LoadInt32(&lastState) != int32(StateStop) {
+                updateIconByState(StateStop)
+                atomic.StoreInt32(&lastState, int32(StateStop))
+            }
+        } else {
+            // 1. 获取核心状态
+            curr := checkSystemState() 
+            
+            // 2. 判定 Tun 是否异常 (仅在非初始化、非同步时判定)
+            isTunMode := (getIniConfig("tun_enabled") == "true")
+            hasTun := true
+            
+            // 只有在系统稳定运行中才去“吹毛求疵”查网卡
+            if isTunMode && atomic.LoadInt32(&isSystemInitializing) == 0 && atomic.LoadInt32(&isSyncing) == 0 {
+                hasTun = false
+                if ifaces, err := net.Interfaces(); err == nil {
+                    for _, i := range ifaces {
+                        if isTunInterfaceMatch(i.Name) {
+                            hasTun = true
+                            break
+                        }
+                    }
+                }
+            }
 
-			if isBroken {
-				successCounter = 0 
-				
-				if tunErrorCounter < 5 { tunErrorCounter++ }
-				if tunErrorCounter > 2 {
-					targetState := int32(StateError)
-					if curr == int32(StateStop) {
-						targetState = int32(StateStop)
-					}
-					if atomic.LoadInt32(&lastState) != targetState {
-						updateIconByState(int(targetState))
-						atomic.StoreInt32(&lastState, targetState)
-					}
-				}
-			} else {
-				successCounter++
-				if tunErrorCounter <= 2 || successCounter >= 3 {
-					if successCounter >= 3 { tunErrorCounter = 0 }
-					
-					if atomic.LoadInt32(&lastState) != curr {
-						updateIconByState(int(curr))
-						atomic.StoreInt32(&lastState, curr)
-					}
-				}
-			}
-		}
-		time.Sleep(1 * time.Second)
-	}
+            // 3. 综合判定是否有故障
+            // 如果内核说停了，或者开启了 Tun 但没网卡，就是 Broken
+            isBroken := (curr == int32(StateStop)) || (isTunMode && !hasTun)
+
+            if isBroken {
+                successCounter = 0 
+                if iconErrorCounter < 5 { iconErrorCounter++ }
+                
+                // 只有连续 3 次检测到异常（3秒），才真正切换图标颜色
+                if iconErrorCounter >= 3 {
+                    targetState := int32(StateError)
+                    if curr == int32(StateStop) { targetState = int32(StateStop) }
+                    
+                    if atomic.LoadInt32(&lastState) != targetState {
+                        updateIconByState(int(targetState))
+                        atomic.StoreInt32(&lastState, targetState)
+                    }
+                }
+            } else {
+                // 状态正常，累加成功计数
+                successCounter++
+                // 只要成功 1 次，且错误还没达标，或者连续成功 3 次
+                if iconErrorCounter < 3 || successCounter >= 3 {
+                    if successCounter >= 3 { iconErrorCounter = 0 }
+                    
+                    if atomic.LoadInt32(&lastState) != curr {
+                        updateIconByState(int(curr))
+                        atomic.StoreInt32(&lastState, curr)
+                    }
+                }
+            }
+        }
+        time.Sleep(1 * time.Second)
+    }
 }
 
 func watchTunState() {
-	ticker := time.NewTicker(3 * time.Second)
-	defer ticker.Stop()
+    ticker := time.NewTicker(3 * time.Second)
+    defer ticker.Stop()
 
-	var lastHasTun bool
-	ifaces, _ := net.Interfaces()
-	for _, i := range ifaces {
-		if isTunInterfaceMatch(i.Name) {
-			lastHasTun = true
-			break
-		}
-	}
+    var lastHasTun bool
+    // 初始状态采样
+    ifaces, _ := net.Interfaces()
+    for _, i := range ifaces {
+        if isTunInterfaceMatch(i.Name) {
+            lastHasTun = true
+            break
+        }
+    }
 
-	for {
-		select {
-		case <-ticker.C:
-			if atomic.LoadInt32(&isReallyExiting) == 1 {
-				return
-			}
+    // 新增：连续一致计数器，用于防抖
+    confirmCount := 0
 
-			if atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1 {
-				continue
-			}
+    for {
+        select {
+        case <-ticker.C:
+            if atomic.LoadInt32(&isReallyExiting) == 1 { return }
 
-			currentHasTun := false
-			currentIfaces, err := net.Interfaces()
-			if err != nil {
-				continue
-			}
+            // 1. 严格锁定：系统初始化或同步中，不仅跳过，还要重置计数器
+            if atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1 {
+                confirmCount = 0 
+                continue
+            }
 
-			for _, i := range currentIfaces {
-				if isTunInterfaceMatch(i.Name) {
-					currentHasTun = true
-					break
-				}
-			}
+            // 2. 检查当前网卡
+            currentHasTun := false
+            currentIfaces, err := net.Interfaces()
+            if err != nil { continue }
+            for _, i := range currentIfaces {
+                if isTunInterfaceMatch(i.Name) {
+                    currentHasTun = true
+                    break
+                }
+            }
 
-			if currentHasTun != lastHasTun {
-				if atomic.LoadInt32(&isKernelActive) == 1 && atomic.LoadInt32(&isReallyExiting) == 0 {
-					
-					lastHasTun = currentHasTun
-					atomic.StoreInt32(&hasFirstSynced, 1)
-					saveIniConfig("tun_enabled", fmt.Sprint(currentHasTun))
-					newState := checkSystemState()
-					updateIconByState(int(newState))
-					atomic.StoreInt32(&lastState, newState)
-					if mTun != nil {
-						if currentHasTun {
-							mTun.Check()
-						} else {
-							mTun.Uncheck()
-						}
-					}
-					
-				}
-			}
-		}
-	}
+            // 3. 状态变化判定逻辑
+            if currentHasTun != lastHasTun {
+                confirmCount++
+                // 只有连续 2 次（约 6 秒）状态稳定变化，才认为是真的变了
+                if confirmCount >= 2 {
+                    if atomic.LoadInt32(&isKernelActive) == 1 {
+                        lastHasTun = currentHasTun
+                        confirmCount = 0 // 重置计数
+                        
+                        // --- 严格化修改：不要在这里 saveIniConfig ---
+                        // 让 checkSystemState 自动去对齐 API 状态和 UI
+                        newState := checkSystemState() 
+                        
+                        updateIconByState(int(newState))
+                        atomic.StoreInt32(&lastState, newState)
+                        
+                        if mTun != nil {
+                            if currentHasTun { mTun.Check() } else { mTun.Uncheck() }
+                        }
+                    }
+                }
+            } else {
+                // 状态回到了原点，清空确认计数
+                confirmCount = 0
+            }
+        }
+    }
 }
 
 func syncConfigToKernel() {
@@ -1039,10 +1058,8 @@ func setTunMode(enable bool) {
 
 func setProxyRegistry(enable bool) {
 	if atomic.LoadInt32(&isReallyExiting) == 1 { return }
-	
 	saveIniConfig("system_proxy_enabled", fmt.Sprint(enable))
 	
-	// 修改注册表逻辑保持...
 	key, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.SET_VALUE)
 	if err == nil {
 		defer key.Close()
@@ -1054,20 +1071,12 @@ func setProxyRegistry(enable bool) {
 		}
 	}
 
-	// 1. 异步刷新网络栈
 	go func() {
 		wininet := windows.NewLazySystemDLL("wininet.dll")
 		setOption := wininet.NewProc("InternetSetOptionW")
+		// 通知系统代理设置已改变
 		setOption.Call(0, 39, 0, 0)
 		setOption.Call(0, 37, 0, 0)
-	}()
-
-	// 2. 立即同步 UI 状态
-	go func() {
-		time.Sleep(50 * time.Millisecond) // 留给磁盘 IO 一点时间
-		curr := checkSystemState()
-		updateIconByState(int(curr))
-		atomic.StoreInt32(&lastState, int32(curr))
 	}()
 }
 
