@@ -566,19 +566,16 @@ func checkSystemState() int32 {
     iniProxyEnabled := getIniConfig("system_proxy_enabled") == "true"
     isInit := atomic.LoadInt32(&isSystemInitializing) == 1
 
-    // 1. 性能关口：API 通信判定（不通直接返回，不解析，不扫网卡）
     body, err := doAPIRequest("GET", "/configs", nil)
     if err != nil {
         return int32(StateStop) 
     }
 
-    // 2. 第一次连通激活内核同步
     if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
         atomic.StoreInt32(&isKernelActive, 1)
         go syncConfigToKernel()
     }
 
-    // 3. 配置解析与解锁（修复 C 版反写 BUG）
     var currentConf struct {
         Tun  struct { Enable bool `json:"enable"` } `json:"tun"`
         Mode string `json:"mode"`
@@ -586,14 +583,14 @@ func checkSystemState() int32 {
     unmarshalErr := json.Unmarshal(body, &currentConf)
 
     if unmarshalErr == nil {
-        // 解锁判定：只有内核状态跟 INI 意图对齐了，才解初始化锁
-        if isInit && currentConf.Tun.Enable == iniTunEnabled {
+        hasSynced := atomic.LoadInt32(&hasFirstSynced) == 1
+
+        if isInit && hasSynced && currentConf.Tun.Enable == iniTunEnabled {
             atomic.StoreInt32(&isSystemInitializing, 0)
             isInit = false 
         }
 
-        // 稳定性关口：只有非初始化期间，才允许反写配置
-        if !isInit {
+        if !isInit && atomic.LoadInt32(&isSystemInitializing) == 0 {
             if currentConf.Mode != "" && currentConf.Mode != getIniConfig("mode") {
                 saveIniConfig("mode", currentConf.Mode)
             }
