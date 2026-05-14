@@ -562,60 +562,80 @@ func monitorKernelDaemon() {
 }
 
 func checkSystemState() int32 {
-	configMu.RLock()
-	targetTun := configData["tun_enabled"] == "true"
-	targetProxy := configData["system_proxy_enabled"] == "true"
-	configMu.RUnlock()
-	
-	currentHasTun := false
-	ifaces, err := net.Interfaces()
-	if err == nil {
-		for _, i := range ifaces {
-			if isTunInterfaceMatch(i.Name) {
-				currentHasTun = true
-				break
-			}
-		}
-	}
+    // --- 1. 入口快照：锁定用户原始意图 ---
+    // 这里对齐你原有的 getIniConfig 逻辑，保持引用一致
+    targetTun := getIniConfig("tun_enabled") == "true"
+    targetProxy := getIniConfig("system_proxy_enabled") == "true"
+    isInit := atomic.LoadInt32(&isSystemInitializing) == 1
 
-	apiConf, err := getKernelConfig()
-	
-	// --- 3. 核心逻辑处理与对齐 ---
-	if err == nil {
-		// A. 自动解锁逻辑：当内核实际状态与用户意图完全对齐时，解除初始化锁
-		if atomic.LoadInt32(&isSystemInitializing) == 1 {
-			// 如果内核返回的状态和我们 INI 想要的一致，说明对齐完成
-			if apiConf.Tun.Enable == targetTun {
-				atomic.StoreInt32(&isSystemInitializing, 0)
-			} else {
-				// 如果不对齐，尝试推一次配置（静默推送到内核）
-				go syncConfigToKernel(targetTun, targetProxy)
-			}
-		}
+    // --- 2. 获取内核实时状态 ---
+    // 保持对 doAPIRequest 的原有引用
+    body, err := doAPIRequest("GET", "/configs", nil)
+    
+    // 如果 API 失败（内核挂了或正在重启）
+    if err != nil {
+        // 探测进程是否还在，如果进程都没了，那是彻底停止
+        if !isProcessRunning("mihomo.exe") {
+            atomic.StoreInt32(&isKernelActive, 0)
+            return int32(StateStop)
+        }
+        // 进程还在但 API 失败，保持当前意图状态，等待 monitorIconState 去发现异常
+        if targetTun { return int32(StateTun) }
+        if targetProxy { return int32(StateProxy) }
+        return int32(StateDefault)
+    }
 
-		if atomic.LoadInt32(&isSystemInitializing) == 0 {
-			if apiConf.Tun.Enable != targetTun {
-				// 此时认为是用户通过 Web UI 进行了修改
-				saveIniConfig("tun_enabled", fmt.Sprint(apiConf.Tun.Enable))
-				// 仅仅记录日志或更新内存 map 即可，不干扰 targetTun 快照
-			}
-		}
-	} else {
-		isKernelActiveNow := isProcessRunning("mihomo.exe")
-		if !isKernelActiveNow {
-			atomic.StoreInt32(&isKernelActive, 0)
-			return StateStop
-		}
-	}
-	
-	if targetTun {
-		return StateTun
-	}
+    // 首次同步逻辑（保持你原有的 hasFirstSynced 引用）
+    if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
+        atomic.StoreInt32(&isKernelActive, 1)
+        go syncConfigToKernel() 
+    }
 
-	if targetProxy {
-		return StateProxy
-	}
-	return StateDefault
+    // 解析内核配置
+    var currentConf struct {
+        Tun  struct { Enable bool `json:"enable"` } `json:"tun"`
+        Mode string `json:"mode"`
+    }
+    
+    if err := json.Unmarshal(body, &currentConf); err == nil {
+        // A. 自动解锁逻辑：内核状态与意图对齐时解除初始化锁
+        if isInit {
+            if currentConf.Tun.Enable == targetTun {
+                atomic.StoreInt32(&isSystemInitializing, 0)
+                isInit = false
+            } else {
+                // 不对齐则尝试补推配置
+                go syncConfigToKernel()
+            }
+        }
+
+        // B. 反写保护逻辑：只有非初始化阶段才允许反写 INI
+        if !isInit && atomic.LoadInt32(&isSystemInitializing) == 0 {
+            // 模式反写
+            if currentConf.Mode != "" && currentConf.Mode != getIniConfig("mode") {
+                saveIniConfig("mode", currentConf.Mode)
+            }
+            // TUN 状态反写
+            if currentConf.Tun.Enable != targetTun {
+                saveIniConfig("tun_enabled", fmt.Sprint(currentConf.Tun.Enable))
+                targetTun = currentConf.Tun.Enable // 同步快照以便最后 return
+                // 保持对 UI 勾选框 mTun 的引用
+                if mTun != nil {
+                    if targetTun { mTun.Check() } else { mTun.Uncheck() }
+                }
+            }
+        }
+    }
+
+    // --- 3. 优先级输出 ---
+    // 严格按照 TUN > Proxy > Default 优先级返回
+    if targetTun {
+        return int32(StateTun)
+    }
+    if targetProxy {
+        return int32(StateProxy)
+    }
+    return int32(StateDefault)
 }
 
 func monitorIconState() {
