@@ -516,7 +516,6 @@ func onExit() {
 }
 
 func monitorKernelDaemon() {
-    targetTun := getIniConfig("tun_enabled") == "true"
 	target := filepath.Join(baseDir, "mihomo.exe")
 	absBaseDir, _ := filepath.Abs(baseDir)
 	for {
