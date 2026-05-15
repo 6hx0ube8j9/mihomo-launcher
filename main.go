@@ -689,10 +689,13 @@ func monitorIconState() {
             }
         } else {
             curr := checkSystemState() 
-            isTunMode := (getIniConfig("tun_enabled") == "true")
+            isTunModeInConfig := (getIniConfig("tun_enabled") == "true")
             isPhysicalLost := (atomic.LoadInt32(&isTunInterfaceCurrentlyAlive) == 0)
+			isKernelActuallyRunningTun := (curr == int32(StateTun))
+			isSyncing := (atomic.LoadInt32(&isSyncing) == 1)
             isBroken := (curr == int32(StateStop)) || 
-                        (isTunMode && isPhysicalLost && atomic.LoadInt32(&isSystemInitializing) == 0)
+                        (isTunModeInConfig && isKernelActuallyRunningTun && isPhysicalLost && 
+                        atomic.LoadInt32(&isSystemInitializing) == 0 && !isSyncing)
 
             if isBroken {
                 successCounter = 0 
