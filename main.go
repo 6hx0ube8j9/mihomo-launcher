@@ -517,53 +517,58 @@ func onExit() {
 }
 
 func monitorKernelDaemon() {
-	target := filepath.Join(baseDir, "mihomo.exe")
-	absBaseDir, _ := filepath.Abs(baseDir)
-	for {
-		// 1. 退出检查
-		if atomic.LoadInt32(&isReallyExiting) == 1 { return }
-		
-		if !isProcessRunning("mihomo.exe") {
-			// 2. 锁定初始化状态
-			atomic.StoreInt32(&isSystemInitializing, 1)
-			atomic.StoreInt32(&hasFirstSynced, 0)
-			atomic.StoreInt32(&isKernelActive, 0)
-			
-			KillProcessByName("mihomo.exe")
-			time.Sleep(200 * time.Millisecond)
-			
-			cmd := exec.Command(target, "-d", ".")
-			cmd.Dir = absBaseDir
-			cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
-			
-			if err := cmd.Start(); err == nil {
-				atomic.StoreInt32(&isKernelActive, 1)
-				
-				// --- 无损补全：如果你的业务需要启动时固化配置，请保留此行 ---
-				sniffAndSolidifyConfig() 
+    target := filepath.Join(baseDir, "mihomo.exe")
+    absBaseDir, _ := filepath.Abs(baseDir)
+    for {
+        if atomic.LoadInt32(&isReallyExiting) == 1 { return }
+        
+        if !isProcessRunning("mihomo.exe") {
+            // 1. 锁定状态
+            atomic.StoreInt32(&isSystemInitializing, 1)
+            atomic.StoreInt32(&hasFirstSynced, 0)
+            atomic.StoreInt32(&isKernelActive, 0)
+            
+            KillProcessByName("mihomo.exe")
+            time.Sleep(300 * time.Millisecond) // 稍微多给点时间让端口释放
+            
+            cmd := exec.Command(target, "-d", ".")
+            cmd.Dir = absBaseDir
+            cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
+            
+            if err := cmd.Start(); err == nil {
+                atomic.StoreInt32(&isKernelActive, 1)
+                sniffAndSolidifyConfig() 
 
-				if hJob != 0 {
-					hp, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
-					if err == nil {
-						_ = windows.AssignProcessToJobObject(hJob, hp)
-						_ = windows.CloseHandle(hp)
-					}
-				}
-				
-				go func(c *exec.Cmd) {
-					_ = c.Wait()
-					atomic.StoreInt32(&isKernelActive, 0)
-				}(cmd)
-				
-				// 3. 缓冲期，防止 checkSystemState 在 API 还没起来时误判
-				time.Sleep(1000 * time.Millisecond)
-			}
-			
-			// 4. 关键：释放锁，让 checkSystemState 恢复正常工作
-			atomic.StoreInt32(&isSystemInitializing, 0)
-		}
-		time.Sleep(2 * time.Second)
-	}
+                // 绑定 Job Object (略...)
+                if hJob != 0 {
+                    hp, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid))
+                    if err == nil {
+                        _ = windows.AssignProcessToJobObject(hJob, hp)
+                        _ = windows.CloseHandle(hp)
+                    }
+                }
+                
+                go func(c *exec.Cmd) {
+                    _ = c.Wait()
+                    atomic.StoreInt32(&isKernelActive, 0)
+                }(cmd)
+                
+                // 2. 核心调整：启动后强制对齐状态
+                time.Sleep(1000 * time.Millisecond) 
+                go syncConfigToKernel() // 这里面的 defer 会把 Initializing 设为 0
+                
+            } else {
+                // 3. 兜底：如果连 Start 都失败了（如文件丢失），必须开门，让图标变红
+                atomic.StoreInt32(&isSystemInitializing, 0)
+            }
+        } else {
+            if atomic.LoadInt32(&isSystemInitializing) == 1 && atomic.LoadInt32(&isSyncing) == 0 {
+                // 只有在没有进行同步任务时，才允许复位
+                atomic.StoreInt32(&isSystemInitializing, 0)
+            }
+        }
+        time.Sleep(2 * time.Second)
+    }
 }
 
 func watchTunState() {
@@ -636,38 +641,28 @@ func checkSystemState() int32 {
 
     body, err := doAPIRequest("GET", "/configs", nil)
     if err != nil {
-        if !isProcessRunning("mihomo.exe") {
-            atomic.StoreInt32(&isKernelActive, 0)
-            return int32(StateStop)
-        }
+        if !isProcessRunning("mihomo.exe") { return int32(StateStop) }
         return getState(targetTun, targetProxy)
     }
 
-    if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
-        atomic.StoreInt32(&isKernelActive, 1)
-        go syncConfigToKernel()
-    }
-
+    // 状态对齐逻辑
     var currentConf struct {
-        Tun struct {
-            Enable bool `json:"enable"`
-        } `json:"tun"`
+        Tun struct { Enable bool `json:"enable"` } `json:"tun"`
         Mode string `json:"mode"`
     }
 
     if err := json.Unmarshal(body, &currentConf); err == nil {
+        // A. 初始化/重载中：强制对齐账本 (纠偏)
         if atomic.LoadInt32(&isSystemInitializing) == 1 {
             if currentConf.Tun.Enable != targetTun {
-                go syncConfigToKernel()
+                go syncConfigToKernel() 
                 return getState(targetTun, targetProxy)
             }
-        }
-
-        if atomic.LoadInt32(&isSystemInitializing) == 0 {
+        } else {
+            // B. 稳定运行中：允许内核改写账本 (反向同步)
             if currentConf.Mode != "" && currentConf.Mode != getIniConfig("mode") {
                 saveIniConfig("mode", currentConf.Mode)
             }
-
             if currentConf.Tun.Enable != targetTun {
                 saveIniConfig("tun_enabled", fmt.Sprint(currentConf.Tun.Enable))
                 targetTun = currentConf.Tun.Enable
@@ -677,7 +672,6 @@ func checkSystemState() int32 {
             }
         }
     }
-	
     return getState(targetTun, targetProxy)
 }
 
@@ -730,52 +724,45 @@ func monitorIconState() {
     }
 }
 
-func syncConfigToKernel() {
-    // 1. 防止并发执行同步
-    if !atomic.CompareAndSwapInt32(&isSyncing, 0, 1) {
-        return
-    }
-    defer atomic.StoreInt32(&isSyncing, 0)
+func reloadConfigFile() {
+    atomic.StoreInt32(&isSystemInitializing, 1) // 1. 关门
+    
+    payload := map[string]string{"path": filepath.Join(baseDir, "config.yaml")}
+    _, err := doAPIRequest("PUT", "/configs?force=false", payload)
+    
+    // 无论 PUT 是否成功，都交给 sync 去处理后续和“开门”
+    go syncConfigToKernel() 
+}
 
-    // 2. 实时获取最新配置（确保对齐的准确性）
+func syncConfigToKernel() {
+    if !atomic.CompareAndSwapInt32(&isSyncing, 0, 1) { return }
+    
+    // 【精简点】统一在 defer 处理所有锁的释放
+    defer func() {
+        atomic.StoreInt32(&isSyncing, 0)
+        // 关键：同步彻底结束（无论成败）后再允许 monitor 恢复工作
+        atomic.StoreInt32(&isSystemInitializing, 0) 
+    }()
+
     tunEnabled := getIniConfig("tun_enabled") == "true"
     currentMode := getIniConfig("mode")
     
-    var payload interface{}
-    // 只要是初始化阶段，我们必须同步全量参数（Mode + Tun）
+    // 逻辑合并：如果是初始化，带上 mode
+    payload := map[string]interface{}{"tun": map[string]bool{"enable": tunEnabled}}
     if atomic.LoadInt32(&isSystemInitializing) == 1 {
-        payload = map[string]interface{}{
-            "mode": currentMode,
-            "tun":  map[string]bool{"enable": tunEnabled},
-        }
-    } else {
-        // 普通切换阶段，仅同步 Tun 状态
-        payload = map[string]interface{}{
-            "tun": map[string]bool{"enable": tunEnabled},
-        }
+        payload["mode"] = currentMode
     }
 
-    // 3. 带退避算法的重试（应对内核启动瞬间的 API 繁忙）
-    success := false
-    for i := 0; i < 5; i++ { // 增加到5次，覆盖约5秒的启动窗口
-        _, err := doAPIRequest("PATCH", "/configs", payload)
-        if err == nil {
-            success = true
-            break
+    // 指数退避重试
+    for i := 0; i < 5; i++ {
+        if _, err := doAPIRequest("PATCH", "/configs", payload); err == nil {
+            // 成功后更新 UI
+            if mTun != nil {
+                if tunEnabled { mTun.Check() } else { mTun.Uncheck() }
+            }
+            return // 成功直接返回，触发 defer 解锁
         }
-        // 指数退避：500ms, 1000ms, 1500ms...
         time.Sleep(time.Duration(i+1) * 500 * time.Millisecond)
-    }
-
-    // 4. 同步成功后的处理
-    if success {
-        // 更新 UI 勾选状态
-        if mTun != nil {
-            if tunEnabled { mTun.Check() } else { mTun.Uncheck() }
-        }
-
-        atomic.StoreInt32(&isSystemInitializing, 0)
-        time.Sleep(200 * time.Millisecond)
     }
 }
 
@@ -814,22 +801,21 @@ func doAPIRequest(method, path string, payload interface{}) ([]byte, error) {
 	if err != nil {
 		return nil, err
 	}
-	// 确保 Body 最终被关闭，防止连接泄漏
+	// 确保 Body 最终被关闭
 	defer resp.Body.Close()
 
-	// 6. 性能优化：心跳检测逻辑
-	// 如果是 GET 请求且 path 为空（说明来自 checkSystemState 的存活检查）
-	// 我们只关心状态码，不关心内容，直接丢弃 Body 以节省内存分配
-	if method == "GET" && (path == "" || path == "/") {
+	// 6. 自动判定：无内容或标准心跳响应则跳过读取
+	// 204 是标准的 "No Content" 成功码，ContentLength == 0 说明确实没数据
+	if resp.StatusCode == 204 || resp.ContentLength == 0 {
 		_, _ = io.Copy(io.Discard, resp.Body)
-		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return nil, fmt.Errorf("API Heartbeat Error: %d", resp.StatusCode)
+		// 如果状态码在 200 范围内，认为成功
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			return nil, nil
 		}
-		return nil, nil
+		return nil, fmt.Errorf("API Status Error: %d", resp.StatusCode)
 	}
 
 	// 7. 读取响应内容
-	// 对于配置更新、状态获取等请求，我们需要读取完整的响应体
 	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		return nil, fmt.Errorf("read response body failed: %v", err)
@@ -1060,17 +1046,6 @@ func toggleAutoStart(enable bool) {
 	if success { saveIniConfig("startup_enabled", fmt.Sprint(enable)) }
 }
 
-func reloadConfigFile() {
-    atomic.StoreInt32(&isSystemInitializing, 1)
-    payload := map[string]string{
-        "path": filepath.Join(baseDir, "config.yaml"),
-    }    
-    _, err := doAPIRequest("PUT", "/configs?force=false", payload)    
-    go func() {
-        time.Sleep(1 * time.Second)
-        atomic.StoreInt32(&isSystemInitializing, 0)
-    }()
-}
 
 func isAdmin() bool {
 	var token windows.Token
