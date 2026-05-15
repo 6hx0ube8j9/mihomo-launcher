@@ -725,12 +725,11 @@ func monitorIconState() {
 }
 
 func reloadConfigFile() {
-    atomic.StoreInt32(&isSystemInitializing, 1) // 1. 关门
+    atomic.StoreInt32(&isSystemInitializing, 1) // 关门
     
     payload := map[string]string{"path": filepath.Join(baseDir, "config.yaml")}
-    _, err := doAPIRequest("PUT", "/configs?force=false", payload)
-    
-    // 无论 PUT 是否成功，都交给 sync 去处理后续和“开门”
+    _, _ = doAPIRequest("PUT", "/configs?force=false", payload)
+	
     go syncConfigToKernel() 
 }
 
