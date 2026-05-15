@@ -676,55 +676,85 @@ func checkSystemState() int32 {
 }
 
 func monitorIconState() {
-    var successCounter int 
+	var successCounter int
 
-    for {
-        if atomic.LoadInt32(&isReallyExiting) == 1 { return }
-        if !isProcessRunning("mihomo.exe") {
-            tunErrorCounter = 0
-            successCounter = 0
-            if atomic.LoadInt32(&lastState) != int32(StateStop) {
-                updateIconByState(StateStop)
-                atomic.StoreInt32(&lastState, int32(StateStop))
-            }
-        } else {
-            curr := checkSystemState() 
-            isTunModeInConfig := (getIniConfig("tun_enabled") == "true")
-            isPhysicalLost := (atomic.LoadInt32(&isTunInterfaceCurrentlyAlive) == 0)
-			isKernelActuallyRunningTun := (curr == int32(StateTun))
-			isSyncing := (atomic.LoadInt32(&isSyncing) == 1)
-            isBroken := (curr == int32(StateStop)) || 
-                        (isTunModeInConfig && isKernelActuallyRunningTun && isPhysicalLost && 
-                        atomic.LoadInt32(&isSystemInitializing) == 0 && !isSyncing)
+	for {
+		// 1. 退出检查
+		if atomic.LoadInt32(&isReallyExiting) == 1 {
+			return
+		}
 
-            if isBroken {
-                successCounter = 0 
-                if tunErrorCounter < 5 { tunErrorCounter++ }
-                if tunErrorCounter > 2 {
-                    targetState := int32(StateError)
-                    if curr == int32(StateStop) {
-                        targetState = int32(StateStop)
-                    }
+		// 2. 进程存活检查
+		if !isProcessRunning("mihomo.exe") {
+			tunErrorCounter = 0
+			successCounter = 0
+			if atomic.LoadInt32(&lastState) != int32(StateStop) {
+				updateIconByState(StateStop)
+				atomic.StoreInt32(&lastState, int32(StateStop))
+			}
+		} else {
+			// 3. 获取内核意图 (来自 API 实时状态)
+			curr := checkSystemState()
 
-                    if atomic.LoadInt32(&lastState) != targetState {
-                        updateIconByState(int(targetState))
-                        atomic.StoreInt32(&lastState, targetState)
-                    }
-                }
-            } else {
-                successCounter++
-                if tunErrorCounter <= 2 || successCounter >= 3 {
-                    if successCounter >= 3 { tunErrorCounter = 0 }
-                    
-                    if atomic.LoadInt32(&lastState) != curr {
-                        updateIconByState(int(curr))
-                        atomic.StoreInt32(&lastState, curr)
-                    }
-                }
-            }
-        }
-        time.Sleep(1 * time.Second)
-    }
+			// 4. 获取物理事实 (来自 watchTunState 滤波后的结果)
+			// 注意：这里仅读取原子变量，不再进行任何网络接口扫描
+			isPhysicalAlive := (atomic.LoadInt32(&isTunInterfaceCurrentlyAlive) == 1)
+
+			// 5. 判定是否处于故障状态 (isBroken)
+			isBroken := false
+
+			if curr == int32(StateStop) {
+				// 场景 A: API 无法访问 (可能是内核卡死或端口冲突)
+				isBroken = true
+			} else if curr == int32(StateTun) {
+				// 场景 B: 内核说它在跑 TUN，我们才需要校验物理事实
+				// 避让：初始化中、同步中、或者物理网卡确实活着，都不算 Broken
+				if atomic.LoadInt32(&isSystemInitializing) == 0 &&
+					atomic.LoadInt32(&isSyncing) == 0 &&
+					!isPhysicalAlive {
+					isBroken = true
+				}
+			}
+			// 场景 C: curr 为 StateProxy 或 StateDefault 时，isBroken 默认为 false
+			// 即使物理网卡还没消失，只要内核说关了，就不再报 Broken，从而消除“闪黄”
+
+			// 6. 状态应用逻辑
+			if isBroken {
+				successCounter = 0
+				if tunErrorCounter < 5 {
+					tunErrorCounter++
+				}
+				// 连续 3 秒确认故障才变色 (进一步防抖)
+				if tunErrorCounter > 2 {
+					targetState := int32(StateError)
+					if curr == int32(StateStop) {
+						targetState = int32(StateStop)
+					}
+
+					if atomic.LoadInt32(&lastState) != targetState {
+						updateIconByState(int(targetState))
+						atomic.StoreInt32(&lastState, targetState)
+					}
+				}
+			} else {
+				// 正常运行状态
+				successCounter++
+				// 恢复逻辑：连续 3 秒正常才从 Error 切回正常，或者还没变红前保持现状
+				if tunErrorCounter <= 2 || successCounter >= 3 {
+					if successCounter >= 3 {
+						tunErrorCounter = 0
+					}
+
+					if atomic.LoadInt32(&lastState) != curr {
+						updateIconByState(int(curr))
+						atomic.StoreInt32(&lastState, curr)
+					}
+				}
+			}
+		}
+		// 1 秒巡检一次
+		time.Sleep(1 * time.Second)
+	}
 }
 
 func reloadConfigFile() {
