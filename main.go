@@ -637,121 +637,129 @@ func watchTunState() {
     }
 }
 func checkSystemState() int32 {
-	// 1. 快速进程检查，减少无效 API 请求
-	if !isProcessRunning("mihomo.exe") {
-		return int32(StateStop)
-	}
+    // 1. 进程检查
+    if !isProcessRunning("mihomo.exe") {
+        return int32(StateStop)
+    }
 
-	// 2. 从内核 API 获取实时配置
-	body, err := doAPIRequest("GET", "/configs", nil)
-	if err != nil {
-		return int32(StateStop)
-	}
+    // 2. API 获取
+    body, err := doAPIRequest("GET", "/configs", nil)
+    if err != nil { return int32(StateStop) }
 
-	var currentConf struct {
-		Tun struct {
-			Enable bool `json:"enable"`
-		} `json:"tun"`
-		Mode string `json:"mode"`
-	}
+    var currentConf struct {
+        Tun struct { Enable bool `json:"enable"` } `json:"tun"`
+        Mode string `json:"mode"`
+    }
+    if err := json.Unmarshal(body, &currentConf); err != nil { return int32(StateStop) }
 
-	if err := json.Unmarshal(body, &currentConf); err != nil {
-		return int32(StateStop)
-	}
+    // 3. 读取账本
+    targetTunInIni := getIniConfig("tun_enabled") == "true"
+    targetModeInIni := getIniConfig("mode")
+    targetProxyInIni := getIniConfig("system_proxy_enabled") == "true"
 
-	// 3. 读取本地账本预期
-	targetTunInIni := getIniConfig("tun_enabled") == "true"
-	targetProxyInIni := getIniConfig("system_proxy_enabled") == "true"
+    // 4. 对齐逻辑
+    if atomic.LoadInt32(&isSystemInitializing) == 1 {
+        // 初始化/重载：发现不对立即捅穿中间态，直达目标
+        if currentConf.Tun.Enable != targetTunInIni || (targetModeInIni != "" && currentConf.Mode != targetModeInIni) {
+            go syncConfigToKernel()
+        }
+    } else {
+        // 稳定期：反向同步。增加判断防止重复写入
+        if currentConf.Tun.Enable != targetTunInIni {
+            // 这里建议同步更新一下本地变量，防止下一轮循环又起一个 goroutine
+            go func(enabled bool) {
+                saveIniConfig("tun_enabled", fmt.Sprint(enabled))
+                if mTun != nil {
+                    if enabled { mTun.Check() } else { mTun.Uncheck() }
+                }
+            }(currentConf.Tun.Enable)
+        }
+        if currentConf.Mode != "" && currentConf.Mode != targetModeInIni {
+            newMode := currentConf.Mode
+            go saveIniConfig("mode", newMode)
+        }
+    }
 
-	// 4. 状态对齐逻辑
-	if atomic.LoadInt32(&isSystemInitializing) == 1 {
-		// 【初始化模式】：如果内核跟账本对不上，强制去同步
-		if currentConf.Tun.Enable != targetTunInIni {
-			go syncConfigToKernel()
-		}
-	} else {
-		// 【稳定运行模式】：允许反向同步（内核改写账本）
-		// 使用协程异步写入磁盘，避免阻塞主循环导致 UI 卡顿
-		if currentConf.Tun.Enable != targetTunInIni {
-			go func(enabled bool) {
-				saveIniConfig("tun_enabled", fmt.Sprint(enabled))
-				if mTun != nil {
-					if enabled { mTun.Check() } else { mTun.Uncheck() }
-				}
-			}(currentConf.Tun.Enable)
-		}
-		if currentConf.Mode != "" && currentConf.Mode != getIniConfig("mode") {
-			newMode := currentConf.Mode
-			go saveIniConfig("mode", newMode)
-		}
-	}
-
-	// 5. 【关键修复】：返回值必须优先基于内核 API 的真实状态
-	// 只有内核说开了 TUN，我们才返回 StateTun
-	if currentConf.Tun.Enable {
-		return int32(StateTun)
-	}
-	if targetProxyInIni {
-		return int32(StateProxy)
-	}
-	return int32(StateDefault)
+    // 5. 事实反馈
+    if currentConf.Tun.Enable {
+        return int32(StateTun)
+    }
+    if targetProxyInIni {
+        return int32(StateProxy)
+    }
+    return int32(StateDefault)
 }
 
 func monitorIconState() {
+	var successCounter int
+
 	for {
 		if atomic.LoadInt32(&isReallyExiting) == 1 { return }
 
+		// 1. 最高优先级：进程不在 (零宽容，第一时间 STOP)
 		if !isProcessRunning("mihomo.exe") {
 			tunErrorCounter = 0
+			successCounter = 0
 			if atomic.LoadInt32(&lastState) != int32(StateStop) {
 				updateIconByState(StateStop)
 				atomic.StoreInt32(&lastState, int32(StateStop))
 			}
 		} else {
-			// 获取内核意图
+			// 2. 状态采集
 			curr := checkSystemState()
+			isTunModeInConfig := (getIniConfig("tun_enabled") == "true")
+			isPhysicalLost := (atomic.LoadInt32(&isTunInterfaceCurrentlyAlive) == 0)
 			
-			// 获取物理事实（由 watchTunState 协程滤波后的结果）
-			isPhysicalAlive := (atomic.LoadInt32(&isTunInterfaceCurrentlyAlive) == 1)
+			isInitializing := (atomic.LoadInt32(&isSystemInitializing) == 1)
+			isSyncing := (atomic.LoadInt32(&isSyncing) == 1)
 
-			// 判定 Broken 的条件
-			isBroken := false
-			if curr == int32(StateStop) {
-				isBroken = true
-			} else if curr == int32(StateTun) {
-				// 【核心防闪烁】：只有内核承认自己在跑 TUN，才去校验物理网卡
-				// 如果物理网卡确认为 0，且不在同步中，才判定为 Broken
-				if atomic.LoadInt32(&isSystemInitializing) == 0 &&
-					atomic.LoadInt32(&isSyncing) == 0 &&
-					!isPhysicalAlive {
-					isBroken = true
+			// --- 核心手术：防闪烁拦截 ---
+			// 如果处于启动或同步中，且 API 已经返回了中间态(黄/蓝)，但物理网卡还没出
+			// 我们强制判定为“尚未就绪”，不进入下方的恢复逻辑，从而冻结在“灰色”
+			if (isInitializing || isSyncing) && curr != int32(StateTun) {
+				if isTunModeInConfig {
+					// 这种情况下，我们认为系统还没“恢复”，继续等待
+					goto nextLoop 
 				}
 			}
 
-			// 状态应用
+			// 3. 判定故障 (isBroken)
+			isBroken := (curr == int32(StateStop)) ||
+				(isTunModeInConfig && isPhysicalLost && !isInitializing && !isSyncing)
+
 			if isBroken {
+				successCounter = 0
 				if tunErrorCounter < 5 { tunErrorCounter++ }
-				// 连续 3 次判定 Broken 且 API 还在跑，才变红
+
+				// 连续 3 秒异常才生效 (防抖)
 				if tunErrorCounter > 2 {
-					target := int32(StateError)
-					if curr == int32(StateStop) { target = int32(StateStop) }
-					
-					if atomic.LoadInt32(&lastState) != target {
-						updateIconByState(int(target))
-						atomic.StoreInt32(&lastState, target)
+					targetState := int32(StateError)
+					if curr == int32(StateStop) {
+						targetState = int32(StateStop)
+					}
+
+					if atomic.LoadInt32(&lastState) != targetState {
+						updateIconByState(int(targetState))
+						atomic.StoreInt32(&lastState, targetState)
 					}
 				}
 			} else {
-				// 正常状态：只要不 Broken，立刻跟随 curr 变色，不设延迟
-				tunErrorCounter = 0
-				if atomic.LoadInt32(&lastState) != curr {
-					updateIconByState(int(curr))
-					atomic.StoreInt32(&lastState, curr)
+				// 4. 重置/恢复逻辑
+				successCounter++
+				// 恢复判定：只有连续 3 秒稳定，或者还没变红(Error)前的状态切换
+				if tunErrorCounter <= 2 || successCounter >= 3 {
+					if successCounter >= 3 { tunErrorCounter = 0 }
+
+					if atomic.LoadInt32(&lastState) != curr {
+						updateIconByState(int(curr))
+						atomic.StoreInt32(&lastState, curr)
+					}
 				}
 			}
 		}
-		// 提速到 500ms 巡检一次，UI 反馈更灵敏
-		time.Sleep(500 * time.Millisecond)
+
+	nextLoop:
+		time.Sleep(1 * time.Second)
 	}
 }
 
