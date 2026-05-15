@@ -446,7 +446,7 @@ func onReady() {
         atomic.StoreInt32(&isSystemInitializing, 1)
         atomic.StoreInt32(&hasFirstSynced, 0)
         KillProcessByName("mihomo.exe")
-		sniffAndSolidifyConfig()
+        sniffAndSolidifyConfig()
     })
 
     mReload := mMoreRoot.AddSubMenuItem("重载配置文件", "")
@@ -454,7 +454,7 @@ func onReady() {
         atomic.StoreInt32(&isSystemInitializing, 1)
         sniffAndSolidifyConfig()
         reloadConfigFile()
-		go syncConfigToKernel()
+        atomic.StoreInt32(&hasFirstSynced, 0)
     })
     mEditConfig := mMoreRoot.AddSubMenuItem("编辑 config.yaml", "")
     mEditConfig.Click(func() {
@@ -516,6 +516,7 @@ func onExit() {
 }
 
 func monitorKernelDaemon() {
+    targetTun := getIniConfig("tun_enabled") == "true"
 	target := filepath.Join(baseDir, "mihomo.exe")
 	absBaseDir, _ := filepath.Abs(baseDir)
 	for {
@@ -601,18 +602,14 @@ func checkSystemState() int32 {
 	}
 
 	if err := json.Unmarshal(body, &currentConf); err == nil {
-		// 修补 A: 初始化状态对齐
 		if atomic.LoadInt32(&isSystemInitializing) == 1 {
 			if currentConf.Tun.Enable == targetTun {
-				atomic.StoreInt32(&isSystemInitializing, 0)
 			} else {
 				go syncConfigToKernel()
-				// 这里假设你原本想调用自定义逻辑或直接返回
-				return getState(targetTun, targetProxy) 
+				return getState(targetTun, targetProxy)
 			}
 		}
 
-		// 修补 B: 反写逻辑 (仅在非初始化状态执行)
 		if atomic.LoadInt32(&isSystemInitializing) == 0 {
 			if currentConf.Mode != "" && currentConf.Mode != getIniConfig("mode") {
 				saveIniConfig("mode", currentConf.Mode)
@@ -759,52 +756,52 @@ func watchTunState() {
 }
 
 func syncConfigToKernel() {
-	if !atomic.CompareAndSwapInt32(&isSyncing, 0, 1) {
-		return
-	}
-	defer atomic.StoreInt32(&isSyncing, 0)
+    // 1. 防止并发执行同步
+    if !atomic.CompareAndSwapInt32(&isSyncing, 0, 1) {
+        return
+    }
+    defer atomic.StoreInt32(&isSyncing, 0)
 
-	tunEnabled := getIniConfig("tun_enabled") == "true"
-	var payload interface{}
+    // 2. 实时获取最新配置（确保对齐的准确性）
+    tunEnabled := getIniConfig("tun_enabled") == "true"
+    currentMode := getIniConfig("mode")
+    
+    var payload interface{}
+    // 只要是初始化阶段，我们必须同步全量参数（Mode + Tun）
+    if atomic.LoadInt32(&isSystemInitializing) == 1 {
+        payload = map[string]interface{}{
+            "mode": currentMode,
+            "tun":  map[string]bool{"enable": tunEnabled},
+        }
+    } else {
+        // 普通切换阶段，仅同步 Tun 状态
+        payload = map[string]interface{}{
+            "tun": map[string]bool{"enable": tunEnabled},
+        }
+    }
 
-	if atomic.LoadInt32(&isSystemInitializing) == 1 {
-		timer := time.AfterFunc(10*time.Second, func() {
-			atomic.StoreInt32(&isSystemInitializing, 0)
-		})
-		defer timer.Stop()
+    // 3. 带退避算法的重试（应对内核启动瞬间的 API 繁忙）
+    success := false
+    for i := 0; i < 5; i++ { // 增加到5次，覆盖约5秒的启动窗口
+        _, err := doAPIRequest("PATCH", "/configs", payload)
+        if err == nil {
+            success = true
+            break
+        }
+        // 指数退避：500ms, 1000ms, 1500ms...
+        time.Sleep(time.Duration(i+1) * 500 * time.Millisecond)
+    }
 
-		payload = map[string]interface{}{
-			"mode": getIniConfig("mode"),
-			"tun":  map[string]bool{"enable": tunEnabled},
-		}
-	} else {
-		payload = map[string]interface{}{
-			"tun": map[string]bool{"enable": tunEnabled},
-		}
-	}
+    // 4. 同步成功后的处理
+    if success {
+        // 更新 UI 勾选状态
+        if mTun != nil {
+            if tunEnabled { mTun.Check() } else { mTun.Uncheck() }
+        }
 
-	success := false
-	for i := 0; i < 3; i++ {
-		_, err := doAPIRequest("PATCH", "/configs", payload)
-		if err == nil {
-			success = true
-			break
-		}
-		time.Sleep(time.Duration(i+1) * 500 * time.Millisecond)
-	}
-
-	if success {
-		if mTun != nil {
-			if tunEnabled {
-				mTun.Check()
-			} else {
-				mTun.Uncheck()
-			}
-		}
-		time.Sleep(500 * time.Millisecond)
-	}
-
-	atomic.StoreInt32(&isSystemInitializing, 0)
+        atomic.StoreInt32(&isSystemInitializing, 0)
+        time.Sleep(200 * time.Millisecond)
+    }
 }
 
 func doAPIRequest(method, path string, payload interface{}) ([]byte, error) {
@@ -1089,17 +1086,14 @@ func toggleAutoStart(enable bool) {
 }
 
 func reloadConfigFile() {
-    atomic.StoreInt32(&isSystemInitializing, 1)
-
-    _, err := doAPIRequest("PUT", "/configs?force=false", map[string]string{
+    payload := map[string]string{
         "path": filepath.Join(baseDir, "config.yaml"),
-    })
-
+    }    
+    _, err := doAPIRequest("PUT", "/configs?force=false", payload)
+    
     if err != nil {
         atomic.StoreInt32(&isSystemInitializing, 0)
-        return
     }
-    go syncConfigToKernel()
 }
 
 func isAdmin() bool {
