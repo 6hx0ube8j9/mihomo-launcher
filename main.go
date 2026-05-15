@@ -62,6 +62,7 @@ var (
     manualUpdateTrigger  int32
     isReallyExiting      int32 
 	lastClickTime        int64
+	isTunInterfaceCurrentlyAlive int32
 
     // --- 4. 流程控制与计数 ---
     exitOnce        sync.Once
@@ -565,133 +566,12 @@ func monitorKernelDaemon() {
 	}
 }
 
-func checkSystemState() int32 {
-	// 1. 获取配置快照
-	targetTun := getIniConfig("tun_enabled") == "true"
-	targetProxy := getIniConfig("system_proxy_enabled") == "true"
-
-	// 定义统一的返回逻辑
-	getState := func(tun, proxy bool) int32 {
-		if tun { return int32(StateTun) }
-		if proxy { return int32(StateProxy) }
-		return int32(StateDefault)
-	}
-
-	// 2. 获取实时状态
-	body, err := doAPIRequest("GET", "/configs", nil)
-	if err != nil {
-		if !isProcessRunning("mihomo.exe") {
-			atomic.StoreInt32(&isKernelActive, 0)
-			return int32(StateStop)
-		}
-		return getState(targetTun, targetProxy)
-	}
-
-	// 首次同步
-	if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
-		atomic.StoreInt32(&isKernelActive, 1)
-		go syncConfigToKernel()
-	}
-
-	var currentConf struct {
-		Tun struct {
-			Enable bool `json:"enable"`
-		} `json:"tun"`
-		Mode string `json:"mode"`
-	}
-
-	if err := json.Unmarshal(body, &currentConf); err == nil {
-		if atomic.LoadInt32(&isSystemInitializing) == 1 {
-			if currentConf.Tun.Enable == targetTun {
-			} else {
-				go syncConfigToKernel()
-				return getState(targetTun, targetProxy)
-			}
-		}
-
-		if atomic.LoadInt32(&isSystemInitializing) == 0 {
-			if currentConf.Mode != "" && currentConf.Mode != getIniConfig("mode") {
-				saveIniConfig("mode", currentConf.Mode)
-			}
-			if currentConf.Tun.Enable != targetTun {
-				saveIniConfig("tun_enabled", fmt.Sprint(currentConf.Tun.Enable))
-				targetTun = currentConf.Tun.Enable
-				if mTun != nil {
-					if targetTun { mTun.Check() } else { mTun.Uncheck() }
-				}
-			}
-		}
-	}
-
-	return getState(targetTun, targetProxy)
-} 
-
-func monitorIconState() {
-	var successCounter int 
-
-	for {
-		if atomic.LoadInt32(&isReallyExiting) == 1 { return }
-
-		if !isProcessRunning("mihomo.exe") {
-			tunErrorCounter = 0
-			successCounter = 0
-			if atomic.LoadInt32(&lastState) != int32(StateStop) {
-				updateIconByState(StateStop)
-				atomic.StoreInt32(&lastState, int32(StateStop))
-			}
-		} else {
-			curr := checkSystemState() 
-			isTunMode := (getIniConfig("tun_enabled") == "true")
-			hasTun := true
-			if isTunMode && atomic.LoadInt32(&isSystemInitializing) == 0 {
-				hasTun = false
-				if ifaces, err := net.Interfaces(); err == nil {
-					for _, i := range ifaces {
-						if isTunInterfaceMatch(i.Name) {
-							hasTun = true
-							break
-						}
-					}
-				}
-			}
-			isBroken := (curr == int32(StateStop)) || (isTunMode && !hasTun)
-
-			if isBroken {
-				successCounter = 0 
-				
-				if tunErrorCounter < 5 { tunErrorCounter++ }
-				if tunErrorCounter > 2 {
-					targetState := int32(StateError)
-					if curr == int32(StateStop) {
-						targetState = int32(StateStop)
-					}
-					if atomic.LoadInt32(&lastState) != targetState {
-						updateIconByState(int(targetState))
-						atomic.StoreInt32(&lastState, targetState)
-					}
-				}
-			} else {
-				successCounter++
-				if tunErrorCounter <= 2 || successCounter >= 3 {
-					if successCounter >= 3 { tunErrorCounter = 0 }
-					
-					if atomic.LoadInt32(&lastState) != curr {
-						updateIconByState(int(curr))
-						atomic.StoreInt32(&lastState, curr)
-					}
-				}
-			}
-		}
-		time.Sleep(1 * time.Second)
-	}
-}
-
 func watchTunState() {
     ticker := time.NewTicker(3 * time.Second)
     defer ticker.Stop()
 
     var lastHasTun bool
-    // 初始状态采样
+	
     ifaces, _ := net.Interfaces()
     for _, i := range ifaces {
         if isTunInterfaceMatch(i.Name) {
@@ -699,22 +579,23 @@ func watchTunState() {
             break
         }
     }
+	
+    if lastHasTun {
+        atomic.StoreInt32(&isTunInterfaceCurrentlyAlive, 1)
+    } else {
+        atomic.StoreInt32(&isTunInterfaceCurrentlyAlive, 0)
+    }
 
-    // 新增：连续一致计数器，用于防抖
     confirmCount := 0
-
     for {
         select {
         case <-ticker.C:
             if atomic.LoadInt32(&isReallyExiting) == 1 { return }
-
-            // 1. 严格锁定：系统初始化或同步中，不仅跳过，还要重置计数器
             if atomic.LoadInt32(&isSystemInitializing) == 1 || atomic.LoadInt32(&isSyncing) == 1 {
-                confirmCount = 0 
+                confirmCount = 0
                 continue
             }
 
-            // 2. 检查当前网卡
             currentHasTun := false
             currentIfaces, err := net.Interfaces()
             if err != nil { continue }
@@ -724,33 +605,128 @@ func watchTunState() {
                     break
                 }
             }
-
-            // 3. 状态变化判定逻辑
             if currentHasTun != lastHasTun {
                 confirmCount++
-                // 只有连续 2 次（约 6 秒）状态稳定变化，才认为是真的变了
                 if confirmCount >= 2 {
-                    if atomic.LoadInt32(&isKernelActive) == 1 {
-                        lastHasTun = currentHasTun
-                        confirmCount = 0 // 重置计数
-                        
-                        // --- 严格化修改：不要在这里 saveIniConfig ---
-                        // 让 checkSystemState 自动去对齐 API 状态和 UI
-                        newState := checkSystemState() 
-                        
-                        updateIconByState(int(newState))
-                        atomic.StoreInt32(&lastState, newState)
-                        
-                        if mTun != nil {
-                            if currentHasTun { mTun.Check() } else { mTun.Uncheck() }
-                        }
+                    lastHasTun = currentHasTun
+                    confirmCount = 0
+                    if currentHasTun {
+                        atomic.StoreInt32(&isTunInterfaceCurrentlyAlive, 1)
+                    } else {
+                        atomic.StoreInt32(&isTunInterfaceCurrentlyAlive, 0)
                     }
+                    atomic.StoreInt32(&hasFirstSynced, 1)
                 }
             } else {
-                // 状态回到了原点，清空确认计数
                 confirmCount = 0
             }
         }
+    }
+}
+
+func checkSystemState() int32 {
+    targetTun := getIniConfig("tun_enabled") == "true"
+    targetProxy := getIniConfig("system_proxy_enabled") == "true"
+
+    getState := func(tun, proxy bool) int32 {
+        if tun { return int32(StateTun) }
+        if proxy { return int32(StateProxy) }
+        return int32(StateDefault)
+    }
+
+    body, err := doAPIRequest("GET", "/configs", nil)
+    if err != nil {
+        if !isProcessRunning("mihomo.exe") {
+            atomic.StoreInt32(&isKernelActive, 0)
+            return int32(StateStop)
+        }
+        return getState(targetTun, targetProxy)
+    }
+
+    if atomic.CompareAndSwapInt32(&hasFirstSynced, 0, 1) {
+        atomic.StoreInt32(&isKernelActive, 1)
+        go syncConfigToKernel()
+    }
+
+    var currentConf struct {
+        Tun struct {
+            Enable bool `json:"enable"`
+        } `json:"tun"`
+        Mode string `json:"mode"`
+    }
+
+    if err := json.Unmarshal(body, &currentConf); err == nil {
+        if atomic.LoadInt32(&isSystemInitializing) == 1 {
+            if currentConf.Tun.Enable != targetTun {
+                go syncConfigToKernel()
+                return getState(targetTun, targetProxy)
+            }
+        }
+
+        if atomic.LoadInt32(&isSystemInitializing) == 0 {
+            if currentConf.Mode != "" && currentConf.Mode != getIniConfig("mode") {
+                saveIniConfig("mode", currentConf.Mode)
+            }
+
+            if currentConf.Tun.Enable != targetTun {
+                saveIniConfig("tun_enabled", fmt.Sprint(currentConf.Tun.Enable))
+                targetTun = currentConf.Tun.Enable
+                if mTun != nil {
+                    if targetTun { mTun.Check() } else { mTun.Uncheck() }
+                }
+            }
+        }
+    }
+	
+    return getState(targetTun, targetProxy)
+}
+
+func monitorIconState() {
+    var successCounter int 
+
+    for {
+        if atomic.LoadInt32(&isReallyExiting) == 1 { return }
+        if !isProcessRunning("mihomo.exe") {
+            tunErrorCounter = 0
+            successCounter = 0
+            if atomic.LoadInt32(&lastState) != int32(StateStop) {
+                updateIconByState(StateStop)
+                atomic.StoreInt32(&lastState, int32(StateStop))
+            }
+        } else {
+            curr := checkSystemState() 
+            isTunMode := (getIniConfig("tun_enabled") == "true")
+            isPhysicalLost := (atomic.LoadInt32(&isTunInterfaceCurrentlyAlive) == 0)
+            isBroken := (curr == int32(StateStop)) || 
+                        (isTunMode && isPhysicalLost && atomic.LoadInt32(&isSystemInitializing) == 0)
+
+            if isBroken {
+                successCounter = 0 
+                if tunErrorCounter < 5 { tunErrorCounter++ }
+                if tunErrorCounter > 2 {
+                    targetState := int32(StateError)
+                    if curr == int32(StateStop) {
+                        targetState = int32(StateStop)
+                    }
+
+                    if atomic.LoadInt32(&lastState) != targetState {
+                        updateIconByState(int(targetState))
+                        atomic.StoreInt32(&lastState, targetState)
+                    }
+                }
+            } else {
+                successCounter++
+                if tunErrorCounter <= 2 || successCounter >= 3 {
+                    if successCounter >= 3 { tunErrorCounter = 0 }
+                    
+                    if atomic.LoadInt32(&lastState) != curr {
+                        updateIconByState(int(curr))
+                        atomic.StoreInt32(&lastState, curr)
+                    }
+                }
+            }
+        }
+        time.Sleep(1 * time.Second)
     }
 }
 
@@ -1085,14 +1061,15 @@ func toggleAutoStart(enable bool) {
 }
 
 func reloadConfigFile() {
+    atomic.StoreInt32(&isSystemInitializing, 1)
     payload := map[string]string{
         "path": filepath.Join(baseDir, "config.yaml"),
     }    
-    _, err := doAPIRequest("PUT", "/configs?force=false", payload)
-    
-    if err != nil {
+    _, err := doAPIRequest("PUT", "/configs?force=false", payload)    
+    go func() {
+        time.Sleep(1 * time.Second)
         atomic.StoreInt32(&isSystemInitializing, 0)
-    }
+    }()
 }
 
 func isAdmin() bool {
