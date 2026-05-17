@@ -1087,37 +1087,29 @@ func setTunMode(enable bool) {
 }
 
 func setProxyRegistry(enable bool) {
-	if atomic.LoadInt32(&isReallyExiting) == 1 { return }
-	
-	saveIniConfig("system_proxy_enabled", fmt.Sprint(enable))
-	
-	// 修改注册表逻辑保持...
-	key, err := registry.OpenKey(registry.CURRENT_USER, `Software\Microsoft\Windows\CurrentVersion\Internet Settings`, registry.SET_VALUE)
-	if err == nil {
-		defer key.Close()
-		if enable {
-			_ = key.SetDWordValue("ProxyEnable", 1)
-			_ = key.SetStringValue("ProxyServer", getIniConfig("proxy_address"))
-		} else {
-			_ = key.SetDWordValue("ProxyEnable", 0)
-		}
+	if atomic.LoadInt32(&isReallyExiting) != 1 {
+		saveIniConfig("system_proxy_enabled", fmt.Sprint(enable))
 	}
 
-	// 1. 异步刷新网络栈
-	go func() {
-		wininet := windows.NewLazySystemDLL("wininet.dll")
-		setOption := wininet.NewProc("InternetSetOptionW")
-		setOption.Call(0, 39, 0, 0)
-		setOption.Call(0, 37, 0, 0)
-	}()
+	key, err := registry.OpenKey(registry.CURRENT_USER, REG_PROXY, registry.SET_VALUE)
+	if err != nil {
+		return
+	}
+	defer key.Close()
 
-	// 2. 立即同步 UI 状态
-	go func() {
-		time.Sleep(50 * time.Millisecond) // 留给磁盘 IO 一点时间
-		curr := checkSystemState()
-		updateIconByState(int(curr))
-		atomic.StoreInt32(&lastState, int32(curr))
-	}()
+	if enable {
+		_ = key.SetDWordValue("ProxyEnable", 1)
+		_ = key.SetStringValue("ProxyServer", getIniConfig("proxy_address"))
+	} else {
+		_ = key.SetDWordValue("ProxyEnable", 0)
+	}
+
+	key.Close()
+
+	wininet := windows.NewLazySystemDLL("wininet.dll")
+	setOption := wininet.NewProc("InternetSetOptionW")
+	_, _, _ = setOption.Call(0, 39, 0, 0)
+	_, _, _ = setOption.Call(0, 37, 0, 0)
 }
 
 func toggleAutoStart(enable bool) {
