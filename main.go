@@ -181,18 +181,22 @@ func main() {
 	onExit()
 }
 func focusWindowSilky(targetHwnd uintptr) {
+	// 1. 原子锁控制，防止短时间内多次触发导致置顶冲突
 	if !atomic.CompareAndSwapInt32(&isFocusing, 0, 1) {
 		return
 	}
 	defer atomic.StoreInt32(&isFocusing, 0)
 
+	// 获取当前、前台以及目标窗口的线程 ID
 	currT, _, _ := procGetCurrentThread.Call()
 	foreH, _, _ := procGetForeground.Call()
 	foreT, _, _ := procGetWindowThread.Call(foreH, 0)
 	targT, _, _ := procGetWindowThread.Call(targetHwnd, 0)
 
-	procKeybdEvent.Call(0x12, 0, 0, 0)
+	// 2. 模拟 Alt 键按下（黑魔法前置）：提前向系统高呼“有键盘输入事件”，偷取 Windows 前台焦点控制权
+	procKeybdEvent.Call(0x12, 0, 0, 0) // Alt down
 
+	// 3. 线程关联：让当前进程拥有前台权限（增加防崩溃安全判定）
 	if foreT != currT && foreT != 0 {
 		procAttachThread.Call(foreT, currT, 1)
 	}
@@ -200,16 +204,23 @@ func focusWindowSilky(targetHwnd uintptr) {
 		procAttachThread.Call(currT, targT, 1)
 	}
 
-	procShowWindow.Call(targetHwnd, 9) // 9 = SW_RESTORE
+	// 4. 强行恢复可能处于最小化状态的窗口 (9 = SW_RESTORE)
+	procShowWindow.Call(targetHwnd, 9)
 
+	// 5. 穿透多进程内核补刀：利用 SwitchToThisWindow 直接激活最底层的多进程 shell 外壳
 	winuser := windows.NewLazySystemDLL("user32.dll")
 	switchToThisWindow := winuser.NewProc("SwitchToThisWindow")
 	_, _, _ = switchToThisWindow.Call(targetHwnd, 1)
 
+	// 6. 执行窗口唤醒组合拳
 	procSetForeground.Call(targetHwnd)
 	procBringToTop.Call(targetHwnd)
-	procSetWindowPos.Call(targetHwnd, -1, 0, 0, 0, 0, 0x0040|0x0002|0x0001) // HWND_TOPMOST, SWP_SHOWWINDOW|SWP_NOMOVE|SWP_NOSIZE
+	
+	// ⚡ 方案 A 修复：在 64 位环境下，-1 的十六进制补码为 0xFFFFFFFFFFFFFFFF (HWND_TOPMOST)
+	// (0x0040|0x0002|0x0001 代表 SWP_SHOWWINDOW|SWP_NOMOVE|SWP_NOSIZE)
+	procSetWindowPos.Call(targetHwnd, uintptr(0xFFFFFFFFFFFFFFFF), 0, 0, 0, 0, 0x0040|0x0002|0x0001)
 
+	// 7. 解除线程关联
 	if targT != 0 && targT != currT {
 		procAttachThread.Call(currT, targT, 0)
 	}
@@ -217,10 +228,13 @@ func focusWindowSilky(targetHwnd uintptr) {
 		procAttachThread.Call(foreT, currT, 0)
 	}
 
-	procKeybdEvent.Call(0x12, 0, 2, 0)
+	// 8. 释放 Alt 键
+	procKeybdEvent.Call(0x12, 0, 2, 0) // Alt up
 
+	// 9. 延时 400 毫秒恢复普通层级，允许用户切走，不做流氓置顶
 	time.AfterFunc(400*time.Millisecond, func() {
-		procSetWindowPos.Call(targetHwnd, -2, 0, 0, 0, 0, 0x0040|0x0002|0x0001) // HWND_NOTOPMOST
+		// ⚡ 方案 A 修复：在 64 位环境下，-2 的十六进制补码为 0xFFFFFFFFFFFFFFFE (HWND_NOTOPMOST)
+		procSetWindowPos.Call(targetHwnd, uintptr(0xFFFFFFFFFFFFFFFE), 0, 0, 0, 0, 0x0040|0x0002|0x0001)
 	})
 }
 
