@@ -359,7 +359,7 @@ func launchWebUI() {
 	}
 
 	if browserPath != "" {
-		userDataDir := filepath.Join(baseDir, "WebCache")
+		userDataDir := filepath.Join(baseDir, "webcache")
 		_ = os.MkdirAll(userDataDir, 0755)
 
 		args := []string{
