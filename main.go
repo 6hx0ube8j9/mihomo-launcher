@@ -91,7 +91,7 @@ var (
     procBringToTop       = u32.NewProc("BringWindowToTop")
     procGetForeground    = u32.NewProc("GetForegroundWindow")
     procAttachThread     = u32.NewProc("AttachThreadInput")
-	procGetCurrentThread = func() uint32 { return windows.GetCurrentThreadId() }
+	procGetCurrentThread = k32.NewProc("GetCurrentThreadId")
 
     // 辅助模拟输入
     procKeybdEvent = u32.NewProc("keybd_event")
