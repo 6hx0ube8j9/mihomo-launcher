@@ -91,7 +91,7 @@ var (
     procBringToTop       = u32.NewProc("BringWindowToTop")
     procGetForeground    = u32.NewProc("GetForegroundWindow")
     procAttachThread     = u32.NewProc("AttachThreadInput")
-	procGetCurrentThread = k32.NewProc("GetCurrentThreadId")
+	procGetCurrentThread = func() uint32 { return windows.GetCurrentThreadId() }
 
     // 辅助模拟输入
     procKeybdEvent = u32.NewProc("keybd_event")
@@ -209,43 +209,62 @@ func main() {
 }
 
 func focusWindowSilky(targetHwnd uintptr) {
-    if !atomic.CompareAndSwapInt32(&isFocusing, 0, 1) {
-        return
-    }
-    defer atomic.StoreInt32(&isFocusing, 0)
+	// 1. 原子锁控制，防止短时间内多次触发导致置顶冲突
+	if !atomic.CompareAndSwapInt32(&isFocusing, 0, 1) {
+		return
+	}
+	defer atomic.StoreInt32(&isFocusing, 0)
 
-    // 统一转换为系统级调用，接收 r1 并将其转为 uint32 线程 ID
-    r1, _, _ := procGetCurrentThread.Call()
-    currT    := uint32(r1)
-    
-    foreH, _, _ := procGetForeground.Call()
-    r2, _, _    := procGetWindowThread.Call(foreH, 0)
-    foreT       := uint32(r2)
-    
-    r3, _, _    := procGetWindowThread.Call(targetHwnd, 0)
-    targT       := uint32(r3)
+	// 获取当前、前台以及目标窗口的线程 ID
+	currT := uint32(procGetCurrentThread()) // 明确转换为 uint32 基础类型
+	
+	foreH, _, _ := procGetForeground.Call()
+	var foreT uint32
+	if foreH != 0 {
+		r1, _, _ := procGetWindowThread.Call(foreH, 0)
+		foreT = uint32(r1)
+	}
 
-    if foreT != currT {
-        procAttachThread.Call(uintptr(foreT), uintptr(currT), 1)
-    }
-    procAttachThread.Call(uintptr(currT), uintptr(targT), 1)
+	r2, _, _ := procGetWindowThread.Call(targetHwnd, 0)
+	targT := uint32(r2)
 
-    procShowWindow.Call(targetHwnd, SW_RESTORE)
-    procSetForeground.Call(targetHwnd)
-    procBringToTop.Call(targetHwnd)
-    procSetWindowPos.Call(targetHwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_SILKY)
+	// 【防御性加固】：如果目标窗口的线程就是当前线程，或者目标线程获取失败(0)，无需且不能执行 Attach
+	needAttachFore := foreT != 0 && foreT != currT
+	needAttachTarg := targT != 0 && targT != currT
 
-    procAttachThread.Call(uintptr(currT), uintptr(targT), 0)
-    if foreT != currT {
-        procAttachThread.Call(uintptr(foreT), uintptr(currT), 0)
-    }
+	// 2. 线程关联（黑魔法）：让当前进程拥有前台权限
+	// 【核心修复】：所有的线程 ID 作为参数传给 .Call 时，必须全部显式转换为 uintptr！
+	if needAttachFore {
+		_, _, _ = procAttachThread.Call(uintptr(foreT), uintptr(currT), 1)
+	}
+	if needAttachTarg {
+		_, _, _ = procAttachThread.Call(uintptr(currT), uintptr(targT), 1)
+	}
 
-    procKeybdEvent.Call(0x12, 0, 0, 0) 
-    procKeybdEvent.Call(0x12, 0, 2, 0) 
+	// 3. 执行窗口唤醒组合拳
+	_, _, _ = procShowWindow.Call(targetHwnd, SW_RESTORE)
+	_, _, _ = procSetForeground.Call(targetHwnd)
+	_, _, _ = procBringToTop.Call(targetHwnd)
+	
+	// 物理置顶：设置为 HWND_TOPMOST
+	_, _, _ = procSetWindowPos.Call(targetHwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_SILKY)
 
-    time.AfterFunc(400*time.Millisecond, func() {
-        procSetWindowPos.Call(targetHwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_SILKY)
-    })
+	// 4. 解除线程关联 (用之前的布尔状态标记，确保进出严格对称，防止解除失败)
+	if needAttachTarg {
+		_, _, _ = procAttachThread.Call(uintptr(currT), uintptr(targT), 0)
+	}
+	if needAttachFore {
+		_, _, _ = procAttachThread.Call(uintptr(foreT), uintptr(currT), 0)
+	}
+
+	// 5. 模拟 Alt 键：强制 Windows 刷新输入焦点到目标窗口
+	_, _, _ = procKeybdEvent.Call(0x12, 0, 0, 0) // Alt down
+	_, _, _ = procKeybdEvent.Call(0x12, 0, 2, 0) // Alt up
+
+	// 6. 延时解除物理置顶，防止窗口“流氓”，允许用户切走
+	time.AfterFunc(400*time.Millisecond, func() {
+		_, _, _ = procSetWindowPos.Call(targetHwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_SILKY)
+	})
 }
 
 func launchWebUI() {
