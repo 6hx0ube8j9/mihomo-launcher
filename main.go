@@ -209,42 +209,40 @@ func main() {
 }
 
 func focusWindowSilky(targetHwnd uintptr) {
-    // 1. 原子锁控制，防止短时间内多次触发导致置顶冲突
     if !atomic.CompareAndSwapInt32(&isFocusing, 0, 1) {
         return
     }
     defer atomic.StoreInt32(&isFocusing, 0)
 
-    // 获取当前、前台以及目标窗口的线程 ID
-    currT, _, _ := procGetCurrentThread.Call()
+    // 统一转换为系统级调用，接收 r1 并将其转为 uint32 线程 ID
+    r1, _, _ := procGetCurrentThread.Call()
+    currT    := uint32(r1)
+    
     foreH, _, _ := procGetForeground.Call()
-    foreT, _, _ := procGetWindowThread.Call(foreH, 0)
-    targT, _, _ := procGetWindowThread.Call(targetHwnd, 0)
+    r2, _, _    := procGetWindowThread.Call(foreH, 0)
+    foreT       := uint32(r2)
+    
+    r3, _, _    := procGetWindowThread.Call(targetHwnd, 0)
+    targT       := uint32(r3)
 
-    // 2. 线程关联（黑魔法）：让当前进程拥有前台权限
     if foreT != currT {
-        procAttachThread.Call(foreT, currT, 1)
+        procAttachThread.Call(uintptr(foreT), uintptr(currT), 1)
     }
-    procAttachThread.Call(currT, targT, 1)
+    procAttachThread.Call(uintptr(currT), uintptr(targT), 1)
 
-    // 3. 执行窗口唤醒组合拳
     procShowWindow.Call(targetHwnd, SW_RESTORE)
     procSetForeground.Call(targetHwnd)
     procBringToTop.Call(targetHwnd)
-    // 物理置顶：设置为 HWND_TOPMOST
     procSetWindowPos.Call(targetHwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_SILKY)
 
-    // 4. 解除线程关联
-    procAttachThread.Call(currT, targT, 0)
+    procAttachThread.Call(uintptr(currT), uintptr(targT), 0)
     if foreT != currT {
-        procAttachThread.Call(foreT, currT, 0)
+        procAttachThread.Call(uintptr(foreT), uintptr(currT), 0)
     }
 
-    // 5. 模拟 Alt 键：强制 Windows 刷新输入焦点到目标窗口
-    procKeybdEvent.Call(0x12, 0, 0, 0) // Alt down
-    procKeybdEvent.Call(0x12, 0, 2, 0) // Alt up
+    procKeybdEvent.Call(0x12, 0, 0, 0) 
+    procKeybdEvent.Call(0x12, 0, 2, 0) 
 
-    // 6. 延时解除物理置顶，防止窗口“流氓”，允许用户切走
     time.AfterFunc(400*time.Millisecond, func() {
         procSetWindowPos.Call(targetHwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_SILKY)
     })
