@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -254,25 +255,62 @@ func launchWebUI() {
                 pURL, _ := t["url"].(string)
                 if strings.Contains(pURL, "/ui/") || strings.Contains(pURL, "setup") {
                     id, _ := t["id"].(string)
-                    client.Get(fmt.Sprintf("http://127.0.0.1:%s/json/activate/%s", debugPort, id))
-                    
+                    client.Get(fmt.Sprintf("http://127.0.0.1:%s/json/activate/%s", debugPort, id))                    
                     go func() {
-                        time.Sleep(100 * time.Millisecond)
-                        var targetHwnd uintptr
-                        procEnumWindows.Call(windows.NewCallback(func(hwnd uintptr, _ uintptr) uintptr {
-                            var buf [256]uint16
-                            procGetClassName.Call(hwnd, uintptr(unsafe.Pointer(&buf[0])), 256)
-                            if windows.UTF16ToString(buf[:]) == "Chrome_WidgetWin_1" {
-                                if vis, _, _ := procIsWindowVisible.Call(hwnd); vis != 0 {
-                                    targetHwnd = hwnd
-                                    return 0 
-                                }
-                            }
-                            return 1
-                        }), 0)
-                        if targetHwnd != 0 { focusWindowSilky(targetHwnd) }
-                    }()
-                    return 
+						// 1. 稍微延长一点等待时间（从100ms改到200ms），确保 CDP 激活和窗口映射完成
+						time.Sleep(200 * time.Millisecond) 
+						
+						var targetPid uint32
+						// 2. 动态获取当前监听 debugPort 的进程 PID
+						cmdText := fmt.Sprintf("for /f \"tokens=5\" %%a in ('netstat -aon ^| findstr :%s ^| findstr LISTENING') do @echo %%a", debugPort)
+						out, err := exec.Command("cmd", "/c", cmdText).Output()
+						if err == nil {
+							pidStr := strings.TrimSpace(string(out))
+							// 兼容可能有多行输出的情况，只取第一行
+							if lines := strings.Split(pidStr, "\n"); len(lines) > 0 {
+								pidStr = strings.TrimSpace(lines[0])
+							}
+							if pid, err := strconv.Atoi(pidStr); err == nil {
+								targetPid = uint32(pid)
+							}
+						}
+
+						// 如果没有拿到有效的 PID，则不处理（防止误伤其他 Edge 窗口）
+						if targetPid == 0 {
+							return
+						}
+
+						// 3. 开始精准遍历窗口
+						var targetHwnd uintptr
+						procGetWindowThreadProcessId := windows.NewLazySystemDLL("user32.dll").NewProc("GetWindowThreadProcessId")
+
+						procEnumWindows.Call(windows.NewCallback(func(hwnd uintptr, _ uintptr) uintptr {
+							var buf [256]uint16
+							procGetClassName.Call(hwnd, uintptr(unsafe.Pointer(&buf[0])), 256)
+							
+							if windows.UTF16ToString(buf[:]) == "Chrome_WidgetWin_1" {
+								if vis, _, _ := procIsWindowVisible.Call(hwnd); vis != 0 {
+									
+									// 【核心修复】：获取当前遍历到的窗口所属的进程 PID
+									var windowPid uint32
+									procGetWindowThreadProcessId.Call(hwnd, uintptr(unsafe.Pointer(&windowPid)))
+									
+									// 只有窗口 PID 和监听端口的 PID 完全一致，才是我们要置顶的那个独立 UI
+									if windowPid == targetPid {
+										targetHwnd = hwnd
+										return 0 // 找到了，立即停止遍历
+									}
+								}
+							}
+							return 1 // 继续寻找
+						}), 0)
+						
+						// 4. 精准唤醒与置顶
+						if targetHwnd != 0 { 
+							focusWindowSilky(targetHwnd) 
+						}
+					}()
+					return
                 }
             }
         }
