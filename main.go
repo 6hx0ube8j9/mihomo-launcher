@@ -257,33 +257,15 @@ func launchWebUI() {
                     id, _ := t["id"].(string)
                     client.Get(fmt.Sprintf("http://127.0.0.1:%s/json/activate/%s", debugPort, id))                    
                     go func() {
-						// 1. 稍微延长一点等待时间（从100ms改到200ms），确保 CDP 激活和窗口映射完成
-						time.Sleep(200 * time.Millisecond) 
+						// 1. 稍微等待，确保 CDP 激活指令生效
+						time.Sleep(150 * time.Millisecond) 
 						
-						var targetPid uint32
-						// 2. 动态获取当前监听 debugPort 的进程 PID
-						cmdText := fmt.Sprintf("for /f \"tokens=5\" %%a in ('netstat -aon ^| findstr :%s ^| findstr LISTENING') do @echo %%a", debugPort)
-						out, err := exec.Command("cmd", "/c", cmdText).Output()
-						if err == nil {
-							pidStr := strings.TrimSpace(string(out))
-							// 兼容可能有多行输出的情况，只取第一行
-							if lines := strings.Split(pidStr, "\n"); len(lines) > 0 {
-								pidStr = strings.TrimSpace(lines[0])
-							}
-							if pid, err := strconv.Atoi(pidStr); err == nil {
-								targetPid = uint32(pid)
-							}
-						}
-
-						// 如果没有拿到有效的 PID，则不处理（防止误伤其他 Edge 窗口）
-						if targetPid == 0 {
-							return
-						}
-
-						// 3. 开始精准遍历窗口
 						var targetHwnd uintptr
 						procGetWindowThreadProcessId := windows.NewLazySystemDLL("user32.dll").NewProc("GetWindowThreadProcessId")
-
+						procGetWindowModuleFileName := windows.NewLazySystemDLL("user32.dll").NewProc("GetWindowModuleFileNameW")
+						
+						// 获取当前托盘程序自己的 PID（用来做对比，或者如果拉起过 cmd 也可以用 cmd.Process.Pid）
+						// 但这里我们用一个更巧妙、完全不弹黑框的办法：直接过滤掉真正的 "msedge.exe" 或普通窗口
 						procEnumWindows.Call(windows.NewCallback(func(hwnd uintptr, _ uintptr) uintptr {
 							var buf [256]uint16
 							procGetClassName.Call(hwnd, uintptr(unsafe.Pointer(&buf[0])), 256)
@@ -291,18 +273,55 @@ func launchWebUI() {
 							if windows.UTF16ToString(buf[:]) == "Chrome_WidgetWin_1" {
 								if vis, _, _ := procIsWindowVisible.Call(hwnd); vis != 0 {
 									
-									// 【核心修复】：获取当前遍历到的窗口所属的进程 PID
-									var windowPid uint32
-									procGetWindowThreadProcessId.Call(hwnd, uintptr(unsafe.Pointer(&windowPid)))
+									// 检查窗口的标题（防止把普通 edge 错当成目标）
+									var titleBuf [512]uint16
+									textLen, _, _ := windows.NewLazySystemDLL("user32.dll").NewProc("GetWindowTextW").Call(hwnd, uintptr(unsafe.Pointer(&titleBuf[0])), 512)
+									title := windows.UTF16ToString(titleBuf[:textLen])
 									
-									// 只有窗口 PID 和监听端口的 PID 完全一致，才是我们要置顶的那个独立 UI
-									if windowPid == targetPid {
-										targetHwnd = hwnd
-										return 0 // 找到了，立即停止遍历
+									// 【核心过滤逻辑】：
+									// 1. 排除普通 Edge 浏览器的特征标题
+									// 2. 独立的 -app 窗口标题是纯网页标题，不会带 " - Microsoft Edge" 
+									if strings.Contains(title, " - Microsoft Edge") || title == "新标签页" || title == "" {
+										return 1 // 这是普通的 Edge 窗口，跳过！
 									}
+									
+									// 找到了符合特征的独立 -app 窗口
+									targetHwnd = hwnd
+									return 0 // 停止遍历
 								}
 							}
-							return 1 // 继续寻找
+							return 1
+						}), 0)
+						
+						// 2. 强行突破 Windows 焦点锁定限制（完美解决不最小化弹不出来的问题）
+						if targetHwnd != 0 {
+							user32 := windows.NewLazySystemDLL("user32.dll")
+							procShowWindow := user32.NewProc("ShowWindow")
+							procSetForegroundWindow := user32.NewProc("SetForegroundWindow")
+							procBringToFront := user32.NewProc("BringWindowToTop")
+							
+							// 无论窗口当前是最小化、在后台、还是被挡住，先执行恢复显示
+							// SW_RESTORE = 9, SW_SHOW = 5
+							procShowWindow.Call(targetHwnd, 9) 
+							
+							// 【黑科技组合拳】：Windows 允许当前处于前台的输入法或键盘激活者切换窗口。
+							// 我们可以通过模拟按下一次 ALT 键，欺骗系统解除 Foreground Lockout 限制
+							procKeybdEvent := user32.NewProc("keybd_event")
+							// 模拟按下 ALT (0x12)
+							procKeybdEvent.Call(0x12, 0, 0, 0)
+							
+							// 强行设置前台
+							procSetForegroundWindow.Call(targetHwnd)
+							procBringToFront.Call(targetHwnd)
+							
+							// 模拟释放 ALT
+							procKeybdEvent.Call(0x12, 0, 0x0002, 0)
+							
+							// 如果你原本的 focusWindowSilky 里面有更复杂的逻辑，这里继续调用它作为兜底
+							focusWindowSilky(targetHwnd)
+						}
+					}()
+					return
 						}), 0)
 						
 						// 4. 精准唤醒与置顶
