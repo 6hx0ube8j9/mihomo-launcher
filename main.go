@@ -15,7 +15,6 @@ import (
 	"strings"
 	"sync"
 	"sync/atomic"
-	"runtime"
 	"syscall"
 	"time"
 	"unsafe"
@@ -64,6 +63,10 @@ var (
     isReallyExiting      int32 
 	lastClickTime        int64
 	isTunInterfaceCurrentlyAlive int32
+	
+	// --- 性能与防误触追加组件 ---
+    cachedWebUIHwnd      uintptr                            // 全局句柄缓存，实现 O(1) 极速复用
+    procEnumChildWindows = u32.NewProc("EnumChildWindows")   // 用于过滤普通浏览器的子窗口体检
 
     // --- 4. 流程控制与计数 ---
     exitOnce        sync.Once
@@ -91,11 +94,10 @@ var (
     procBringToTop       = u32.NewProc("BringWindowToTop")
     procGetForeground    = u32.NewProc("GetForegroundWindow")
     procAttachThread     = u32.NewProc("AttachThreadInput")
-	procGetCurrentThread = func() uint32 { return windows.GetCurrentThreadId() }
+    procGetCurrentThread = k32.NewProc("GetCurrentThreadId")
 
     // 辅助模拟输入
     procKeybdEvent = u32.NewProc("keybd_event")
-
 )
 
 const (
@@ -116,28 +118,20 @@ const (
 )
 
 func init() {
-	// 【核心铁律 1】：强制将主协程死死锁在操作系统的第一个线程上 (Thread 0)
-	// 确保整个生命周期中，systray 的隐藏窗口和 Windows 消息循环不发生线程漂移，彻底杜绝死锁与卡死！
-	runtime.LockOSThread()
-
-	// 原有的高 DPI 适配逻辑保持不变
-	u32 := windows.NewLazySystemDLL("user32.dll")
-	procSetContext := u32.NewProc("SetProcessDpiAwarenessContext")
-	if procSetContext.Find() == nil {
-		_, _, _ = procSetContext.Call(uintptr(0xfffffffc))
-	} else {
-		procSetAware := u32.NewProc("SetProcessDPIAware")
-		if procSetAware.Find() == nil {
-			_, _, _ = procSetAware.Call()
-		}
-	}
+    u32 := windows.NewLazySystemDLL("user32.dll")
+    procSetContext := u32.NewProc("SetProcessDpiAwarenessContext")
+    if procSetContext.Find() == nil {
+        _, _, _ = procSetContext.Call(uintptr(0xfffffffc))
+    } else {
+        procSetAware := u32.NewProc("SetProcessDPIAware")
+        if procSetAware.Find() == nil {
+            _, _, _ = procSetAware.Call()
+        }
+    }
 }
 
 func main() {
-	// 1. 原子标记系统正在初始化，阻断其他并发监控协程过早读取状态
-	atomic.StoreInt32(&isSystemInitializing, 1)
-
-	// 2. 获取程序自身路径并切换工作目录
+    atomic.StoreInt32(&isSystemInitializing, 1)
 	var err error
 	exePath, err = os.Executable()
 	if err != nil {
@@ -146,7 +140,6 @@ func main() {
 	baseDir = filepath.Dir(exePath)
 	_ = os.Chdir(baseDir)
 
-	// 3. 进程单例互斥锁（防止多开）
 	mName, _ := windows.UTF16PtrFromString(APP_MUTEX)
 	h, err := windows.CreateMutex(nil, false, mName)
 	if err != nil || windows.GetLastError() == windows.ERROR_ALREADY_EXISTS {
@@ -156,10 +149,7 @@ func main() {
 		return
 	}
 	hMutex = h
-	// 注意：在 main 函数结束时需要安全释放互斥锁
-	defer windows.CloseHandle(hMutex)
 
-	// 4. 解析启动参数检查是否由自启动拉起
 	isAutostart := false
 	for _, arg := range os.Args {
 		if arg == "---autostart" {
@@ -168,17 +158,14 @@ func main() {
 		}
 	}
 
-	// 5. 权限判定与 UAC 提权：如果没有管理员权限且不是自启动，则触发提权并退出当前进程
 	if !isAdmin() && !isAutostart {
 		runAsAdmin()
 		return
 	}
 
-	// 6. 加载配置与代理注册表初始化
 	ensureDefaultConfig()
 	setProxyRegistry(getIniConfig("system_proxy_enabled") == "true")
 
-	// 7. 优雅退出信号监听
 	go func() {
 		sigCh := make(chan os.Signal, 1)
 		signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
@@ -186,14 +173,12 @@ func main() {
 		systray.Quit()
 	}()
 
-	// 8. 清理旧残留，初始化内核容器底座
-	KillProcessByName("mihomo.exe")
-	time.Sleep(200 * time.Millisecond)
+    KillProcessByName("mihomo.exe")
+    time.Sleep(200 * time.Millisecond)
 
 	initJobObject()
 	sniffAndSolidifyConfig()
 
-	// 9. 异步拉起内核守护与状态监控
 	go func() {
 		time.Sleep(1 * time.Second)
 		go monitorKernelDaemon()
@@ -201,264 +186,224 @@ func main() {
 		go watchTunState()
 	}()
 
-	// 10. 启动系统托盘事件主消息循环（此函数会阻塞主线程）
 	systray.Run(onReady, onExit)
-	
-	// 11. 消息循环退出后的彻底清理（由于 systray.Run 会阻塞，当它退出时确保执行收尾）
 	onExit()
 }
-
 func focusWindowSilky(targetHwnd uintptr) {
-	// 1. 原子锁控制，防止短时间内多次触发导致置顶冲突
-	if !atomic.CompareAndSwapInt32(&isFocusing, 0, 1) {
-		return
-	}
-	defer atomic.StoreInt32(&isFocusing, 0)
+    // 1. 原子锁控制，防止短时间内多次触发导致置顶冲突
+    if !atomic.CompareAndSwapInt32(&isFocusing, 0, 1) {
+        return
+    }
+    defer atomic.StoreInt32(&isFocusing, 0)
 
-	// 获取当前、前台以及目标窗口的线程 ID
-	currT := uint32(procGetCurrentThread()) // 明确转换为 uint32 基础类型
-	
-	foreH, _, _ := procGetForeground.Call()
-	var foreT uint32
-	if foreH != 0 {
-		r1, _, _ := procGetWindowThread.Call(foreH, 0)
-		foreT = uint32(r1)
-	}
+    // 获取当前、前台以及目标窗口的线程 ID
+    currT, _, _ := procGetCurrentThread.Call()
+    foreH, _, _ := procGetForeground.Call()
+    foreT, _, _ := procGetWindowThread.Call(foreH, 0)
+    targT, _, _ := procGetWindowThread.Call(targetHwnd, 0)
 
-	r2, _, _ := procGetWindowThread.Call(targetHwnd, 0)
-	targT := uint32(r2)
+    // 2. 线程关联（黑魔法）：让当前进程拥有前台权限
+    if foreT != currT {
+        procAttachThread.Call(foreT, currT, 1)
+    }
+    procAttachThread.Call(currT, targT, 1)
 
-	// 【防御性加固】：如果目标窗口的线程就是当前线程，或者目标线程获取失败(0)，无需且不能执行 Attach
-	needAttachFore := foreT != 0 && foreT != currT
-	needAttachTarg := targT != 0 && targT != currT
+    // 3. 执行窗口唤醒组合拳
+    procShowWindow.Call(targetHwnd, SW_RESTORE)
+    procSetForeground.Call(targetHwnd)
+    procBringToTop.Call(targetHwnd)
+    // 物理置顶：设置为 HWND_TOPMOST
+    procSetWindowPos.Call(targetHwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_SILKY)
 
-	// 2. 线程关联（黑魔法）：让当前进程拥有前台权限
-	// 【核心修复】：所有的线程 ID 作为参数传给 .Call 时，必须全部显式转换为 uintptr！
-	if needAttachFore {
-		_, _, _ = procAttachThread.Call(uintptr(foreT), uintptr(currT), 1)
-	}
-	if needAttachTarg {
-		_, _, _ = procAttachThread.Call(uintptr(currT), uintptr(targT), 1)
-	}
+    // 4. 解除线程关联
+    procAttachThread.Call(currT, targT, 0)
+    if foreT != currT {
+        procAttachThread.Call(foreT, currT, 0)
+    }
 
-	// 3. 执行窗口唤醒组合拳
-	_, _, _ = procShowWindow.Call(targetHwnd, SW_RESTORE)
-	_, _, _ = procSetForeground.Call(targetHwnd)
-	_, _, _ = procBringToTop.Call(targetHwnd)
-	
-	// 物理置顶：设置为 HWND_TOPMOST
-	_, _, _ = procSetWindowPos.Call(targetHwnd, HWND_TOPMOST, 0, 0, 0, 0, SWP_SILKY)
+    // 5. 模拟 Alt 键：强制 Windows 刷新输入焦点到目标窗口
+    procKeybdEvent.Call(0x12, 0, 0, 0) // Alt down
+    procKeybdEvent.Call(0x12, 0, 2, 0) // Alt up
 
-	// 4. 解除线程关联 (用之前的布尔状态标记，确保进出严格对称，防止解除失败)
-	if needAttachTarg {
-		_, _, _ = procAttachThread.Call(uintptr(currT), uintptr(targT), 0)
-	}
-	if needAttachFore {
-		_, _, _ = procAttachThread.Call(uintptr(foreT), uintptr(currT), 0)
-	}
-
-	// 5. 模拟 Alt 键：强制 Windows 刷新输入焦点到目标窗口
-	_, _, _ = procKeybdEvent.Call(0x12, 0, 0, 0) // Alt down
-	_, _, _ = procKeybdEvent.Call(0x12, 0, 2, 0) // Alt up
-
-	// 6. 延时解除物理置顶，防止窗口“流氓”，允许用户切走
-	time.AfterFunc(400*time.Millisecond, func() {
-		_, _, _ = procSetWindowPos.Call(targetHwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_SILKY)
-	})
+    // 6. 延时解除物理置顶，防止窗口“流氓”，允许用户切走
+    time.AfterFunc(400*time.Millisecond, func() {
+        procSetWindowPos.Call(targetHwnd, HWND_NOTOPMOST, 0, 0, 0, 0, SWP_SILKY)
+    })
 }
 
 func launchWebUI() {
-    apiAddr := getIniConfig("external-controller")
-    secret := getIniConfig("secret")
-    proxyAddr := getIniConfig("proxy_address")
-    
-    // 1. URL 构造
-    baseUI := strings.TrimRight(apiAddr, "/")
-    if !strings.HasPrefix(baseUI, "http") {
-        baseUI = "http://" + baseUI
-    }
-    host, port, _ := net.SplitHostPort(strings.TrimPrefix(strings.TrimPrefix(baseUI, "http://"), "https://"))
-    if port == "" { host, port = "127.0.0.1", "9090" }
-    finalURL := fmt.Sprintf("%s/ui/?hostname=%s&port=%s&secret=%s#/proxies", baseUI, host, port, secret)
+	apiAddr := getIniConfig("external-controller")
+	secret := getIniConfig("secret")
+	proxyAddr := getIniConfig("proxy_address")
+	
+	// 1. URL 构造
+	baseUI := strings.TrimRight(apiAddr, "/")
+	if !strings.HasPrefix(baseUI, "http") {
+		baseUI = "http://" + baseUI
+	}
+	host, port, _ := net.SplitHostPort(strings.TrimPrefix(strings.TrimPrefix(baseUI, "http://"), "https://"))
+	if port == "" { host, port = "127.0.0.1", "9090" }
+	finalURL := fmt.Sprintf("%s/ui/?hostname=%s&port=%s&secret=%s#/proxies", baseUI, host, port, secret)
 
-    // 2. 探测与复用逻辑
-    client := &http.Client{Timeout: 300 * time.Millisecond}
-    isPortOccupied := false
-    
-    if resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%s/json", debugPort)); err == nil {
-        isPortOccupied = true 
-        defer resp.Body.Close()
-        var targets []map[string]interface{}
-        if err := json.NewDecoder(resp.Body).Decode(&targets); err == nil {
-            for _, t := range targets {
-                pURL, _ := t["url"].(string)
-                if strings.Contains(pURL, "/ui/") || strings.Contains(pURL, "setup") {
-                    id, _ := t["id"].(string)
-                    client.Get(fmt.Sprintf("http://127.0.0.1:%s/json/activate/%s", debugPort, id))
-                    
-                    // 开启异步原生置顶协程
-                    go func() {
-                        runtime.LockOSThread()
-                        defer runtime.UnlockOSThread()
+	// 【防御性优化 1】：O(1) 缓存命中，直接闪电置顶
+	if cachedWebUIHwnd != 0 {
+		if vis, _, _ := procIsWindowVisible.Call(cachedWebUIHwnd); vis != 0 {
+			focusWindowSilky(cachedWebUIHwnd)
+			return
+		}
+		cachedWebUIHwnd = 0 // 缓存失效清空
+	}
 
-                        time.Sleep(100 * time.Millisecond)
-                        var targetHwnd uintptr
-                        procGetWindowTextW := u32.NewProc("GetWindowTextW")
-                        
-                        procEnumWindows.Call(windows.NewCallback(func(hwnd uintptr, _ uintptr) uintptr {
-                            var buf [256]uint16
-                            procGetClassName.Call(hwnd, uintptr(unsafe.Pointer(&buf[0])), 256)
-                            if windows.UTF16ToString(buf[:]) == "Chrome_WidgetWin_1" {
-                                if vis, _, _ := procIsWindowVisible.Call(hwnd); vis != 0 {
-                                    var titleBuf [512]uint16
-                                    textLen, _, _ := procGetWindowTextW.Call(hwnd, uintptr(unsafe.Pointer(&titleBuf[0])), 512)
-                                    title := windows.UTF16ToString(titleBuf[:textLen])
-                                    
-                                    if strings.Contains(title, " - Microsoft Edge") || 
-                                       strings.Contains(title, " - Google Chrome") || 
-                                       strings.Contains(title, " - Brave") || 
-                                       title == "新标签页" || title == "" {
-                                        return 1 
-                                    }
-                                    targetHwnd = hwnd
-                                    return 0 
-                                }
-                            }
-                            return 1
-                        }), 0)
-                        
-                        if targetHwnd != 0 {
-                            procShowWindow.Call(targetHwnd, 9)
-                            foreHwnd, _, _ := procGetForeground.Call()
-                            var foreThread uint32
-                            if foreHwnd != 0 {
-                                r1, _, _ := procGetWindowThread.Call(foreHwnd, 0)
-                                foreThread = uint32(r1)
-                            }
-                            
-                            currentThread := procGetCurrentThread()
-                            isAttached := false
-                            if foreThread != 0 && foreThread != currentThread {
-                                res, _, _ := procAttachThread.Call(uintptr(currentThread), uintptr(foreThread), 1)
-                                if res != 0 {
-                                    isAttached = true
-                                }
-                            }
-                            
-                            procSetForeground.Call(targetHwnd)
-                            procBringToTop.Call(targetHwnd)
-                            
-                            if isAttached {
-                                procAttachThread.Call(uintptr(currentThread), uintptr(foreThread), 0)
-                            }
-                            
-                            focusWindowSilky(targetHwnd)
-                        }
-                    }()
-                    return 
-                }
-            }
-        }
-    } else {
-        conn, dialErr := net.DialTimeout("tcp", "127.0.0.1:"+debugPort, 50*time.Millisecond)
-        if dialErr == nil {
-            conn.Close()
-            isPortOccupied = true
-        }
-    }
+	// 2. 探测与复用逻辑
+	client := &http.Client{Timeout: 300 * time.Millisecond}
+	isPortOccupied := false
+	
+	if resp, err := client.Get(fmt.Sprintf("http://127.0.0.1:%s/json", debugPort)); err == nil {
+		isPortOccupied = true 
+		defer resp.Body.Close()
+		var targets []map[string]interface{}
+		if err := json.NewDecoder(resp.Body).Decode(&targets); err == nil {
+			for _, t := range targets {
+				pURL, _ := t["url"].(string)
+				if strings.Contains(pURL, "/ui/") || strings.Contains(pURL, "setup") {
+					id, _ := t["id"].(string)
+					client.Get(fmt.Sprintf("http://127.0.0.1:%s/json/activate/%s", debugPort, id))
+					
+					// 异步精确捞回老窗口
+					go func() {
+						runtime.LockOSThread()
+						defer runtime.UnlockOSThread()
 
-    // 3. 精细化清场
-    if isPortOccupied {
-        killCmd := fmt.Sprintf("for /f \"tokens=5\" %%a in ('netstat -aon ^| findstr :%s ^| findstr LISTENING') do taskkill /F /PID %%a", debugPort)
-        _ = exec.Command("cmd", "/c", killCmd).Run()
-        time.Sleep(150 * time.Millisecond) 
-    }
+						time.Sleep(120 * time.Millisecond)
+						var targetHwnd uintptr
+						
+						procEnumWindows.Call(windows.NewCallback(func(hwnd uintptr, _ uintptr) uintptr {
+							var buf [256]uint16
+							procGetClassName.Call(hwnd, uintptr(unsafe.Pointer(&buf[0])), 256)
+							if windows.UTF16ToString(buf[:]) == "Chrome_WidgetWin_1" {
+								if vis, _, _ := procIsWindowVisible.Call(hwnd); vis != 0 {
+									
+									// 【关键改动】：通过计算子窗口数量，过滤普通大浏览器（普通浏览器控件极多，数量 > 20）
+									childCount := 0
+									procEnumChildWindows.Call(hwnd, windows.NewCallback(func(_, _ uintptr) uintptr {
+										childCount++
+										return 1
+									}), 0)
+									
+									if childCount > 5 { // --app 独立容器子窗口极少，通常小于3个
+										return 1 
+									}
 
-    // 4. 浏览器查找 (按照 Edge(x86) -> Chrome -> Brave 优化顺序)
-    var browserPath string
-    potentialPaths := []string{
-        filepath.Join(os.Getenv("ProgramFiles(x86)"), `Microsoft\Edge\Application\msedge.exe`),
-        filepath.Join(os.Getenv("ProgramFiles"), `Microsoft\Edge\Application\msedge.exe`),
-        filepath.Join(os.Getenv("ProgramFiles"), `Google\Chrome\Application\chrome.exe`),
-        filepath.Join(os.Getenv("ProgramFiles(x86)"), `Google\Chrome\Application\chrome.exe`),
-        filepath.Join(os.Getenv("LocalAppData"), `Google\Chrome\Application\chrome.exe`),
-        filepath.Join(os.Getenv("ProgramFiles"), `BraveSoftware\Brave-Browser\Application\brave.exe`),
-        filepath.Join(os.Getenv("LocalAppData"), `BraveSoftware\Brave-Browser\Application\brave.exe`),
-        filepath.Join(os.Getenv("ProgramFiles(x86)"), `BraveSoftware\Brave-Browser\Application\brave.exe`),
-    }
+									targetHwnd = hwnd
+									cachedWebUIHwnd = hwnd // 写入缓存
+									return 0 
+								}
+							}
+							return 1
+						}), 0)
+						
+						if targetHwnd != 0 {
+							focusWindowSilky(targetHwnd)
+						}
+					}()
+					return 
+				}
+			}
+		}
+	} else {
+		conn, dialErr := net.DialTimeout("tcp", "127.0.0.1:"+debugPort, 50*time.Millisecond)
+		if dialErr == nil {
+			conn.Close()
+			isPortOccupied = true
+		}
+	}
 
-    for _, p := range potentialPaths {
-        if _, err := os.Stat(p); err == nil {
-            browserPath = p
-            break
-        }
-    }
+	// 3. 精细化清场
+	if isPortOccupied {
+		killCmd := fmt.Sprintf("for /f \"tokens=5\" %%a in ('netstat -aon ^| findstr :%s ^| findstr LISTENING') do taskkill /F /PID %%a", debugPort)
+		_ = exec.Command("cmd", "/c", killCmd).Run()
+		time.Sleep(150 * time.Millisecond) 
+	}
 
-    // 5. 启动阶段
-    if browserPath != "" {
-        userDataDir := filepath.Join(baseDir, "WebCache")
-        _ = os.MkdirAll(userDataDir, 0755)
+	// 4. 浏览器查找
+	var browserPath string
+	potentialPaths := []string{
+		filepath.Join(os.Getenv("ProgramFiles(x86)"), `Microsoft\Edge\Application\msedge.exe`),
+		filepath.Join(os.Getenv("ProgramFiles"), `Microsoft\Edge\Application\msedge.exe`),
+		filepath.Join(os.Getenv("ProgramFiles"), `Google\Chrome\Application\chrome.exe`),
+		filepath.Join(os.Getenv("ProgramFiles(x86)"), `Google\Chrome\Application\chrome.exe`),
+		filepath.Join(os.Getenv("LocalAppData"), `Google\Chrome\Application\chrome.exe`),
+		filepath.Join(os.Getenv("ProgramFiles"), `BraveSoftware\Brave-Browser\Application\brave.exe`),
+		filepath.Join(os.Getenv("LocalAppData"), `BraveSoftware\Brave-Browser\Application\brave.exe`),
+		filepath.Join(os.Getenv("ProgramFiles(x86)"), `BraveSoftware\Brave-Browser\Application\brave.exe`),
+	}
 
-        args := []string{
-            "--app=" + finalURL,
-            "--remote-debugging-port=" + debugPort,
-            "--user-data-dir=" + userDataDir,
-            "--window-size=1280,768",
-            "--proxy-server=" + proxyAddr,
-            "--no-first-run",
-            "--no-default-browser-check", // 【优化点】：防止弹出“是否设为默认浏览器”抢占焦点
-        }
-        cmd := exec.Command(browserPath, args...)
-        if err := cmd.Start(); err == nil {
-            // 将新启动的进程加入 JobObject
-            if hJob != 0 {
-                if hp, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, uint32(cmd.Process.Pid)); err == nil {
-                    _ = windows.AssignProcessToJobObject(hJob, hp)
-                    _ = windows.CloseHandle(hp)
-                }
-            }
-            
-            // 【稳定性补强】：新进程拉起时，也异步执行一次物理置顶，100% 确保新生成的 -app 窗口不会缩在后台
-            go func() {
-                runtime.LockOSThread()
-                defer runtime.UnlockOSThread()
-                
-                // 给 Chromium 内核窗口生成留出 350ms 的缓冲时间
-                time.Sleep(350 * time.Millisecond)
-                var newHwnd uintptr
-                procGetWindowTextW := u32.NewProc("GetWindowTextW")
-                
-                procEnumWindows.Call(windows.NewCallback(func(hwnd uintptr, _ uintptr) uintptr {
-                    var buf [256]uint16
-                    procGetClassName.Call(hwnd, uintptr(unsafe.Pointer(&buf[0])), 256)
-                    if windows.UTF16ToString(buf[:]) == "Chrome_WidgetWin_1" {
-                        if vis, _, _ := procIsWindowVisible.Call(hwnd); vis != 0 {
-                            var titleBuf [512]uint16
-                            textLen, _, _ := procGetWindowTextW.Call(hwnd, uintptr(unsafe.Pointer(&titleBuf[0])), 512)
-                            title := windows.UTF16ToString(titleBuf[:textLen])
-                            
-                            // 过滤普通浏览器，专门掐住没有浏览器后缀的、新生成的那个沙盒容器
-                            if strings.Contains(title, " - Microsoft Edge") || 
-                               strings.Contains(title, " - Google Chrome") || 
-                               strings.Contains(title, " - Brave") || 
-                               title == "新标签页" || title == "" {
-                                return 1
-                            }
-                            newHwnd = hwnd
-                            return 0
-                        }
-                    }
-                    return 1
-                }), 0)
-                
-                if newHwnd != 0 {
-                    focusWindowSilky(newHwnd)
-                }
-            }()
-        }    
-    } else {
-        _ = exec.Command("cmd", "/c", "start", "", finalURL).Start()
-    }
+	for _, p := range potentialPaths {
+		if _, err := os.Stat(p); err == nil {
+			browserPath = p
+			break
+		}
+	}
+
+	// 5. 启动阶段
+	if browserPath != "" {
+		userDataDir := filepath.Join(baseDir, "WebCache")
+		_ = os.MkdirAll(userDataDir, 0755)
+
+		args := []string{
+			"--app=" + finalURL,
+			"--remote-debugging-port=" + debugPort,
+			"--user-data-dir=" + userDataDir,
+			"--window-size=1280,768",
+			"--proxy-server=" + proxyAddr,
+			"--no-first-run",
+			"--no-default-browser-check",
+		}
+		cmd := exec.Command(browserPath, args...)
+		if err := cmd.Start(); err == nil {
+			mainPid := uint32(cmd.Process.Pid)
+
+			if hJob != 0 {
+				if hp, err := windows.OpenProcess(windows.PROCESS_SET_QUOTA|windows.PROCESS_TERMINATE, false, mainPid); err == nil {
+					_ = windows.AssignProcessToJobObject(hJob, hp)
+					_ = windows.CloseHandle(hp)
+				}
+			}
+			
+			// 【防御性优化 2】：冷启动通过 PID 血缘精准捕获新窗口并柔和置顶
+			go func() {
+				runtime.LockOSThread()
+				defer runtime.UnlockOSThread()
+				
+				time.Sleep(350 * time.Millisecond) // 等待 Chromium 窗口建立
+				var newHwnd uintptr
+				
+				procEnumWindows.Call(windows.NewCallback(func(hwnd uintptr, _ uintptr) uintptr {
+					if vis, _, _ := procIsWindowVisible.Call(hwnd); vis != 0 {
+						var wndPid uint32
+						procGetWindowThread.Call(hwnd, uintptr(unsafe.Pointer(&wndPid)))
+						
+						if wndPid == mainPid { // 必须是当前拉起的子进程
+							var buf [256]uint16
+							procGetClassName.Call(hwnd, uintptr(unsafe.Pointer(&buf[0])), 256)
+							if windows.UTF16ToString(buf[:]) == "Chrome_WidgetWin_1" {
+								newHwnd = hwnd
+								cachedWebUIHwnd = hwnd // 存入缓存
+								return 0 
+							}
+						}
+					}
+					return 1
+				}), 0)
+				
+				if newHwnd != 0 {
+					focusWindowSilky(newHwnd)
+				}
+			}()
+		}    
+	} else {
+		_ = exec.Command("cmd", "/c", "start", "", finalURL).Start()
+	}
 }
 
 func onReady() {
