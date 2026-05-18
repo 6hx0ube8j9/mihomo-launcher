@@ -760,26 +760,21 @@ func checkSystemState() int32 {
 
     // 4. 对齐逻辑
     if atomic.LoadInt32(&isSystemInitializing) == 1 {
-        // 初始化/重载：发现不对立即捅穿中间态，直达目标
         if currentConf.Tun.Enable != targetTunInIni || (targetModeInIni != "" && currentConf.Mode != targetModeInIni) {
             go syncConfigToKernel()
         }
     } else {
-        // 稳定期：反向同步。增加判断防止重复写入
-        if currentConf.Tun.Enable != targetTunInIni {
-            // 这里建议同步更新一下本地变量，防止下一轮循环又起一个 goroutine
-            go func(enabled bool) {
-                saveIniConfig("tun_enabled", fmt.Sprint(enabled))
-                if mTun != nil {
-                    if enabled { mTun.Check() } else { mTun.Uncheck() }
-                }
-            }(currentConf.Tun.Enable)
-        }
-        if currentConf.Mode != "" && currentConf.Mode != targetModeInIni {
-            newMode := currentConf.Mode
-            go saveIniConfig("mode", newMode)
-        }
-    }
+		if currentConf.Tun.Enable != targetTunInIni {
+			enabled := currentConf.Tun.Enable
+			saveIniConfig("tun_enabled", fmt.Sprint(enabled))
+			if mTun != nil {
+				if enabled { mTun.Check() } else { mTun.Uncheck() }
+			}
+		}
+		if currentConf.Mode != "" && currentConf.Mode != targetModeInIni {
+			saveIniConfig("mode", currentConf.Mode)
+		}
+	}
 
     // 5. 事实反馈
     if currentConf.Tun.Enable {
@@ -1137,6 +1132,7 @@ func setProxyRegistry(enable bool) {
 	if enable {
 		_ = key.SetDWordValue("ProxyEnable", 1)
 		_ = key.SetStringValue("ProxyServer", getIniConfig("proxy_address"))
+		_ = key.DeleteValue("AutoConfigURL")
 	} else {
 		_ = key.SetDWordValue("ProxyEnable", 0)
 	}
@@ -1146,7 +1142,7 @@ func setProxyRegistry(enable bool) {
 	wininet := windows.NewLazySystemDLL("wininet.dll")
 	setOption := wininet.NewProc("InternetSetOptionW")
 	_, _, _ = setOption.Call(0, 39, 0, 0)
-	_, _, _ = setOption.Call(0, 37, 0, 0)
+	_, _, _ = setOption.Call(0, 42, 0, 0)
 }
 
 func toggleAutoStart(enable bool) {
@@ -1257,29 +1253,26 @@ func getIniConfig(key string) string {
 }
 
 func saveIniConfig(key, val string) {
-    if key == "" || val == "" { return }
-    configMu.Lock()
-    // 1. 变化检测：如果不动，则不写
-    if old, ok := configData[key]; ok && old == val && key != "" {
-        configMu.Unlock()
-        return
-    }
-    if key != "" {
-        configData[key] = val
-    }
+	configMu.Lock()
 
-    // 2. 准备数据（在锁内快速完成或拷贝）
-    keys := []string{"mode", "tun_enabled", "system_proxy_enabled", "startup_enabled", "proxy_address", "tun_device_name", "external-controller", "secret"}
-    var buf bytes.Buffer
-    for _, k := range keys {
-        if v, ok := configData[k]; ok {
-            buf.WriteString(k + " = " + v + "\n") // 使用字符串拼接比 Sprintf 更快
-        }
-    }
-    configMu.Unlock() // 尽早释放锁，不要带着锁去写磁盘
+	if key != "" && val != "" {
+		if old, ok := configData[key]; ok && old == val {
+			configMu.Unlock()
+			return
+		}
+		configData[key] = val
+	}
 
-    // 3. 磁盘 IO（锁外执行）
-    _ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), buf.Bytes(), 0644)
+	keys := []string{"mode", "tun_enabled", "system_proxy_enabled", "startup_enabled", "proxy_address", "tun_device_name", "external-controller", "secret"}
+	var buf bytes.Buffer
+	for _, k := range keys {
+		if v, ok := configData[k]; ok {
+			buf.WriteString(k + " = " + v + "\n")
+		}
+	}
+	configMu.Unlock() 
+
+	_ = os.WriteFile(filepath.Join(baseDir, CONFIG_FILE), buf.Bytes(), 0644)
 }
 
 func isTunInterfaceMatch(ifaceName string) bool {
