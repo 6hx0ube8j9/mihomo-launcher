@@ -1148,8 +1148,6 @@ func setProxyRegistry(enable bool) {
 		_ = key.SetDWordValue("ProxyEnable", 0)
 	}
 
-	key.Close()
-
 	wininet := windows.NewLazySystemDLL("wininet.dll")
 	setOption := wininet.NewProc("InternetSetOptionW")
 	_, _, _ = setOption.Call(0, 39, 0, 0)
