@@ -739,9 +739,7 @@ func watchTunState() {
 }
 func checkSystemState() int32 {
     // 1. 进程检查
-    if !isProcessRunning("mihomo.exe") {
-        return int32(StateStop)
-    }
+    if !isProcessRunning("mihomo.exe") { return int32(StateStop) }
 
     // 2. API 获取
     body, err := doAPIRequest("GET", "/configs", nil)
@@ -754,14 +752,14 @@ func checkSystemState() int32 {
     if err := json.Unmarshal(body, &currentConf); err != nil { return int32(StateStop) }
 
     // 3. 读取账本
-    targetTunInIni := getIniConfig("tun_enabled") == "true"
-    targetModeInIni := getIniConfig("mode")
+    targetTunInIni   := getIniConfig("tun_enabled") == "true"
+    targetModeInIni  := getIniConfig("mode")
     targetProxyInIni := getIniConfig("system_proxy_enabled") == "true"
 
-    // 4. 对齐逻辑
-    if atomic.LoadInt32(&isSystemInitializing) == 1 {
-        return int32(StateDefault)
-    } else {
+    // 4. 对齐逻辑（保持原有的锁位置，确保绝对的线程安全）
+    isInitializing := atomic.LoadInt32(&isSystemInitializing) == 1
+
+    if !isInitializing {
         if currentConf.Tun.Enable != targetTunInIni {
             if currentConf.Tun.Enable {
                 saveIniConfig("tun_enabled", "true")
@@ -778,8 +776,14 @@ func checkSystemState() int32 {
         }
     }
 
-    // 5. 事实反馈
-    if currentConf.Tun.Enable {
+    // 5. 事实反馈（唯一的、纯粹的状态判定出口）
+    // 如果在初始化中，API 数据可能不准，Tun 状态我们信任 ini 账本；否则信任实时 API
+    isTunActive := currentConf.Tun.Enable
+    if isInitializing {
+        isTunActive = targetTunInIni
+    }
+
+    if isTunActive {
         return int32(StateTun)
     }
     if targetProxyInIni {
@@ -792,6 +796,7 @@ func monitorIconState() {
 	var successCounter int
 
 	for {
+		// 0. 检查是否正在退出系统
 		if atomic.LoadInt32(&isReallyExiting) == 1 { return }
 
 		// 1. 最高优先级：进程不在 (零宽容，第一时间 STOP)
@@ -799,7 +804,7 @@ func monitorIconState() {
 			tunErrorCounter = 0
 			successCounter = 0
 			if atomic.LoadInt32(&lastState) != int32(StateStop) {
-				updateIconByState(StateStop)
+				updateIconByState(int(StateStop))
 				atomic.StoreInt32(&lastState, int32(StateStop))
 			}
 		} else {
@@ -811,17 +816,8 @@ func monitorIconState() {
 			isInitializing := (atomic.LoadInt32(&isSystemInitializing) == 1)
 			isSyncing := (atomic.LoadInt32(&isSyncing) == 1)
 
-			// --- 核心手术：防闪烁拦截 ---
-			// 如果处于启动或同步中，且 API 已经返回了中间态(黄/蓝)，但物理网卡还没出
-			// 我们强制判定为“尚未就绪”，不进入下方的恢复逻辑，从而冻结在“灰色”
-			if (isInitializing || isSyncing) && curr != int32(StateTun) {
-				if isTunModeInConfig {
-					// 这种情况下，我们认为系统还没“恢复”，继续等待
-					goto nextLoop 
-				}
-			}
-
 			// 3. 判定故障 (isBroken)
+			// 在初始化或同步期间，物理网卡尚未加载完成属于正常现象，因此通过 !isInitializing && !isSyncing 屏蔽假故障
 			isBroken := (curr == int32(StateStop)) ||
 				(isTunModeInConfig && isPhysicalLost && !isInitializing && !isSyncing)
 
@@ -829,7 +825,7 @@ func monitorIconState() {
 				successCounter = 0
 				if tunErrorCounter < 5 { tunErrorCounter++ }
 
-				// 连续 3 秒异常才生效 (防抖)
+				// 连续 3 秒异常才生效 (防抖变红/变灰)
 				if tunErrorCounter > 2 {
 					targetState := int32(StateError)
 					if curr == int32(StateStop) {
@@ -842,21 +838,34 @@ func monitorIconState() {
 					}
 				}
 			} else {
-				// 4. 重置/恢复逻辑
-				successCounter++
-				// 恢复判定：只有连续 3 秒稳定，或者还没变红(Error)前的状态切换
-				if tunErrorCounter <= 2 || successCounter >= 3 {
-					if successCounter >= 3 { tunErrorCounter = 0 }
-
+				// 4. 正常或过渡状态的处理逻辑
+				if isInitializing || isSyncing {
+					// 【核心平滑区】：在初始化/同步期间，不累加正常运行的 successCounter 计数器，
+					// 但允许图标直接更新到预判状态（如 Proxy），避免被 nextLoop 冻结。
+					successCounter = 0 
+					
 					if atomic.LoadInt32(&lastState) != curr {
 						updateIconByState(int(curr))
 						atomic.StoreInt32(&lastState, curr)
+					}
+				} else {
+					// 【稳定运行区】：系统完全就绪后的正常防抖逻辑
+					successCounter++
+					
+					// 恢复判定：只有连续 3 秒稳定，或者还没真正变红(Error)前的状态正常切换
+					if tunErrorCounter <= 2 || successCounter >= 3 {
+						if successCounter >= 3 { tunErrorCounter = 0 }
+
+						if atomic.LoadInt32(&lastState) != curr {
+							updateIconByState(int(curr))
+							atomic.StoreInt32(&lastState, curr)
+						}
 					}
 				}
 			}
 		}
 
-	nextLoop:
+		// 固定 1 秒轮询步长，告别 goto 强切，逻辑完全线性流转
 		time.Sleep(1 * time.Second)
 	}
 }
