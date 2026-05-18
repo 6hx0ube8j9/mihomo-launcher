@@ -45,7 +45,7 @@ var (
 	hJob    windows.Handle
 	hMutex  windows.Handle
 
-	httpClient = &http.Client{Timeout: 1 * time.Second}
+	httpClient = &http.Client{Timeout: 500 * time.Millisecond}
 	exePath, _ = os.Executable()
 	baseDir    = filepath.Dir(exePath)
 	configData = make(map[string]string)
@@ -760,21 +760,23 @@ func checkSystemState() int32 {
 
     // 4. 对齐逻辑
     if atomic.LoadInt32(&isSystemInitializing) == 1 {
-        if currentConf.Tun.Enable != targetTunInIni || (targetModeInIni != "" && currentConf.Mode != targetModeInIni) {
-            go syncConfigToKernel()
-        }
+        return int32(StateDefault)
     } else {
-		if currentConf.Tun.Enable != targetTunInIni {
-			enabled := currentConf.Tun.Enable
-			saveIniConfig("tun_enabled", fmt.Sprint(enabled))
-			if mTun != nil {
-				if enabled { mTun.Check() } else { mTun.Uncheck() }
-			}
-		}
-		if currentConf.Mode != "" && currentConf.Mode != targetModeInIni {
-			saveIniConfig("mode", currentConf.Mode)
-		}
-	}
+        if currentConf.Tun.Enable != targetTunInIni {
+            if currentConf.Tun.Enable {
+                saveIniConfig("tun_enabled", "true")
+                if mTun != nil { mTun.Check() }
+            } else {
+                if atomic.LoadInt32(&isSyncing) == 0 {
+                    saveIniConfig("tun_enabled", "false")
+                    if mTun != nil { mTun.Uncheck() }
+                }
+            }
+        }
+        if currentConf.Mode != "" && currentConf.Mode != targetModeInIni {
+            saveIniConfig("mode", currentConf.Mode)
+        }
+    }
 
     // 5. 事实反馈
     if currentConf.Tun.Enable {
