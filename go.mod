@@ -1,4 +1,4 @@
-module mihomo-launcher
+module mihomo-run
 
 go 1.25.0
 
