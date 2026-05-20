@@ -1165,7 +1165,7 @@ func toggleAutoStart(enable bool) {
 		cleanExe := strings.ReplaceAll(exePath, "'", "''")
 		cleanDir := strings.ReplaceAll(baseDir, "'", "''")
 		psScript := fmt.Sprintf(
-			"$trigger = New-ScheduledTaskTrigger -AtLogOn; $trigger.Delay = 'PT8S'; "+
+			"$trigger = New-ScheduledTaskTrigger -AtLogOn; $trigger.Delay = 'PT6S'; "+
 				"$action = New-ScheduledTaskAction -Execute '%s' -Argument '---autostart' -WorkingDirectory '%s'; "+
 				"$settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -ExecutionTimeLimit ([TimeSpan]::Zero); "+
 				"Register-ScheduledTask -TaskName '%s' -Trigger $trigger -Action $action -Settings $settings -User $env:USERNAME -RunLevel Highest -Force",
