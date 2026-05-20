@@ -19,19 +19,22 @@ jobs:
           cache: true   
 
       - name: Install dependencies
+        shell: pwsh
         run: |
           if (!(Test-Path "go.mod")) { go mod init mihomo-launcher }
           go get github.com/energye/systray@latest
           go get github.com/pkg/browser@latest
           go mod tidy
 
-      - name: Prepare Windows Resources
+      - name: Install and Run go-winres
         shell: pwsh
         run: |
-          go install github.com/akavel/rsrc@latest
+          go install github.com/tc-hib/go-winres@latest
           $GOBIN = "$(go env GOPATH)\bin"
-          if (Test-Path "main.manifest") {
-            & "$GOBIN\rsrc.exe" -manifest main.manifest -o resource.syso
+          if (Test-Path "icons/app.ico") {
+            & "$GOBIN\go-winres.exe" simply --icon icons/app.ico
+          } else {
+            exit 1
           }
 
       - name: Build EXE
