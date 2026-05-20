@@ -30,10 +30,10 @@ var iconFs embed.FS
 
 const (
 	APP_MUTEX    = "Mihomo_Unique_Mutex"
-	CONFIG_FILE  = "mihomo-launcher.ini"
+	CONFIG_FILE  = "mihomo-run.ini"
 	REG_RUN      = `Software\Microsoft\Windows\CurrentVersion\Run`
 	REG_PROXY    = `Software\Microsoft\Windows\CurrentVersion\Internet Settings`
-	APP_NAME     = "MihomoLauncher"
+	APP_NAME     = "MihomoRun"
 	StateStop    = 0
 	StateError   = 1
 	StateTun     = 2
@@ -1155,7 +1155,7 @@ func setProxyRegistry(enable bool) {
 }
 
 func toggleAutoStart(enable bool) {
-	const taskName = "MihomoLauncherTask"
+	const taskName = "MihomoRunTask"
 	if key, err := registry.OpenKey(registry.CURRENT_USER, REG_RUN, registry.SET_VALUE); err == nil {
 		_ = key.DeleteValue(APP_NAME)
 		key.Close()
@@ -1241,7 +1241,7 @@ func KillProcessByName(name string) {
 }
 
 func checkAutoStartStatus() bool {
-	cmd := exec.Command("schtasks", "/Query", "/TN", "MihomoLauncherTask")
+	cmd := exec.Command("schtasks", "/Query", "/TN", "MihomoRunTask")
 	cmd.SysProcAttr = &windows.SysProcAttr{CreationFlags: windows.CREATE_NO_WINDOW}
 	return cmd.Run() == nil
 }
