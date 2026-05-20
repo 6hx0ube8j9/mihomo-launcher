@@ -1,1 +1,1 @@
-# mihomo-launcher
+# mihomo-d
