@@ -1,4 +1,4 @@
-name: Build Launcher
+name: Build mihomo-run
 
 on:
   push:
@@ -15,13 +15,13 @@ jobs:
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
-          go-version: 'stable' 
+          go-version: '1.25' 
           cache: true   
 
       - name: Install dependencies
         shell: pwsh
         run: |
-          if (!(Test-Path "go.mod")) { go mod init mihomo-launcher }
+          if (!(Test-Path "go.mod")) { go mod init mihomo-run }
           go get github.com/energye/systray@latest
           go get github.com/pkg/browser@latest
           go mod tidy
@@ -41,10 +41,10 @@ jobs:
         shell: pwsh
         run: |
           $env:CGO_ENABLED="1"
-          go build -ldflags="-s -w -H=windowsgui" -o mihomo-launcher.exe .
+          go build -ldflags="-s -w -H=windowsgui" -o mihomo-run.exe .
 
       - name: Upload Artifact
         uses: actions/upload-artifact@v4
         with:
-          name: mihomo-launcher
-          path: mihomo-launcher.exe
+          name: mihomo-run
+          path: mihomo-run.exe
