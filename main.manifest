@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8" standalone="yes"?>
 <assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
-    <assemblyIdentity version="1.0.0.0" processorArchitecture="*" name="MihomoLauncher" type="win32"/>
-    <description>Mihomo Launcher</description>
+    <assemblyIdentity version="1.0.0.0" processorArchitecture="*" name="MihomoRun" type="win32"/>
+    <description>Mihomo Run</description>
     <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
         <security>
             <requestedPrivileges>
